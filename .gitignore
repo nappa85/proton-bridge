@@ -1,0 +1,39 @@
+# Rust
+/target
+**/*.rs.bk
+Cargo.lock
+
+# Build outputs
+/packaging
+proton_bridge.h
+*.o
+
+# Docker-created reference checkouts (root-owned)
+/buteo-syncfw
+/bridge
+/tmp_build3
+/.cargo-home
+
+# Test/debug artifacts
+/proton-vcard-raw.log
+/test-qtpim
+/test-srp
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# RPM build
+*.rpm
+*.tar.bz2
+*.src.rpm
+
+# Local config
+.env
+*.local

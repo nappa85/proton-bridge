@@ -1,0 +1,19 @@
+[package]
+name = "proton-bridge"
+version = { workspace = true }
+edition = { workspace = true }
+description = "C FFI bridge: Buteo plugin FFI for Proton Contacts sync engine"
+license = { workspace = true }
+repository = { workspace = true }
+authors = { workspace = true }
+
+[lib]
+name = "proton_bridge"
+crate-type = ["staticlib", "cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+proton-sync = { path = "../proton-sync" }
+
+[build-dependencies]
+cbindgen = { workspace = true }

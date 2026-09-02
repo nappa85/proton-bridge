@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<profile name="proton" type="client">
+    <key name="Sync Direction" value="two-way"/>
+    <key name="Sync Protocol" value="proton"/>
+    <key name="Sync Transport" value="HTTP"/>
+    <key name="conflictpolicy" value="prefer remote"/>
+</profile>

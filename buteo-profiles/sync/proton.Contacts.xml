@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<profile name="proton.Contacts" type="sync">
+    <key name="destinationtype" value="online"/>
+    <key name="enabled" value="false"/>
+    <key name="hidden" value="true"/>
+    <key name="use_accounts" value="true"/>
+
+    <profile type="client" name="proton">
+        <key name="Sync Direction" value="two-way"/>
+        <key name="Sync Protocol" value="proton"/>
+        <key name="Sync Transport" value="HTTP"/>
+        <key name="conflictpolicy" value="prefer remote"/>
+    </profile>
+
+    <schedule enabled="false" interval="30" days="1,2,3,4,5,6,7" syncconfiguredtime="" time="">
+        <rush enabled="false" end="" begin="" interval="0" externalsync="false" days=""/>
+    </schedule>
+</profile>

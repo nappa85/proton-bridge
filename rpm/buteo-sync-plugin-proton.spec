@@ -1,0 +1,55 @@
+Name:           buteo-sync-plugin-proton
+Summary:        Buteo sync plugin for Proton Contacts
+Version:        0.1.0
+Release:        1
+License:        GPL-3.0-or-later
+URL:            https://github.com/yourusername/sailfish-proton
+Source0:        %{name}-%{version}.tar.bz2
+
+Requires:       buteo-syncfw-qt5 >= 0.11
+Requires:       qt5-qtpim-contacts
+Requires:       libaccounts-qt5 >= 1.16
+Requires:       libsignon-qt5 >= 8.61
+Requires:       glibc >= 2.17
+
+%description
+Buteo synchronization plugin for Proton Contacts. Implements two-way sync
+between SailfishOS Contacts (QtPIM) and Proton Mail via the internal REST API.
+
+%prep
+%setup -q -n %{name}-%{version}
+
+%build
+echo "Verifying pre-built plugin"
+ls -lh buteo-plugin/libproton-client.so
+
+%install
+rm -rf %{buildroot}
+
+mkdir -p %{buildroot}%{_libdir}/buteo-plugins-qt5/oopp
+install -m 0755 buteo-plugin/libproton-client.so \
+    %{buildroot}%{_libdir}/buteo-plugins-qt5/oopp/libproton-client.so
+
+mkdir -p %{buildroot}%{_sysconfdir}/buteo/profiles/client
+install -m 0644 buteo-profiles/client/proton-contacts.xml \
+    %{buildroot}%{_sysconfdir}/buteo/profiles/client/proton.xml
+
+mkdir -p %{buildroot}%{_sysconfdir}/buteo/profiles/sync
+install -m 0644 buteo-profiles/sync/proton.Contacts.xml \
+    %{buildroot}%{_sysconfdir}/buteo/profiles/sync/proton.Contacts.xml
+
+%files
+%defattr(-,root,root,-)
+%{_libdir}/buteo-plugins-qt5/oopp/libproton-client.so
+%config(noreplace) %{_sysconfdir}/buteo/profiles/client/proton.xml
+%config(noreplace) %{_sysconfdir}/buteo/profiles/sync/proton.Contacts.xml
+
+%post
+systemctl --user reload msyncd 2>/dev/null || true
+
+%postun
+systemctl --user reload msyncd 2>/dev/null || true
+
+%changelog
+* %(date +"%a %b %d %Y") Marco Napetti <marco.napetti@proton.me> - 0.1.0-1
+- Initial packaging

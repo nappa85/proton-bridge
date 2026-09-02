@@ -1,0 +1,37 @@
+[workspace]
+resolver = "2"
+members = [
+    "proton-api",
+    "proton-sync",
+    "proton-bridge",
+    "test-srp",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/yourusername/sailfish-proton"
+authors = ["Marco Napetti <marco.napetti@proton.me>"]
+
+[workspace.lints]
+clippy.pedantic = "warn"
+
+[workspace.dependencies]
+thiserror = "2"
+serde = { version = "1", features = ["derive"], default-features = false }
+serde_json = "1"
+# Use rustls only (no native-tls/openssl) for cross-compile friendliness; host aarch64 cross via proton-build-env lacks openssl headers
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }
+tokio = { version = "1", features = ["full"] }
+vcf = "0.2"
+# Use pure Rust crypto backend for cross-compile friendliness (avoid nettle/openssl C headers needed for aarch64)
+# Original default is crypto-nettle which needs nettle-dev for aarch64 cross (not present in proton-build-env)
+# crypto-rust is experimental + variable-time, requires both allow flags
+sequoia-openpgp = { version = "1.20", default-features = false, features = ["crypto-rust", "allow-experimental-crypto", "allow-variable-time-crypto"] }
+cbindgen = "0.28"
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1

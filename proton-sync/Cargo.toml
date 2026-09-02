@@ -1,0 +1,23 @@
+[package]
+name = "proton-sync"
+version = { workspace = true }
+edition = { workspace = true }
+description = "Proton Contacts sync engine (pure Rust)"
+license = { workspace = true }
+repository = { workspace = true }
+authors = { workspace = true }
+
+[lib]
+name = "proton_sync"
+path = "src/lib.rs"
+
+[dependencies]
+proton-api = { path = "../proton-api" }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { version = "0.4", features = ["serde"] }
+base64 = "0.22"
+
+[features]
+default = []

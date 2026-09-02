@@ -1,0 +1,30 @@
+[package]
+name = "proton-api"
+version = { workspace = true }
+edition = { workspace = true }
+description = "Proton Mail/Contacts REST API client"
+license = { workspace = true }
+repository = { workspace = true }
+authors = { workspace = true }
+
+[lib]
+name = "proton_api"
+path = "src/lib.rs"
+
+[dependencies]
+thiserror = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true }
+sequoia-openpgp = { workspace = true }
+num-bigint = "0.4"
+num-traits = "0.2"
+sha2 = "0.10"
+base64 = "0.22"
+getrandom = "0.2"
+bcrypt = "0.16"
+ical_vcard = "0.5"
+
+[features]
+default = []

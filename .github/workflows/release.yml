@@ -1,0 +1,144 @@
+name: Build & publish RPMs
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'RPM version to build (e.g. 0.1.0). Leave empty to use the pushed tag.'
+        required: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: rpm-release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build RPMs in Sailfish SDK
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free disk space for Sailfish SDK image
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/powershell
+          sudo apt-get clean
+          df -h
+
+      - name: Install aarch64 cross-compiler
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+
+      - name: Set up Rust (aarch64 glibc target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+
+      - name: Compute RPM version
+        id: version
+        env:
+          RELEASE_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "$RELEASE_VERSION" ]; then
+            VER="$RELEASE_VERSION"
+          else
+            VER="${GITHUB_REF_NAME#v}"
+          fi
+          if ! echo "$VER" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "invalid version '$VER' (expected semver like 0.1.0)" >&2
+            exit 1
+          fi
+          echo "version=${VER}" >> "$GITHUB_OUTPUT"
+
+      - name: Stamp version in Cargo.toml files
+        run: |
+          sed -i "s/^version = .*/version = \"${{ steps.version.outputs.version }}\"/" Cargo.toml
+          grep '^version =' Cargo.toml
+
+      - name: Cross-compile Rust crates for aarch64
+        run: |
+          cargo build --release --target aarch64-unknown-linux-gnu
+
+      - name: Stage package bundle (Rust cdylib + configs)
+        run: |
+          chmod +x make-pkg-bundle.sh
+          ./make-pkg-bundle.sh
+
+      - name: Stamp RPM version into spec files
+        run: |
+          sed -i "s/^Version:.*/Version:       ${{ steps.version.outputs.version }}/" rpm/buteo-sync-plugin-proton.spec
+          sed -i "s/^Version:.*/Version:       ${{ steps.version.outputs.version }}/" rpm/sailfish-account-proton.spec
+          grep '^Version:' rpm/buteo-sync-plugin-proton.spec
+          grep '^Version:' rpm/sailfish-account-proton.spec
+
+      - name: Pull Sailfish Platform SDK
+        run: docker pull coderus/sailfishos-platform-sdk-aarch64
+
+      - name: Build buteo-sync-plugin-proton RPM
+        run: |
+          set -euxo pipefail
+          docker create --name proton-build coderus/sailfishos-platform-sdk-aarch64 sleep infinity
+          docker start proton-build
+          trap 'docker rm -f proton-build >/dev/null 2>&1 || true' EXIT
+
+          # Copy packaging tree
+          docker cp packaging proton-build:/home/mersdk/packaging
+          docker exec -u root proton-build chown -R mersdk:mersdk /home/mersdk/packaging
+
+          # Build buteo plugin RPM
+          docker exec -w /home/mersdk/packaging/rpm proton-build \
+            mb2 --target SailfishOS-5.2.0.15-aarch64 -s buteo-sync-plugin-proton.spec build
+
+          mkdir -p packaging/RPMS
+          docker cp proton-build:/home/mersdk/packaging/RPMS/. packaging/RPMS/
+
+      - name: Build sailfish-account-proton RPM
+        run: |
+          set -euxo pipefail
+          # Reuse the same container
+          docker exec -w /home/mersdk/packaging/rpm proton-build \
+            mb2 --target SailfishOS-5.2.0.15-aarch64 -s sailfish-account-proton.spec build
+
+          docker cp proton-build:/home/mersdk/packaging/RPMS/. packaging/RPMS/
+
+      - name: Sanity-check built RPMs
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq rpm >/dev/null
+          expected="${{ steps.version.outputs.version }}"
+          found=0
+          for f in packaging/RPMS/*.rpm; do
+            [ -e "$f" ] || continue
+            found=1
+            echo "== $f =="
+            rpm -qip "$f"
+            ver="$(rpm -qp --qf '%{VERSION}' "$f")"
+            arch="$(rpm -qp --qf '%{ARCH}' "$f")"
+            [ "$arch" = "aarch64" ] || { echo "wrong arch '$arch' for $f (expected aarch64)"; exit 1; }
+            [ "$ver" = "$expected" ] || { echo "version '$ver' != expected '$expected' for $f"; exit 1; }
+          done
+          [ "$found" -eq 1 ] || { echo "no RPMs produced"; exit 1; }
+
+      - name: Publish RPMs to GitHub Release
+        if: github.event_name == 'push'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            packaging/RPMS/*.rpm
+          generate_release_notes: true
+          make_latest: true
+
+      - name: Upload RPMs as workflow artifact
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: rpms-${{ steps.version.outputs.version }}
+          path: |
+            packaging/RPMS/*.rpm
