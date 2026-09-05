@@ -60,7 +60,10 @@ fn unescape_vcard(s: &str) -> String {
                 Some(',') => result.push(','),
                 Some(';') => result.push(';'),
                 Some('\\') => result.push('\\'),
-                Some(other) => { result.push('\\'); result.push(other); }
+                Some(other) => {
+                    result.push('\\');
+                    result.push(other);
+                }
                 None => result.push('\\'),
             }
         } else {
@@ -79,7 +82,9 @@ pub fn parse_vcard(data: &str) -> Result<ParsedContact, String> {
     loop {
         match parser.next() {
             Some(Ok(cl)) => {
-                if cl.name().eq_ignore_ascii_case("BEGIN") && cl.value().eq_ignore_ascii_case("VCARD") {
+                if cl.name().eq_ignore_ascii_case("BEGIN")
+                    && cl.value().eq_ignore_ascii_case("VCARD")
+                {
                     in_vcard = true;
                     lines.clear();
                 }
@@ -115,11 +120,17 @@ pub fn parse_vcard(data: &str) -> Result<ParsedContact, String> {
             }
             "EMAIL" => {
                 let types = get_param_values(cl, "TYPE");
-                contact.emails.push(ParsedEmail { email: value, types });
+                contact.emails.push(ParsedEmail {
+                    email: value,
+                    types,
+                });
             }
             "TEL" => {
                 let types = get_param_values(cl, "TYPE");
-                contact.phones.push(ParsedPhone { number: value, types });
+                contact.phones.push(ParsedPhone {
+                    number: value,
+                    types,
+                });
             }
             "ADR" => {
                 let parts: Vec<&str> = value.split(';').collect();
@@ -190,7 +201,10 @@ pub fn parse_vcard(data: &str) -> Result<ParsedContact, String> {
                 }
             }
             "PHOTO" | "LOGO" => {
-                if value.starts_with("data:") || value.starts_with("http://") || value.starts_with("https://") {
+                if value.starts_with("data:")
+                    || value.starts_with("http://")
+                    || value.starts_with("https://")
+                {
                     contact.photos.push(value);
                 } else if !value.is_empty() {
                     contact.photos.push(value);
@@ -212,31 +226,35 @@ pub fn download_url_photos(photos: &mut Vec<String>) {
                 .timeout(std::time::Duration::from_secs(10))
                 .build()
             {
-                Ok(client) => {
-                    match client.get(photo.as_str()).send() {
-                        Ok(resp) => {
-                            if resp.status().is_success() {
-                                let ct = resp.headers()
-                                    .get("content-type")
-                                    .and_then(|v| v.to_str().ok())
-                                    .unwrap_or("image/jpeg")
-                                    .to_string();
-                                let bytes = resp.bytes();
-                                match bytes {
-                                    Ok(b) => {
-                                        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &b);
-                                        let data_uri = format!("data:{ct};base64,{b64}");
-                                        replacements.push((i, data_uri));
-                                    }
-                                    Err(e) => eprintln!("Failed to read photo bytes from {}: {e}", photo),
+                Ok(client) => match client.get(photo.as_str()).send() {
+                    Ok(resp) => {
+                        if resp.status().is_success() {
+                            let ct = resp
+                                .headers()
+                                .get("content-type")
+                                .and_then(|v| v.to_str().ok())
+                                .unwrap_or("image/jpeg")
+                                .to_string();
+                            let bytes = resp.bytes();
+                            match bytes {
+                                Ok(b) => {
+                                    let b64 = base64::Engine::encode(
+                                        &base64::engine::general_purpose::STANDARD,
+                                        &b,
+                                    );
+                                    let data_uri = format!("data:{ct};base64,{b64}");
+                                    replacements.push((i, data_uri));
                                 }
-                            } else {
-                                eprintln!("Photo download failed {} status={}", photo, resp.status());
+                                Err(e) => {
+                                    eprintln!("Failed to read photo bytes from {}: {e}", photo)
+                                }
                             }
+                        } else {
+                            eprintln!("Photo download failed {} status={}", photo, resp.status());
                         }
-                        Err(e) => eprintln!("Photo download request failed {}: {e}", photo),
                     }
-                }
+                    Err(e) => eprintln!("Photo download request failed {}: {e}", photo),
+                },
                 Err(e) => eprintln!("Failed to build HTTP client for photo: {e}"),
             }
         }

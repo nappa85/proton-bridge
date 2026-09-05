@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Build Proton Contacts Buteo sync plugin
+# Build Proton Contacts Buteo sync plugin + SignOn auth plugin
 # 1. Cross-compile Rust staticlib (aarch64-unknown-linux-gnu)
-# 2. Compile C++ plugin + link (SDK container)
+# 2. Compile C++ Buteo plugin + SignOn plugin + link (SDK container)
 # 3. Deploy to phone
 set -euo pipefail
 
@@ -10,6 +10,7 @@ packaging_dir="$repo_root/packaging"
 target_triple="aarch64-unknown-linux-gnu"
 
 mkdir -p "$packaging_dir/buteo-plugin" \
+         "$packaging_dir/signon-plugin" \
          "$packaging_dir/accounts" \
          "$packaging_dir/ui" \
          "$packaging_dir/rpm" \
@@ -33,13 +34,29 @@ if [ ! -f "$repo_root/target/$target_triple/release/libproton_bridge.a" ]; then
 fi
 
 echo "========================================="
-echo " Step 2: Compile C++ Buteo plugin        "
+echo " Step 2: Compile C++ plugins             "
 echo "========================================="
 
+# Prepare Buteo plugin sources
 cp "$repo_root/proton-bridge/cxx/proton_bridge_shim.h" "$packaging_dir/buteo-plugin/"
 cp "$repo_root/proton-bridge/cxx/proton_bridge_shim.cpp" "$packaging_dir/buteo-plugin/"
 cp "$repo_root/proton-bridge/proton_bridge.h" "$packaging_dir/buteo-plugin/"
 cp "$repo_root/target/$target_triple/release/libproton_bridge.a" "$packaging_dir/buteo-plugin/"
+
+# Prepare SignOn plugin sources
+cp "$repo_root/proton-bridge/signon/proton_signon_plugin.h" "$packaging_dir/signon-plugin/"
+cp "$repo_root/proton-bridge/signon/proton_signon_plugin.cpp" "$packaging_dir/signon-plugin/"
+if [ -f "$repo_root/proton-bridge/signon/minimal_authpluginif.h" ]; then
+    cp "$repo_root/proton-bridge/signon/minimal_authpluginif.h" "$packaging_dir/signon-plugin/"
+fi
+# proton plugin json is proton_plugin.json (not proton.json)
+if [ -f "$repo_root/proton-bridge/signon/proton_plugin.json" ]; then
+    cp "$repo_root/proton-bridge/signon/proton_plugin.json" "$packaging_dir/signon-plugin/proton.json"
+elif [ -f "$repo_root/proton-bridge/signon/proton.json" ]; then
+    cp "$repo_root/proton-bridge/signon/proton.json" "$packaging_dir/signon-plugin/"
+fi
+cp "$repo_root/proton-bridge/proton_bridge.h" "$packaging_dir/signon-plugin/"
+cp "$repo_root/target/$target_triple/release/libproton_bridge.a" "$packaging_dir/signon-plugin/"
 
 mkdir -p "$packaging_dir/buteo-headers/Buteo"
 if [ -d "$repo_root/buteo-syncfw/libbuteosyncfw" ]; then
@@ -68,37 +85,48 @@ ln -sf libQt5Core.so.5 $TARGET_ROOT/usr/lib64/libQt5Core.so 2>/dev/null || true
 ln -sf libQt5Contacts.so.5 $TARGET_ROOT/usr/lib64/libQt5Contacts.so 2>/dev/null || true
 ln -sf libaccounts-qt5.so.1 $TARGET_ROOT/usr/lib64/libaccounts-qt5.so 2>/dev/null || true
 ln -sf libsignon-qt5.so.1 $TARGET_ROOT/usr/lib64/libsignon-qt5.so 2>/dev/null || true
+ln -sf libsignon-plugins-common.so.1 $TARGET_ROOT/usr/lib64/libsignon-plugins-common.so 2>/dev/null || true
 ln -sf libQt5DBus.so.5 $TARGET_ROOT/usr/lib64/libQt5DBus.so 2>/dev/null || true
 ln -sf libQt5Xml.so.5 $TARGET_ROOT/usr/lib64/libQt5Xml.so 2>/dev/null || true
 ln -sf libQt5Network.so.5 $TARGET_ROOT/usr/lib64/libQt5Network.so 2>/dev/null || true
 
-COMMON_INC="-I/home/mersdk/packaging/buteo-headers \
+BUTEO_INC="-I/home/mersdk/packaging/buteo-headers \
     -I/home/mersdk/packaging/buteo-headers/Buteo \
     -I$TARGET_ROOT/usr/include/qt5 \
     -I$TARGET_ROOT/usr/include/qt5/QtCore \
     -I$TARGET_ROOT/usr/include/qt5/QtContacts \
     -I$TARGET_ROOT/usr/include/qt5/QtDBus \
     -I$TARGET_ROOT/usr/include/qt5/QtXml \
+    -I$TARGET_ROOT/usr/include/qt5/QtNetwork \
     -I$TARGET_ROOT/usr/include/accounts-qt5 \
     -I$TARGET_ROOT/usr/include/signon-qt5 \
     -I$TARGET_ROOT/usr/include \
     -DQT_CORE_LIB"
 
+SIGNON_INC="-I/home/mersdk/packaging/signon-plugin \
+    -I$TARGET_ROOT/usr/include/qt5 \
+    -I$TARGET_ROOT/usr/include/qt5/QtCore \
+    -I$TARGET_ROOT/usr/include/signon-qt5 \
+    -I$TARGET_ROOT/usr/include \
+    -DQT_CORE_LIB"
+
+# === Buteo plugin ===
+
 # Moc
-$MOC $COMMON_INC \
+$MOC $BUTEO_INC \
     /home/mersdk/packaging/buteo-plugin/proton_bridge_shim.h \
     -o /home/mersdk/packaging/buteo-plugin/moc_proton_bridge_shim.cpp
 
 # Compile
 aarch64-meego-linux-gnu-g++ \
     -std=c++14 -c -fPIC --sysroot=$TARGET_ROOT \
-    $COMMON_INC \
+    $BUTEO_INC \
     -o /home/mersdk/packaging/buteo-plugin/shim.o \
     /home/mersdk/packaging/buteo-plugin/proton_bridge_shim.cpp
 
 aarch64-meego-linux-gnu-g++ \
     -std=c++14 -c -fPIC --sysroot=$TARGET_ROOT \
-    $COMMON_INC \
+    $BUTEO_INC \
     -o /home/mersdk/packaging/buteo-plugin/moc_shim.o \
     /home/mersdk/packaging/buteo-plugin/moc_proton_bridge_shim.cpp
 
@@ -122,11 +150,48 @@ aarch64-meego-linux-gnu-g++ \
     -lpthread -ldl -lm
 
 chown 1000:1000 /home/mersdk/packaging/buteo-plugin/libproton-client.so
-echo "Plugin built successfully"
+echo "Buteo plugin built successfully"
 ls -lh /home/mersdk/packaging/buteo-plugin/libproton-client.so
 
-echo "=== GLIBC requirements ==="
-objdump -T /home/mersdk/packaging/buteo-plugin/libproton-client.so | grep GLIBC | awk "{print \$5}" | sort -V -u
+# === SignOn plugin ===
+
+# Moc
+$MOC $SIGNON_INC \
+    /home/mersdk/packaging/signon-plugin/proton_signon_plugin.h \
+    -o /home/mersdk/packaging/signon-plugin/moc_proton_signon_plugin.cpp
+
+# Compile
+aarch64-meego-linux-gnu-g++ \
+    -std=c++14 -c -fPIC --sysroot=$TARGET_ROOT \
+    $SIGNON_INC \
+    -o /home/mersdk/packaging/signon-plugin/signon_plugin.o \
+    /home/mersdk/packaging/signon-plugin/proton_signon_plugin.cpp
+
+aarch64-meego-linux-gnu-g++ \
+    -std=c++14 -c -fPIC --sysroot=$TARGET_ROOT \
+    $SIGNON_INC \
+    -o /home/mersdk/packaging/signon-plugin/moc_signon_plugin.o \
+    /home/mersdk/packaging/signon-plugin/moc_proton_signon_plugin.cpp
+
+# Link – filename must match Type in json (proton -> libprotonplugin.so per Sailfish convention)
+rm -f /home/mersdk/packaging/signon-plugin/libprotonplugin.so
+rm -f /home/mersdk/packaging/signon-plugin/libproton.so
+aarch64-meego-linux-gnu-g++ \
+    -shared -fPIC --sysroot=$TARGET_ROOT \
+    -o /home/mersdk/packaging/signon-plugin/libprotonplugin.so \
+    /home/mersdk/packaging/signon-plugin/signon_plugin.o \
+    /home/mersdk/packaging/signon-plugin/moc_signon_plugin.o \
+    -L$TARGET_ROOT/usr/lib64 \
+    /home/mersdk/packaging/signon-plugin/libproton_bridge.a \
+    -lsignon-qt5 \
+    -lsignon-plugins-common \
+    -lQt5Core \
+    -lQt5Network \
+    -lpthread -ldl -lm
+
+chown 1000:1000 /home/mersdk/packaging/signon-plugin/libprotonplugin.so
+echo "SignOn plugin built successfully"
+ls -lh /home/mersdk/packaging/signon-plugin/libprotonplugin.so
 '
 
 echo "========================================="
@@ -134,25 +199,60 @@ echo " Step 3: Deploy to phone                 "
 echo "========================================="
 
 PHONE_IP="${1:-192.168.1.124}"
-PLUGIN="$packaging_dir/buteo-plugin/libproton-client.so"
+BUTEO_PLUGIN="$packaging_dir/buteo-plugin/libproton-client.so"
+# Plugin is now correctly named libprotonplugin.so
+if [ -f "$packaging_dir/signon-plugin/libprotonplugin.so" ]; then
+    SIGNON_PLUGIN="$packaging_dir/signon-plugin/libprotonplugin.so"
+else
+    SIGNON_PLUGIN="$packaging_dir/signon-plugin/libproton.so"
+fi
 
 echo "Deploying to $PHONE_IP..."
-scp "$PLUGIN" defaultuser@$PHONE_IP:/tmp/libproton-client.so
+scp "$BUTEO_PLUGIN" defaultuser@$PHONE_IP:/tmp/libproton-client.so
+scp "$SIGNON_PLUGIN" defaultuser@$PHONE_IP:/tmp/libprotonplugin.so
 
 # Copy profiles
 scp "$repo_root/buteo-profiles/client/proton-contacts.xml" defaultuser@$PHONE_IP:/tmp/
 scp "$repo_root/buteo-profiles/sync/proton.Contacts.xml" defaultuser@$PHONE_IP:/tmp/
 
+# Copy account XMLs
+scp "$repo_root/packaging/accounts/proton.provider" defaultuser@$PHONE_IP:/tmp/
+scp "$repo_root/packaging/accounts/proton-carddav.service" defaultuser@$PHONE_IP:/tmp/
+scp "$repo_root/ui/proton.qml" defaultuser@$PHONE_IP:/tmp/proton.qml
+scp "$repo_root/ui/proton-settings.qml" defaultuser@$PHONE_IP:/tmp/proton-settings.qml
+scp "$repo_root/ui/proton-update.qml" defaultuser@$PHONE_IP:/tmp/proton-update.qml
+
 ssh defaultuser@$PHONE_IP "
 set -e
-# Install plugin (need root for /usr/lib64)
+# Install plugins (need root for /usr/lib64)
 devel-su bash -c '
 cp /tmp/libproton-client.so /usr/lib64/buteo-plugins-qt5/oopp/libproton-client.so
 chmod 755 /usr/lib64/buteo-plugins-qt5/oopp/libproton-client.so
 rm -f /usr/lib64/buteo-plugins-qt5/oopp/libproton-contacts-client.so
 rm -f /usr/lib64/buteo-plugins-qt5/oopp/proton-contacts-client.so
+
+mkdir -p /usr/lib64/signon
+cp /tmp/libprotonplugin.so /usr/lib64/signon/libprotonplugin.so
+chmod 755 /usr/lib64/signon/libprotonplugin.so
+# Remove old incorrect location
+rm -f /usr/lib/signon/libproton.so
+rm -f /usr/lib64/signon/libproton.so
+
 cp /tmp/proton-contacts.xml /etc/buteo/profiles/client/proton.xml
+# Sync profile name is proton-carddav – ensure correct filename and cleanup old
+cp /tmp/proton.Contacts.xml /etc/buteo/profiles/sync/proton-carddav.xml
 cp /tmp/proton.Contacts.xml /etc/buteo/profiles/sync/proton.Contacts.xml
+rm -f /etc/buteo/profiles/sync/proton.xml 2>/dev/null || true
+
+mkdir -p /usr/share/accounts/providers
+cp /tmp/proton.provider /usr/share/accounts/providers/proton.provider
+mkdir -p /usr/share/accounts/services
+cp /tmp/proton-carddav.service /usr/share/accounts/services/proton-carddav.service
+mkdir -p /usr/share/accounts/ui
+cp /tmp/proton.qml /usr/share/accounts/ui/proton.qml
+cp /tmp/proton-settings.qml /usr/share/accounts/ui/proton-settings.qml
+cp /tmp/proton-update.qml /usr/share/accounts/ui/proton-update.qml
+rm -f /usr/share/accounts/ui/proton-creation.qml
 '
 
 # Restart msyncd

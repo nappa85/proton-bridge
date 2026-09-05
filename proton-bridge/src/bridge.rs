@@ -61,16 +61,47 @@ pub extern "C" fn proton_bridge_create_engine(
     access_token: *const c_char,
     refresh_token: *const c_char,
     uid: *const c_char,
+    totp_code: *const c_char,
+) -> *mut ProtonSyncEngine {
+    proton_bridge_create_engine_with_derived(
+        username,
+        password,
+        access_token,
+        refresh_token,
+        uid,
+        totp_code,
+        std::ptr::null(),
+    )
+}
+
+#[no_mangle]
+pub extern "C" fn proton_bridge_create_engine_with_derived(
+    username: *const c_char,
+    password: *const c_char,
+    access_token: *const c_char,
+    refresh_token: *const c_char,
+    uid: *const c_char,
+    totp_code: *const c_char,
+    derived_passwords_json: *const c_char,
 ) -> *mut ProtonSyncEngine {
     let username = unsafe { cstr_to_string(username) };
     let password = unsafe { cstr_to_string(password) };
     let access_token_str = unsafe { cstr_to_string(access_token) };
     let refresh_token_str = unsafe { cstr_to_string(refresh_token) };
     let uid_str = unsafe { cstr_to_string(uid) };
+    let totp_code_str = unsafe { cstr_to_string(totp_code) };
+    let derived_json_str = unsafe { cstr_to_string(derived_passwords_json) };
+
+    let derived_passwords = if derived_json_str.is_empty() {
+        None
+    } else {
+        serde_json::from_str(&derived_json_str).ok()
+    };
 
     let config = SyncConfig {
         username,
         password,
+        derived_passwords,
         access_token: if access_token_str.is_empty() {
             None
         } else {
@@ -85,6 +116,11 @@ pub extern "C" fn proton_bridge_create_engine(
             None
         } else {
             Some(uid_str)
+        },
+        totp_code: if totp_code_str.is_empty() {
+            None
+        } else {
+            Some(totp_code_str)
         },
         ..Default::default()
     };
@@ -217,6 +253,40 @@ pub extern "C" fn proton_bridge_get_uid(engine: *mut ProtonSyncEngine) -> *mut c
     let guard = engine_ref.inner.lock().unwrap();
     match guard.as_ref() {
         Some(e) => match e.get_uid() {
+            Some(s) => CString::new(s).unwrap().into_raw(),
+            None => std::ptr::null_mut(),
+        },
+        None => std::ptr::null_mut(),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn proton_bridge_get_derived_passwords_json(
+    engine: *mut ProtonSyncEngine,
+) -> *mut c_char {
+    if engine.is_null() {
+        return std::ptr::null_mut();
+    }
+    let engine_ref = unsafe { &*engine };
+    let guard = engine_ref.inner.lock().unwrap();
+    match guard.as_ref() {
+        Some(e) => match e.get_derived_passwords_json() {
+            Some(s) => CString::new(s).unwrap().into_raw(),
+            None => std::ptr::null_mut(),
+        },
+        None => std::ptr::null_mut(),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn proton_bridge_get_keys_debug(engine: *mut ProtonSyncEngine) -> *mut c_char {
+    if engine.is_null() {
+        return std::ptr::null_mut();
+    }
+    let engine_ref = unsafe { &*engine };
+    let guard = engine_ref.inner.lock().unwrap();
+    match guard.as_ref() {
+        Some(e) => match e.get_keys_debug() {
             Some(s) => CString::new(s).unwrap().into_raw(),
             None => std::ptr::null_mut(),
         },

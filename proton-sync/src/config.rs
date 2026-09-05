@@ -6,6 +6,7 @@ pub struct SyncConfig {
     pub account_id: String,
     pub username: String,
     pub password: String,
+    pub derived_passwords: Option<HashMap<String, String>>,
     pub access_token: Option<String>,
     pub refresh_token: Option<String>,
     pub uid: Option<String>,
@@ -14,4 +15,5 @@ pub struct SyncConfig {
     pub last_sync: Option<String>,
     pub collection_remote_uid: Option<String>,
     pub custom_fields: HashMap<String, String>,
+    pub totp_code: Option<String>,
 }

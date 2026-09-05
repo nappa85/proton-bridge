@@ -15,8 +15,19 @@ pub struct AuthClient {
 
 #[derive(Debug, Clone)]
 pub enum LoginState {
-    Authenticated { tokens: AuthTokens, scopes: Vec<String> },
-    Requires2FA { access_token: String, refresh_token: String, uid: String, scopes: Vec<String> },
+    Authenticated {
+        tokens: AuthTokens,
+        scopes: Vec<String>,
+    },
+    Requires2FA {
+        /// Locked-session access token (scopes: twofactor). Upgraded in-place
+        /// by the server once the TOTP code is submitted.
+        access_token: String,
+        /// Refresh token issued at login; stays valid after 2FA.
+        refresh_token: String,
+        uid: String,
+        scopes: Vec<String>,
+    },
 }
 
 impl AuthClient {
@@ -65,14 +76,27 @@ impl AuthClient {
         }
     }
 
-    pub fn submit_2fa(&self, totp_code: &str, access_token: &str, uid: &str) -> Result<AuthTokens> {
+    /// Submits the TOTP code for a locked (2FA-pending) session.
+    ///
+    /// Per the Proton API (see go-proton-api Auth2FA), POST /auth/v4/2fa does
+    /// NOT return new tokens: it upgrades the scopes of the existing locked
+    /// session. The refresh token issued at login remains valid.
+    pub fn submit_2fa(
+        &self,
+        totp_code: &str,
+        access_token: &str,
+        refresh_token: &str,
+        uid: &str,
+    ) -> Result<AuthTokens> {
         let resp = self
             .client
-            .post(format!("{}/core/v4/auth/2fa", self.base_url))
+            .post(format!("{}/auth/v4/2fa", self.base_url))
             .header("x-pm-appversion", APP_VERSION)
             .header("x-pm-uid", uid)
             .bearer_auth(access_token)
-            .json(&TwoFARequest { TwoFactorCode: totp_code.to_string() })
+            .json(&TwoFARequest {
+                TwoFactorCode: totp_code.to_string(),
+            })
             .send()?;
 
         let status = resp.status();
@@ -84,11 +108,21 @@ impl AuthClient {
             )));
         }
 
+        // Response only carries {Code, Scope, Scopes} - no tokens. The
+        // original locked-session tokens are the valid ones now.
         let twofa_resp: TwoFAResponse = serde_json::from_str(&body)?;
+        if twofa_resp.Code != 1000 {
+            return Err(ProtonError::Auth(format!(
+                "2FA rejected, code {}: {}",
+                twofa_resp.Code,
+                twofa_resp.Error.unwrap_or_default()
+            )));
+        }
+
         Ok(AuthTokens {
-            access_token: twofa_resp.AccessToken,
-            refresh_token: twofa_resp.RefreshToken,
-            uid: twofa_resp.UID,
+            access_token: access_token.to_string(),
+            refresh_token: refresh_token.to_string(),
+            uid: uid.to_string(),
         })
     }
 
@@ -199,8 +233,16 @@ impl TokenManager {
         Ok(state)
     }
 
-    pub fn submit_2fa(&mut self, totp_code: &str, access_token: &str, uid: &str) -> Result<()> {
-        let tokens = self.auth.submit_2fa(totp_code, access_token, uid)?;
+    pub fn submit_2fa(
+        &mut self,
+        totp_code: &str,
+        access_token: &str,
+        refresh_token: &str,
+        uid: &str,
+    ) -> Result<()> {
+        let tokens = self
+            .auth
+            .submit_2fa(totp_code, access_token, refresh_token, uid)?;
         self.expires_at = Some(Instant::now() + Duration::from_secs(3600));
         self.tokens = Some(tokens);
         Ok(())
@@ -209,6 +251,10 @@ impl TokenManager {
     pub fn restore_tokens(&mut self, tokens: AuthTokens) {
         self.tokens = Some(tokens);
         self.expires_at = None;
+    }
+
+    pub fn set_expiry(&mut self, secs: u64) {
+        self.expires_at = Some(Instant::now() + Duration::from_secs(secs));
     }
 
     pub fn access_token(&mut self) -> Result<String> {
@@ -226,7 +272,10 @@ impl TokenManager {
     }
 
     fn refresh_internal(&mut self) -> Result<()> {
-        let tokens = self.tokens.as_ref().ok_or(ProtonError::Auth("No tokens".into()))?;
+        let tokens = self
+            .tokens
+            .as_ref()
+            .ok_or(ProtonError::Auth("No tokens".into()))?;
         if tokens.refresh_token.is_empty() {
             return Err(ProtonError::Auth("No refresh token available".into()));
         }
@@ -359,11 +408,14 @@ struct TwoFARequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(non_snake_case)]
 struct TwoFAResponse {
-    AccessToken: String,
-    RefreshToken: String,
-    UID: String,
+    #[serde(default)]
+    Code: i64,
+    #[serde(default)]
+    Scope: Option<String>,
     #[serde(default)]
     Scopes: Option<Vec<String>>,
+    #[serde(default)]
+    Error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -441,14 +493,8 @@ impl SrpAuth {
 
         let shared = int_to_le(byte_len, &base.modpow(&exp, &n));
 
-        let client_proof = expand_hash(
-            [
-                client_ephemeral.as_slice(),
-                &self.server_ephemeral,
-                &shared,
-            ]
-            .concat(),
-        );
+        let client_proof =
+            expand_hash([client_ephemeral.as_slice(), &self.server_ephemeral, &shared].concat());
 
         Ok(SrpProofs {
             client_ephemeral,
@@ -472,24 +518,33 @@ fn extract_clearsign_payload(msg: &str) -> Result<String> {
         .ok_or_else(|| ProtonError::Auth("No PGP signed message header".into()))?;
     let rest = &msg[after_header + header.len()..];
 
-    let hash_end = rest.find('\n').ok_or_else(|| ProtonError::Auth("No newline after header".into()))?;
+    let hash_end = rest
+        .find('\n')
+        .ok_or_else(|| ProtonError::Auth("No newline after header".into()))?;
     let after_hash = &rest[hash_end + 1..];
 
-    let blank_end = after_hash.find('\n').ok_or_else(|| ProtonError::Auth("No blank line".into()))?;
+    let blank_end = after_hash
+        .find('\n')
+        .ok_or_else(|| ProtonError::Auth("No blank line".into()))?;
     let payload_start = &after_hash[blank_end + 1..];
 
     let sig_pos = payload_start
         .find(sig_start)
         .ok_or_else(|| ProtonError::Auth("No PGP signature block".into()))?;
 
-    let payload = payload_start[..sig_pos].trim_end_matches('\n').trim_end_matches('\r').trim();
+    let payload = payload_start[..sig_pos]
+        .trim_end_matches('\n')
+        .trim_end_matches('\r')
+        .trim();
     Ok(payload.to_string())
 }
 
 fn hash_password(version: i64, password: &[u8], salt: &[u8], modulus: &[u8]) -> Result<Vec<u8>> {
     match version {
         4 | 3 => hash_password_v3(password, salt, modulus),
-        _ => Err(ProtonError::Auth(format!("Unsupported auth version: {version}"))),
+        _ => Err(ProtonError::Auth(format!(
+            "Unsupported auth version: {version}"
+        ))),
     }
 }
 

@@ -8,9 +8,11 @@ pub mod vcard;
 
 pub use auth::{AuthClient, LoginState, TokenManager};
 pub use contacts::ContactsClient;
+pub use crypto::{decrypt_contact_card, derive_mailbox_password, UnlockedKey};
 pub use error::{ProtonError, Result};
 pub use keys::KeysClient;
 pub use models::*;
-pub use crypto::{UnlockedKey, derive_mailbox_password, decrypt_contact_card};
-pub use vcard::{ParsedContact, ParsedEmail, ParsedPhone, ParsedAddress, parse_vcard, format_bday, download_url_photos};
-
+pub use vcard::{
+    download_url_photos, format_bday, parse_vcard, ParsedAddress, ParsedContact, ParsedEmail,
+    ParsedPhone,
+};

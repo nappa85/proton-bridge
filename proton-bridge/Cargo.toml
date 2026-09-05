@@ -13,7 +13,9 @@ crate-type = ["staticlib", "cdylib"]
 path = "src/lib.rs"
 
 [dependencies]
+proton-api = { path = "../proton-api" }
 proton-sync = { path = "../proton-sync" }
+serde_json = { workspace = true }
 
 [build-dependencies]
 cbindgen = { workspace = true }

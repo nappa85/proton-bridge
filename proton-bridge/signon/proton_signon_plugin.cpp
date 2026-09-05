@@ -1,0 +1,249 @@
+#include "proton_signon_plugin.h"
+#include <QDebug>
+#include <QVariantMap>
+
+/*
+ * Proton SignOn authentication plugin (method "proton", mechanism "password").
+ *
+ * signond merges the identity secret (UserName/Secret) and the previously
+ * stored method blob (tokens) into the session data before invoking
+ * process(), so the flow is fully driven by the input map:
+ *
+ *   - RefreshToken + Uid present  -> POST /auth/v4/refresh, return tokens.
+ *   - Otherwise full SRP login with UserName/Secret.
+ *       - account has no 2FA     -> tokens stored + returned.
+ *       - account has TOTP 2FA   -> return the "Requires2FA" state through
+ *                                    the result map (TwoFARequired=true +
+ *                                    locked-session tokens) WITHOUT storing
+ *                                    anything; the caller re-invokes the
+ *                                    session with TwoFactorPassword=<code>
+ *                                    (and the returned tokens) to complete.
+ *
+ * Tokens are persisted via the store() signal: signond keeps every property
+ * except UserName/Secret in the per-identity, per-method blob store, so
+ * subsequent sessions (buteo sync plugin, credentials verification) receive
+ * them automatically. The user's password is never persisted by this plugin;
+ * it lives only in the signond-managed identity secret.
+ *
+ * The OTP code is intentionally NOT requested through signon-ui
+ * (userActionRequired): the in-process entry dialog crashes this
+ * jolla-signon-ui version (SIGSEGV in InProcessEntryView) and the
+ * NoUserInteractionPolicy used by credential verification would block it
+ * anyway. Account creation/update UIs collect the code in their own QML.
+ */
+
+SIGNON_DECL_AUTH_PLUGIN(ProtonSignonPlugin)
+
+ProtonSignonPlugin::ProtonSignonPlugin(QObject *parent)
+    : AuthPluginInterface(parent)
+{
+}
+
+ProtonSignonPlugin::~ProtonSignonPlugin()
+{
+}
+
+QString ProtonSignonPlugin::type() const
+{
+    return QStringLiteral("proton");
+}
+
+QStringList ProtonSignonPlugin::mechanisms() const
+{
+    return { QStringLiteral("password") };
+}
+
+void ProtonSignonPlugin::cancel()
+{
+    // Nothing to cancel: no UI interaction, no background tasks.
+}
+
+static QVariantMap tokensMap(const QString &username,
+                             const QString &accessToken,
+                             const QString &refreshToken,
+                             const QString &uid)
+{
+    QVariantMap map;
+    if (!username.isEmpty())
+        map.insert(QStringLiteral("UserName"), username);
+    if (!accessToken.isEmpty())
+        map.insert(QStringLiteral("AccessToken"), accessToken);
+    if (!refreshToken.isEmpty())
+        map.insert(QStringLiteral("RefreshToken"), refreshToken);
+    if (!uid.isEmpty())
+        map.insert(QStringLiteral("Uid"), uid);
+    return map;
+}
+
+void ProtonSignonPlugin::handleAuthOk(ProtonAuthResult &authResult,
+                                      const QString &username,
+                                      const QString &password)
+{
+    QString newAccess = QString::fromUtf8(authResult.access_token);
+    QString newRefresh = QString::fromUtf8(authResult.refresh_token);
+    QString newUid = QString::fromUtf8(authResult.uid);
+    proton_auth_free_result(&authResult);
+
+    QVariantMap tokens = tokensMap(username, newAccess, newRefresh, newUid);
+
+    // Persist the tokens in signond's blob store (UserName/Secret are
+    // stripped by signond when storing; the identity secret stays as-is).
+    emit store(SignOn::SessionData(tokens));
+
+    QVariantMap response = tokens;
+    if (!password.isEmpty())
+        response.insert(QStringLiteral("Secret"), password);
+    emit result(SignOn::SessionData(response));
+}
+
+void ProtonSignonPlugin::process(const SignOn::SessionData &dataIn, const QString &mechanism)
+{
+    Q_UNUSED(mechanism);
+
+    QString username = dataIn.UserName();
+    QString password = dataIn.Secret();
+    QString refreshToken = dataIn.getProperty(QStringLiteral("RefreshToken")).toString();
+    QString uid = dataIn.getProperty(QStringLiteral("Uid")).toString();
+    QString totpCode = dataIn.getProperty(QStringLiteral("TwoFactorPassword")).toString().trimmed();
+
+    // 1) Second factor submission: complete the locked-session login.
+    if (!totpCode.isEmpty() && !refreshToken.isEmpty() && !uid.isEmpty()) {
+        QString lockedAccess = dataIn.getProperty(QStringLiteral("AccessToken")).toString();
+        if (!lockedAccess.isEmpty()) {
+            ProtonAuthResult authResult = proton_auth_submit_2fa(
+                lockedAccess.toUtf8().constData(),
+                refreshToken.toUtf8().constData(),
+                uid.toUtf8().constData(),
+                totpCode.toUtf8().constData());
+
+            if (authResult.status == 0) {
+                qDebug() << "ProtonSignonPlugin: 2FA verified, session upgraded";
+                handleAuthOk(authResult, username, password);
+            } else {
+                QString errMsg = QString::fromUtf8(authResult.error);
+                proton_auth_free_result(&authResult);
+                qWarning() << "ProtonSignonPlugin: 2FA rejected:" << errMsg;
+                emit error(SignOn::Error(SignOn::Error::NotAuthorized, errMsg));
+            }
+            return;
+        }
+    }
+
+    // 2) Stored tokens available: refresh, never prompt for anything.
+    if (!refreshToken.isEmpty() && !uid.isEmpty()) {
+        ProtonAuthResult authResult = proton_auth_refresh(
+            refreshToken.toUtf8().constData(),
+            uid.toUtf8().constData());
+
+        if (authResult.status == 0) {
+            qDebug() << "ProtonSignonPlugin: refreshed session for uid" << uid;
+            handleAuthOk(authResult, username, password);
+            return;
+        }
+
+        QString err = QString::fromUtf8(authResult.error);
+        proton_auth_free_result(&authResult);
+        qWarning() << "ProtonSignonPlugin: token refresh failed:" << err;
+
+        // Fall back to full login only when we actually have a password.
+        if (password.isEmpty()) {
+            emit error(SignOn::Error(SignOn::Error::NotAuthorized,
+                                     QStringLiteral("Session expired, please sign in again")));
+            return;
+        }
+    }
+
+    // 3) Full SRP login.
+    if (username.isEmpty() || password.isEmpty()) {
+        emit error(SignOn::Error(SignOn::Error::MissingData,
+                                 QStringLiteral("Username and password are required")));
+        return;
+    }
+
+    ProtonAuthResult authResult = proton_auth_login(
+        username.toUtf8().constData(),
+        password.toUtf8().constData());
+
+    if (authResult.status == 0) {
+        // No 2FA on the account: fully authenticated.
+        handleAuthOk(authResult, username, password);
+        return;
+    }
+
+    if (authResult.status == 1) {
+        // 2FA required. If the caller supplied the code, finish the flow;
+        // otherwise hand the locked-session tokens back (do NOT store them -
+        // the session is not usable for data access until the second factor
+        // is verified) so the UI can ask for the code and retry.
+        QString lockedAccess = QString::fromUtf8(authResult.access_token);
+        QString lockedRefresh = QString::fromUtf8(authResult.refresh_token);
+        QString lockedUid = QString::fromUtf8(authResult.uid);
+        proton_auth_free_result(&authResult);
+
+        if (!totpCode.isEmpty()) {
+            ProtonAuthResult twoFaResult = proton_auth_submit_2fa(
+                lockedAccess.toUtf8().constData(),
+                lockedRefresh.toUtf8().constData(),
+                lockedUid.toUtf8().constData(),
+                totpCode.toUtf8().constData());
+
+            if (twoFaResult.status == 0) {
+                qDebug() << "ProtonSignonPlugin: 2FA verified, session upgraded";
+                handleAuthOk(twoFaResult, username, password);
+            } else {
+                QString errMsg = QString::fromUtf8(twoFaResult.error);
+                proton_auth_free_result(&twoFaResult);
+                qWarning() << "ProtonSignonPlugin: 2FA rejected:" << errMsg;
+                emit error(SignOn::Error(SignOn::Error::NotAuthorized, errMsg));
+            }
+            return;
+        }
+
+        QVariantMap response;
+        response.insert(QStringLiteral("TwoFARequired"), true);
+        response.insert(QStringLiteral("AccessToken"), lockedAccess);
+        response.insert(QStringLiteral("RefreshToken"), lockedRefresh);
+        response.insert(QStringLiteral("Uid"), lockedUid);
+        qDebug() << "ProtonSignonPlugin: 2FA required, returning locked session";
+        emit result(SignOn::SessionData(response));
+        return;
+    }
+
+    QString errMsg = QString::fromUtf8(authResult.error);
+    proton_auth_free_result(&authResult);
+    emit error(SignOn::Error(SignOn::Error::NotAuthorized, errMsg));
+}
+
+void ProtonSignonPlugin::userActionFinished(const SignOn::UiSessionData &data)
+{
+    Q_UNUSED(data);
+    // No UI interaction is requested by this plugin.
+    emit error(SignOn::Error(SignOn::Error::OperationNotSupported,
+                             QStringLiteral("No user interaction expected")));
+}
+
+void ProtonSignonPlugin::refresh(const SignOn::UiSessionData &data)
+{
+    QString refreshToken = data.getProperty(QStringLiteral("RefreshToken")).toString();
+    QString uid = data.getProperty(QStringLiteral("Uid")).toString();
+    QString username = data.UserName();
+
+    if (refreshToken.isEmpty() || uid.isEmpty()) {
+        emit error(SignOn::Error(SignOn::Error::MissingData,
+                                 QStringLiteral("No stored tokens to refresh")));
+        return;
+    }
+
+    ProtonAuthResult authResult = proton_auth_refresh(
+        refreshToken.toUtf8().constData(),
+        uid.toUtf8().constData());
+
+    if (authResult.status == 0) {
+        handleAuthOk(authResult, username, QString());
+        return;
+    }
+
+    QString errMsg = QString::fromUtf8(authResult.error);
+    proton_auth_free_result(&authResult);
+    emit error(SignOn::Error(SignOn::Error::NotAuthorized, errMsg));
+}

@@ -70,12 +70,19 @@ pub struct ContactCard {
     pub Signature: String,
 }
 
-fn deserialize_card_type<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<i32, D::Error> {
+fn deserialize_card_type<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> std::result::Result<i32, D::Error> {
     use serde::de;
     let val = serde_json::Value::deserialize(d)?;
     match val {
-        serde_json::Value::Number(n) => n.as_i64().map(|v| v as i32).ok_or_else(|| de::Error::custom("invalid number")),
-        serde_json::Value::String(s) => s.parse::<i32>().map_err(|_| de::Error::custom("invalid string number")),
+        serde_json::Value::Number(n) => n
+            .as_i64()
+            .map(|v| v as i32)
+            .ok_or_else(|| de::Error::custom("invalid number")),
+        serde_json::Value::String(s) => s
+            .parse::<i32>()
+            .map_err(|_| de::Error::custom("invalid string number")),
         _ => Err(de::Error::custom("expected number or string")),
     }
 }

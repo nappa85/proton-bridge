@@ -74,7 +74,10 @@ impl ContactsClient {
             match self.get(&summary.ID) {
                 Ok(full) => full_contacts.push(full),
                 Err(e) => {
-                    eprintln!("Failed to fetch contact {}: {}, using summary", summary.ID, e);
+                    eprintln!(
+                        "Failed to fetch contact {}: {}, using summary",
+                        summary.ID, e
+                    );
                     full_contacts.push(summary.clone());
                 }
             }
@@ -99,8 +102,8 @@ impl ContactsClient {
             let _ = f.write_all(text.as_bytes());
         }
         let parsed: serde_json::Value = serde_json::from_str(&text)?;
-        let contact: Contact = serde_json::from_value(parsed["Contact"].clone())
-            .map_err(|e| ProtonError::Serde(e))?;
+        let contact: Contact =
+            serde_json::from_value(parsed["Contact"].clone()).map_err(|e| ProtonError::Serde(e))?;
         Ok(contact)
     }
 

@@ -1,11 +1,7 @@
 #pragma once
 
 #include "Buteo/ClientPlugin.h"
-#include "Buteo/SyncProfile.h"
-#include "Buteo/SyncResults.h"
-#include "Buteo/PluginCbInterface.h"
 #include "Buteo/SyncPluginLoader.h"
-#include "Buteo/SyncCommonDefs.h"
 
 #include <QContactManager>
 #include <QContact>
@@ -44,6 +40,7 @@
 #include <Accounts/auth-data.h>
 #include <Accounts/service.h>
 #include <SignOn/identity.h>
+#include <SignOn/identityinfo.h>
 #include <SignOn/authsession.h>
 #include <SignOn/sessiondata.h>
 #include <SignOn/signonerror.h>

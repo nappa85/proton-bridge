@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<profile name="proton.Contacts" type="sync">
+<profile name="proton-carddav" type="sync">
     <key name="destinationtype" value="online"/>
     <key name="enabled" value="false"/>
     <key name="hidden" value="true"/>

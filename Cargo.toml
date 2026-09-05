@@ -4,7 +4,6 @@ members = [
     "proton-api",
     "proton-sync",
     "proton-bridge",
-    "test-srp",
 ]
 
 [workspace.package]

@@ -1,11 +1,14 @@
 use crate::{ProtonError, Result};
 use base64::Engine;
 use sequoia_openpgp::{
-    Cert, KeyHandle,
     crypto::{Password, SessionKey},
-    parse::{Parse, stream::{DecryptorBuilder, DecryptionHelper, VerificationHelper, MessageStructure}},
+    parse::{
+        stream::{DecryptionHelper, DecryptorBuilder, MessageStructure, VerificationHelper},
+        Parse,
+    },
     policy::StandardPolicy,
     types::SymmetricAlgorithm,
+    Cert, KeyHandle,
 };
 
 pub fn derive_mailbox_password(password: &[u8], key_salt_b64: &str) -> Result<Vec<u8>> {
@@ -49,7 +52,11 @@ impl UnlockedKey {
             let mut key = ka.key().clone();
             let pk_algo = key.pk_algo();
             if key.secret().is_encrypted() {
-                if key.secret_mut().decrypt_in_place(pk_algo, &Password::from(passphrase.to_vec())).is_err() {
+                if key
+                    .secret_mut()
+                    .decrypt_in_place(pk_algo, &Password::from(passphrase.to_vec()))
+                    .is_err()
+                {
                     continue;
                 }
             }
@@ -63,15 +70,20 @@ impl UnlockedKey {
         }
 
         if keypairs.is_empty() {
-            return Err(ProtonError::Crypto("Failed to unlock any key with passphrase".into()));
+            return Err(ProtonError::Crypto(
+                "Failed to unlock any key with passphrase".into(),
+            ));
         }
 
-        Ok(Self { keypairs, fingerprints })
+        Ok(Self {
+            keypairs,
+            fingerprints,
+        })
     }
 
     pub fn from_bytes(bytes: &[u8], passphrase: &[u8]) -> Result<Self> {
-        let cert = Cert::from_bytes(bytes)
-            .map_err(|e| ProtonError::Crypto(format!("Parse key: {e}")))?;
+        let cert =
+            Cert::from_bytes(bytes).map_err(|e| ProtonError::Crypto(format!("Parse key: {e}")))?;
 
         let mut keypairs = Vec::new();
         let mut fingerprints = Vec::new();
@@ -80,7 +92,11 @@ impl UnlockedKey {
             let mut key = ka.key().clone();
             let pk_algo = key.pk_algo();
             if key.secret().is_encrypted() {
-                if key.secret_mut().decrypt_in_place(pk_algo, &Password::from(passphrase.to_vec())).is_err() {
+                if key
+                    .secret_mut()
+                    .decrypt_in_place(pk_algo, &Password::from(passphrase.to_vec()))
+                    .is_err()
+                {
                     continue;
                 }
             }
@@ -94,10 +110,15 @@ impl UnlockedKey {
         }
 
         if keypairs.is_empty() {
-            return Err(ProtonError::Crypto("Failed to unlock any key with passphrase".into()));
+            return Err(ProtonError::Crypto(
+                "Failed to unlock any key with passphrase".into(),
+            ));
         }
 
-        Ok(Self { keypairs, fingerprints })
+        Ok(Self {
+            keypairs,
+            fingerprints,
+        })
     }
 }
 
@@ -116,8 +137,15 @@ impl<'a> VerificationHelper for Helper<'a> {
 }
 
 impl<'a> DecryptionHelper for Helper<'a> {
-    fn decrypt<D>(&mut self, pkesks: &[sequoia_openpgp::packet::PKESK], _skesks: &[sequoia_openpgp::packet::SKESK], sym_algo: Option<SymmetricAlgorithm>, mut decrypt: D) -> sequoia_openpgp::Result<Option<sequoia_openpgp::Fingerprint>>
-    where D: FnMut(SymmetricAlgorithm, &SessionKey) -> bool
+    fn decrypt<D>(
+        &mut self,
+        pkesks: &[sequoia_openpgp::packet::PKESK],
+        _skesks: &[sequoia_openpgp::packet::SKESK],
+        sym_algo: Option<SymmetricAlgorithm>,
+        mut decrypt: D,
+    ) -> sequoia_openpgp::Result<Option<sequoia_openpgp::Fingerprint>>
+    where
+        D: FnMut(SymmetricAlgorithm, &SessionKey) -> bool,
     {
         for pkesk in pkesks {
             for (i, pair) in self.key.keypairs.iter_mut().enumerate() {
@@ -132,7 +160,10 @@ impl<'a> DecryptionHelper for Helper<'a> {
     }
 }
 
-pub fn decrypt_contact_card(encrypted_data: &str, unlocked_keys: &mut [UnlockedKey]) -> Result<String> {
+pub fn decrypt_contact_card(
+    encrypted_data: &str,
+    unlocked_keys: &mut [UnlockedKey],
+) -> Result<String> {
     let p = &StandardPolicy::new();
 
     for key in unlocked_keys.iter_mut() {
@@ -148,8 +179,7 @@ pub fn decrypt_contact_card(encrypted_data: &str, unlocked_keys: &mut [UnlockedK
             std::io::Read::read_to_end(&mut decryptor, &mut decrypted)
                 .map_err(|e| ProtonError::Crypto(format!("Read: {e}")))?;
 
-            String::from_utf8(decrypted)
-                .map_err(|e| ProtonError::Crypto(format!("UTF-8: {e}")))
+            String::from_utf8(decrypted).map_err(|e| ProtonError::Crypto(format!("UTF-8: {e}")))
         })();
 
         if result.is_ok() {
@@ -157,7 +187,9 @@ pub fn decrypt_contact_card(encrypted_data: &str, unlocked_keys: &mut [UnlockedK
         }
     }
 
-    Err(ProtonError::Crypto("No key could decrypt the message".into()))
+    Err(ProtonError::Crypto(
+        "No key could decrypt the message".into(),
+    ))
 }
 
 fn bcrypt_b64_encode(data: &[u8]) -> String {

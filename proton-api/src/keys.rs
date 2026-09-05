@@ -57,8 +57,8 @@ impl KeysClient {
             .error_for_status()?;
         let text = resp.text()?;
         let parsed: serde_json::Value = serde_json::from_str(&text)?;
-        let addr_resp: AddressesResponse = serde_json::from_value(parsed)
-            .map_err(|e| crate::ProtonError::Serde(e))?;
+        let addr_resp: AddressesResponse =
+            serde_json::from_value(parsed).map_err(|e| crate::ProtonError::Serde(e))?;
         Ok(addr_resp.Addresses)
     }
 
@@ -69,12 +69,20 @@ impl KeysClient {
             .header("Authorization", self.auth_header())
             .header("x-pm-uid", &self.uid)
             .header("x-pm-appversion", APP_VERSION)
-            .send()?
-            .error_for_status()?;
+            .send()?;
+        let status = resp.status();
         let text = resp.text()?;
+        if !status.is_success() {
+            return Err(crate::ProtonError::Auth(format!(
+                "get_key_salts {status} token_prefix={} uid={} body: {}",
+                &self.access_token.chars().take(6).collect::<String>(),
+                &self.uid,
+                text
+            )));
+        }
         let parsed: serde_json::Value = serde_json::from_str(&text)?;
-        let salts_resp: KeySaltsResponse = serde_json::from_value(parsed)
-            .map_err(|e| crate::ProtonError::Serde(e))?;
+        let salts_resp: KeySaltsResponse =
+            serde_json::from_value(parsed).map_err(|e| crate::ProtonError::Serde(e))?;
         Ok(salts_resp.KeySalts)
     }
 }

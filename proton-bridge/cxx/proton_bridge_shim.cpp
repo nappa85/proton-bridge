@@ -3,7 +3,10 @@
 #include <QThread>
 #include <QFile>
 #include <QDateTime>
+#include <QRegularExpression>
 #include <QCoreApplication>
+#include <QDBusConnection>
+#include <QDBusMessage>
 
 static void proton_log(const QString &msg) {
     QFile f("/tmp/proton-sync-debug.log");
@@ -17,6 +20,26 @@ static void proton_log(const QString &msg) {
     qDebug() << msg;
 }
 
+static void sendProtonNotification(const QString &summary, const QString &body) {
+    QDBusMessage msg = QDBusMessage::createMethodCall(
+        QStringLiteral("org.freedesktop.Notifications"),
+        QStringLiteral("/org/freedesktop/Notifications"),
+        QStringLiteral("org.freedesktop.Notifications"),
+        QStringLiteral("Notify"));
+    QVariantList args;
+    args << QStringLiteral("proton-contacts") // app_name
+         << (uint)0 // replaces_id
+         << QStringLiteral("image://theme/icon-m-file-vcard") // app_icon
+         << summary
+         << body
+         << QStringList() // actions
+         << QVariantMap() // hints
+         << (int)10000; // timeout
+    msg.setArguments(args);
+    QDBusConnection::sessionBus().call(msg, QDBus::NoBlock);
+    proton_log(QStringLiteral("Notification: ") + summary + " – " + body);
+}
+
 using namespace Proton;
 
 static const QString PROTON_SERVICE_NAME = QStringLiteral("proton-carddav");
@@ -27,7 +50,8 @@ ProtonContactsPlugin::ProtonContactsPlugin(const QString &aPluginName,
     : Buteo::ClientPlugin(aPluginName, aProfile, aCbInterface)
     , m_manager(new QtContacts::QContactManager(QStringLiteral("org.nemomobile.contacts.sqlite")))
 {
-    proton_log(QStringLiteral("ProtonContactsPlugin constructed: ") + aPluginName);
+    proton_log(QStringLiteral("ProtonContactsPlugin constructed: ") + aPluginName
+             + " profileName=" + getProfileName());
 }
 
 ProtonContactsPlugin::~ProtonContactsPlugin()
@@ -41,11 +65,28 @@ ProtonContactsPlugin::~ProtonContactsPlugin()
 
 bool ProtonContactsPlugin::init()
 {
-    proton_log(QStringLiteral("ProtonContactsPlugin::init()"));
+    proton_log(QStringLiteral("ProtonContactsPlugin::init() profileName=") + getProfileName());
 
     m_accountId = iProfile.key(QStringLiteral("accountid"));
+    proton_log(QStringLiteral("accountid from profile: ") + (m_accountId.isEmpty() ? QStringLiteral("(empty)") : m_accountId));
+
     if (m_accountId.isEmpty()) {
-        proton_log(QStringLiteral("ERROR: No accountid in sync profile"));
+        QString profileName = getProfileName();
+        QRegularExpression re("-(\\d+)$");
+        QRegularExpressionMatch match = re.match(profileName);
+        if (match.hasMatch()) {
+            m_accountId = match.captured(1);
+            proton_log(QStringLiteral("Extracted accountid from profile name: ") + m_accountId);
+        }
+    }
+
+    if (m_accountId.isEmpty()) {
+        m_accountId = iProfile.key(QStringLiteral("account_id"));
+        proton_log(QStringLiteral("Trying account_id: ") + (m_accountId.isEmpty() ? QStringLiteral("(empty)") : m_accountId));
+    }
+
+    if (m_accountId.isEmpty()) {
+        proton_log(QStringLiteral("ERROR: Cannot determine accountid"));
         return false;
     }
 
@@ -85,12 +126,36 @@ bool ProtonContactsPlugin::requestCredentials()
     Accounts::AccountService *accountService = new Accounts::AccountService(account, service, this);
     Accounts::AuthData authData = accountService->authData();
 
-    proton_log(QStringLiteral("credentialsId=") + QString::number(authData.credentialsId())
+    quint32 credentialsId = authData.credentialsId();
+    if (credentialsId == 0) {
+        // Some creation flows store CredentialsId as int32, which the
+        // authData() uint32 getter cannot read. Fall back to the generic
+        // settings read (which converts) and heal the stored type.
+        account->selectService(service);
+        QVariant raw = account->value(QStringLiteral("CredentialsId"));
+        if (raw.isValid() && raw.toUInt() > 0) {
+            credentialsId = raw.toUInt();
+            proton_log(QStringLiteral("Healing CredentialsId (wrong variant type) to ") + QString::number(credentialsId));
+            account->setCredentialsId(credentialsId);
+            account->sync();
+        }
+    }
+    if (credentialsId == 0) {
+        // Last resort: the provider-wide default credentials.
+        account->selectService(Accounts::Service());
+        credentialsId = account->credentialsId();
+        if (credentialsId > 0) {
+            proton_log(QStringLiteral("Using account default credentials id ") + QString::number(credentialsId));
+            account->selectService(service);
+        }
+    }
+
+    proton_log(QStringLiteral("credentialsId=") + QString::number(credentialsId)
              + " method=" + authData.method() + " mechanism=" + authData.mechanism());
 
-    m_identity = SignOn::Identity::existingIdentity(authData.credentialsId(), this);
+    m_identity = SignOn::Identity::existingIdentity(credentialsId, this);
     if (!m_identity) {
-        proton_log(QStringLiteral("ERROR: Unable to create SignOn identity for id=") + QString::number(authData.credentialsId()));
+        proton_log(QStringLiteral("ERROR: Unable to create SignOn identity for id=") + QString::number(credentialsId));
         return false;
     }
 
@@ -105,11 +170,15 @@ bool ProtonContactsPlugin::requestCredentials()
     connect(m_authSession, &SignOn::AuthSession::error,
             this, &ProtonContactsPlugin::onSignOnError);
 
-    SignOn::SessionData sessionData(authData.parameters());
+    SignOn::SessionData sessionData;
+    // The sync plugin must never trigger interactive prompts: tokens were
+    // obtained during account creation / credentials update. If they have
+    // expired beyond refresh, the sync reports an authentication failure and
+    // the user re-enters credentials through the account settings UI.
     sessionData.setUiPolicy(SignOn::NoUserInteractionPolicy);
     m_authSession->process(sessionData, authData.mechanism());
 
-    proton_log(QStringLiteral("SignOn auth session started"));
+    proton_log(QStringLiteral("SignOn auth session started (method=%1)").arg(authData.method()));
     return true;
 }
 
@@ -119,34 +188,57 @@ void ProtonContactsPlugin::onSignOnResponse(const SignOn::SessionData &data)
 
     QString username = data.UserName();
     QString password = data.Secret();
-
-    auto tokens = loadPersistedTokens();
-    QString refreshToken = tokens.first;
-    QString uid = tokens.second;
+    QString accessToken = data.getProperty(QStringLiteral("AccessToken")).toString();
+    QString refreshToken = data.getProperty(QStringLiteral("RefreshToken")).toString();
+    QString uid = data.getProperty(QStringLiteral("Uid")).toString();
+    QString derivedJson = data.getProperty(QStringLiteral("DerivedPasswords")).toString();
 
     proton_log(QStringLiteral("Got credentials: username=") + username
+             + " access_token=" + (accessToken.isEmpty() ? QStringLiteral("(none)") : QStringLiteral("(present)"))
              + " refresh_token=" + (refreshToken.isEmpty() ? QStringLiteral("(none)") : QStringLiteral("(present)"))
-             + " uid=" + (uid.isEmpty() ? QStringLiteral("(none)") : uid));
+             + " uid=" + (uid.isEmpty() ? QStringLiteral("(none)") : uid)
+             + " derived=" + (derivedJson.isEmpty() ? QStringLiteral("(none)") : QStringLiteral("(present)")));
 
-    m_engine = proton_bridge_create_engine(
+    if (refreshToken.isEmpty() || uid.isEmpty()) {
+        auto tokens = loadPersistedTokens();
+        if (refreshToken.isEmpty()) refreshToken = tokens.first;
+        if (uid.isEmpty()) uid = tokens.second;
+    }
+    if (derivedJson.isEmpty()) {
+        QSettings settings(QStringLiteral("proton"), QStringLiteral("sync-tokens"));
+        settings.beginGroup(m_accountId);
+        derivedJson = settings.value(QStringLiteral("derived_passwords")).toString();
+        settings.endGroup();
+        if (!derivedJson.isEmpty()) {
+            proton_log(QStringLiteral("Loaded derived passwords from QSettings cache"));
+        }
+    }
+
+    if (accessToken.isEmpty() && refreshToken.isEmpty()) {
+        emit error(getProfileName(), QStringLiteral("No auth tokens received"), Buteo::SyncResults::AUTHENTICATION_FAILURE);
+        return;
+    }
+
+    // If derived passwords are available, password can be empty (derived-only mode)
+    // Keep password for first sync to generate derived, afterwards derived will be used
+    m_engine = proton_bridge_create_engine_with_derived(
         username.toUtf8().constData(),
         password.toUtf8().constData(),
-        "",
+        accessToken.toUtf8().constData(),
         refreshToken.toUtf8().constData(),
-        uid.toUtf8().constData()
+        uid.toUtf8().constData(),
+        "",
+        derivedJson.toUtf8().constData()
     );
 
     if (!m_engine) {
-        qWarning() << "Failed to create Proton sync engine";
         emit error(getProfileName(), QStringLiteral("Failed to create sync engine"), Buteo::SyncResults::INTERNAL_ERROR);
         return;
     }
 
     m_credentialsReady = true;
-
     m_timer = new QTimer(this);
     connect(m_timer, &QTimer::timeout, this, &ProtonContactsPlugin::pollStatus);
-
     if (!startSync()) {
         emit error(getProfileName(), QStringLiteral("Failed to start sync"), Buteo::SyncResults::INTERNAL_ERROR);
     }
@@ -261,6 +353,31 @@ void ProtonContactsPlugin::pollStatus()
         if (rt) proton_bridge_free_string(rt);
         if (uid) proton_bridge_free_string(uid);
 
+        // Persist derived mailbox passwords (encrypted via SignOn on next auth, plus QSettings cache)
+        char *derived = proton_bridge_get_derived_passwords_json(m_engine);
+        if (derived) {
+            QString derivedJson = QString::fromUtf8(derived);
+            proton_bridge_free_string(derived);
+            if (!derivedJson.isEmpty() && derivedJson != QStringLiteral("null")) {
+                QSettings settings(QStringLiteral("proton"), QStringLiteral("sync-tokens"));
+                settings.beginGroup(m_accountId);
+                settings.setValue(QStringLiteral("derived_passwords"), derivedJson);
+                settings.endGroup();
+                proton_log(QStringLiteral("Persisted derived passwords for account ") + m_accountId);
+                // Also update SignOn identity with derived passwords (encrypted storage)
+                if (m_identity) {
+                    SignOn::IdentityInfo info;
+                    // Query current info async – for now store via QSettings cache is used as derived source
+                    // Future: store via SignOn custom property "DerivedPasswords"
+                }
+            }
+        }
+
+        char *keysDbg = proton_bridge_get_keys_debug(m_engine);
+        QString keysDebug = keysDbg ? QString::fromUtf8(keysDbg) : QString();
+        if (keysDbg) proton_bridge_free_string(keysDbg);
+        proton_log(QStringLiteral("Keys debug: ") + keysDebug);
+
         char *json = proton_bridge_get_synced_contacts_json(m_engine);
         if (json) {
             QByteArray jsonData(json);
@@ -271,6 +388,7 @@ void ProtonContactsPlugin::pollStatus()
                 emit success(getProfileName(), QStringLiteral("Sync completed"));
             } else {
                 emit error(getProfileName(), QStringLiteral("Failed to write contacts"), Buteo::SyncResults::INTERNAL_ERROR);
+                sendProtonNotification(QStringLiteral("Proton Contacts sync failed"), QStringLiteral("Failed to write contacts to phone"));
             }
         } else {
             emit success(getProfileName(), QStringLiteral("Sync completed (no contacts)"));
@@ -280,7 +398,10 @@ void ProtonContactsPlugin::pollStatus()
         QString errMsg = QString::fromUtf8(reinterpret_cast<const char*>(status.error),
                                            strnlen(reinterpret_cast<const char*>(status.error), 256));
         proton_log(QStringLiteral("Sync error: ") + errMsg);
-        emit error(getProfileName(), errMsg, Buteo::SyncResults::INTERNAL_ERROR);
+        // Emit authentication failure so Settings shows “Account not signed in” and user can re-enter credentials
+        auto code = Buteo::SyncResults::AUTHENTICATION_FAILURE;
+        sendProtonNotification(QStringLiteral("Proton Contacts sync failed"), errMsg);
+        emit error(getProfileName(), errMsg, code);
     }
 }
 
@@ -601,5 +722,14 @@ Buteo::ClientPlugin *ProtonPluginLoader::createClientPlugin(const QString &aPlug
                                                             const Buteo::SyncProfile &aProfile,
                                                             Buteo::PluginCbInterface *aCbInterface)
 {
+    // The profile keys live on the top-level sync profile; dump everything
+    // for diagnostics.
+    QMap<QString, QString> keys = aProfile.allKeys();
+    QStringList log;
+    log << QStringLiteral("createClientPlugin: name=") + aProfile.name();
+    for (auto it = keys.constBegin(); it != keys.constEnd(); ++it) {
+        log << it.key() + QLatin1Char('=') + it.value();
+    }
+    proton_log(log.join(QStringLiteral(" | ")));
     return new ProtonContactsPlugin(aPluginName, aProfile, aCbInterface);
 }
