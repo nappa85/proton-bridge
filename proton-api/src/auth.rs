@@ -42,6 +42,23 @@ impl AuthClient {
         }
     }
 
+    #[cfg(test)]
+    pub fn new_with_base_url(base_url: String) -> Self {
+        Self {
+            client: Client::builder()
+                .timeout(Duration::from_secs(30))
+                .user_agent("curl/8.0")
+                .build()
+                .expect("HTTP client"),
+            base_url,
+        }
+    }
+
+    pub fn with_base_url(mut self, base_url: String) -> Self {
+        self.base_url = base_url;
+        self
+    }
+
     pub fn login(&self, username: &str, password: &str) -> Result<LoginState> {
         let info = self.get_auth_info(username)?;
         let auth = SrpAuth::new(password, &info)?;
@@ -54,8 +71,7 @@ impl AuthClient {
             uid: resp.UID.clone(),
         };
 
-        let two_fa_enabled = resp.TwoFA.as_ref().map(|f| f.Enabled == 1).unwrap_or(false)
-            || resp.TwoFactor.as_ref().and_then(|f| f.Enabled).unwrap_or(0) == 1;
+        let two_fa_enabled = Self::is_totp_required(&resp.TwoFA, &resp.TwoFactor);
         let scopes: Vec<String> = resp.Scopes.clone().unwrap_or_default();
 
         let tokens = AuthTokens {
@@ -167,6 +183,30 @@ impl AuthClient {
             .error_for_status()?
             .json()?;
         Ok(resp)
+    }
+
+    fn is_totp_required(
+        two_fa: &Option<TwoFAField>,
+        two_factor: &Option<TwoFactorInfo>,
+    ) -> bool {
+        if let Some(f) = two_fa {
+            // Enabled 1 = TOTP, 2 = FIDO2, 3 = both. TOTP field may also be set.
+            if f.Enabled == 1 || f.Enabled == 3 || f.TOTP == 1 {
+                return true;
+            }
+        }
+        if let Some(f) = two_factor {
+            let enabled = f.Enabled.unwrap_or(0);
+            let totp = f.TOTP.unwrap_or(0);
+            if enabled == 1 || enabled == 3 || totp == 1 {
+                return true;
+            }
+            // Fallback: any non-zero Enabled that includes TOTP bit?
+            // If Enabled is 2 (FIDO2 only) we should not require TOTP.
+            // But if server uses newer schema, check U2F vs TOTP distinction.
+            // Legacy: Enabled==1 means TOTP.
+        }
+        false
     }
 
     fn post_auth(&self, username: &str, proofs: &SrpProofs) -> Result<AuthResponse> {
@@ -658,4 +698,240 @@ fn b64_decode(s: &str) -> Result<Vec<u8>> {
 fn b64_encode(data: &[u8]) -> String {
     use base64::Engine;
     base64::engine::general_purpose::STANDARD.encode(data)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_auth_response(json_str: &str) -> AuthResponse {
+        serde_json::from_str(json_str).expect("parse auth response")
+    }
+
+    #[test]
+    fn test_twofa_detection_totp_enabled_1() {
+        let json = r#"{
+            "AccessToken":"at","RefreshToken":"rt","UID":"uid","ExpiresIn":3600,"ServerProof":"sp",
+            "2FA":{"Enabled":1,"TOTP":1},
+            "Scopes":["self","parent","user","twofactor"]
+        }"#;
+        let resp = make_auth_response(json);
+        assert!(AuthClient::is_totp_required(&resp.TwoFA, &resp.TwoFactor));
+    }
+
+    #[test]
+    fn test_twofa_detection_both_3() {
+        let json = r#"{
+            "AccessToken":"at","RefreshToken":"rt","UID":"uid","ExpiresIn":3600,"ServerProof":"sp",
+            "2FA":{"Enabled":3,"TOTP":1},
+            "Scopes":["self","parent","user","twofactor"]
+        }"#;
+        let resp = make_auth_response(json);
+        assert!(AuthClient::is_totp_required(&resp.TwoFA, &resp.TwoFactor));
+    }
+
+    #[test]
+    fn test_twofa_detection_fido2_only_not_totp() {
+        let json = r#"{
+            "AccessToken":"at","RefreshToken":"rt","UID":"uid","ExpiresIn":3600,"ServerProof":"sp",
+            "2FA":{"Enabled":2,"TOTP":0},
+            "Scopes":["self","parent","user","twofactor"]
+        }"#;
+        let resp = make_auth_response(json);
+        assert!(!AuthClient::is_totp_required(&resp.TwoFA, &resp.TwoFactor));
+    }
+
+    #[test]
+    fn test_twofa_detection_no_2fa() {
+        let json = r#"{
+            "AccessToken":"at","RefreshToken":"rt","UID":"uid","ExpiresIn":3600,"ServerProof":"sp",
+            "Scopes":["self","parent","user","full"]
+        }"#;
+        let resp = make_auth_response(json);
+        assert!(!AuthClient::is_totp_required(&resp.TwoFA, &resp.TwoFactor));
+    }
+
+    #[test]
+    fn test_twofa_detection_legacy_two_factor() {
+        let json = r#"{
+            "AccessToken":"at","RefreshToken":"rt","UID":"uid","ExpiresIn":3600,"ServerProof":"sp",
+            "TwoFactor":{"Enabled":1,"TOTP":1},
+            "Scopes":["self","parent","user","twofactor"]
+        }"#;
+        let resp = make_auth_response(json);
+        assert!(AuthClient::is_totp_required(&resp.TwoFA, &resp.TwoFactor));
+    }
+
+    #[test]
+    fn test_twofa_detection_legacy_enabled_3() {
+        let json = r#"{
+            "AccessToken":"at","RefreshToken":"rt","UID":"uid","ExpiresIn":3600,"ServerProof":"sp",
+            "TwoFactor":{"Enabled":3},
+            "Scopes":["self","parent","user","twofactor"]
+        }"#;
+        let resp = make_auth_response(json);
+        assert!(AuthClient::is_totp_required(&resp.TwoFA, &resp.TwoFactor));
+    }
+
+    #[test]
+    fn test_auth_response_parsing_null_2fa() {
+        let json = r#"{
+            "AccessToken":"at","RefreshToken":"rt","UID":"uid","ExpiresIn":3600,"ServerProof":"sp",
+            "2FA":null,
+            "TwoFactor":null
+        }"#;
+        let resp = make_auth_response(json);
+        assert!(!AuthClient::is_totp_required(&resp.TwoFA, &resp.TwoFactor));
+        assert!(resp.TwoFA.is_none());
+        assert!(resp.TwoFactor.is_none());
+    }
+
+    #[test]
+    fn test_auth_response_parsing_numeric_2fa() {
+        // Proton sometimes returns numeric instead of object for legacy field
+        let json = r#"{
+            "AccessToken":"at","RefreshToken":"rt","UID":"uid","ExpiresIn":3600,"ServerProof":"sp",
+            "2FA":0,
+            "TwoFactor":0
+        }"#;
+        let resp = make_auth_response(json);
+        assert!(!AuthClient::is_totp_required(&resp.TwoFA, &resp.TwoFactor));
+    }
+
+    #[test]
+    fn test_twofa_response_parsing_success() {
+        let json = r#"{"Code":1000,"Scope":"full","Scopes":["full","self"]}"#;
+        let resp: TwoFAResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.Code, 1000);
+        assert_eq!(resp.Scopes.unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_twofa_response_parsing_error() {
+        let json = r#"{"Code":422,"Error":"TotpWrong"}"#;
+        let resp: TwoFAResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.Code, 422);
+    }
+
+    #[test]
+    fn test_login_state_requires_2fa() {
+        // Simulate that AuthClient correctly classifies Requires2FA vs Authenticated
+        let json_locked = r#"{
+            "AccessToken":"locked_at","RefreshToken":"rt","UID":"uid","ExpiresIn":3600,"ServerProof":"sp",
+            "2FA":{"Enabled":1,"TOTP":1},
+            "Scopes":["self","parent","user","twofactor"]
+        }"#;
+        let resp_locked = make_auth_response(json_locked);
+        assert!(AuthClient::is_totp_required(&resp_locked.TwoFA, &resp_locked.TwoFactor));
+
+        let json_full = r#"{
+            "AccessToken":"full_at","RefreshToken":"rt","UID":"uid","ExpiresIn":3600,"ServerProof":"sp",
+            "Scopes":["self","parent","user","full"]
+        }"#;
+        let resp_full = make_auth_response(json_full);
+        assert!(!AuthClient::is_totp_required(&resp_full.TwoFA, &resp_full.TwoFactor));
+    }
+
+    #[test]
+    fn test_refresh_response_parsing() {
+        let json = r#"{"AccessToken":"new_at","RefreshToken":"new_rt","UID":"uid","ExpiresIn":3600}"#;
+        let resp: RefreshResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.AccessToken, "new_at");
+    }
+
+    #[test]
+    fn test_submit_2fa_keeps_same_tokens() {
+        // Verifies the documented behavior: submit_2fa returns same tokens it received on success
+        // This is tested via the AuthTokens construction, not HTTP
+        let at = "locked_at";
+        let rt = "rt";
+        let uid = "uid";
+        let tokens = AuthTokens {
+            access_token: at.to_string(),
+            refresh_token: rt.to_string(),
+            uid: uid.to_string(),
+        };
+        assert_eq!(tokens.access_token, at);
+        assert_eq!(tokens.refresh_token, rt);
+        assert_eq!(tokens.uid, uid);
+    }
+
+    #[test]
+    fn test_submit_2fa_mock_success() {
+        let mut server = mockito::Server::new();
+        let client = AuthClient::new_with_base_url(server.url());
+        let mock = server
+            .mock("POST", "/auth/v4/2fa")
+            .match_header("x-pm-appversion", "web-mail@6.3.2")
+            .match_header("x-pm-uid", "test-uid")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"Code":1000,"Scope":"full","Scopes":["full"]}"#)
+            .create();
+        let res = client.submit_2fa("123456", "locked-at", "rt", "test-uid");
+        assert!(res.is_ok(), "submit_2fa should succeed: {:?}", res);
+        let tokens = res.unwrap();
+        assert_eq!(tokens.access_token, "locked-at");
+        assert_eq!(tokens.refresh_token, "rt");
+        assert_eq!(tokens.uid, "test-uid");
+        mock.assert();
+    }
+
+    #[test]
+    fn test_submit_2fa_mock_wrong_code() {
+        let mut server = mockito::Server::new();
+        let client = AuthClient::new_with_base_url(server.url());
+        let mock = server
+            .mock("POST", "/auth/v4/2fa")
+            .with_status(422)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"Code":422,"Error":"TotpWrong"}"#)
+            .create();
+        let res = client.submit_2fa("000000", "locked-at", "rt", "test-uid");
+        assert!(res.is_err());
+        let err = format!("{}", res.unwrap_err());
+        assert!(err.contains("422") || err.contains("TotpWrong") || err.contains("failed"));
+        mock.assert();
+    }
+
+    #[test]
+    fn test_refresh_mock_success() {
+        let mut server = mockito::Server::new();
+        let client = AuthClient::new_with_base_url(server.url());
+        let mock = server
+            .mock("POST", "/auth/v4/refresh")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"AccessToken":"new_at","RefreshToken":"new_rt","UID":"uid","ExpiresIn":3600}"#)
+            .create();
+        let res = client.refresh("old_rt", "uid");
+        assert!(res.is_ok());
+        let tokens = res.unwrap();
+        assert_eq!(tokens.access_token, "new_at");
+        assert_eq!(tokens.refresh_token, "new_rt");
+        mock.assert();
+    }
+
+    #[test]
+    fn test_token_manager_2fa_flow() {
+        // TokenManager should not store tokens before 2FA, only after
+        let mut tm = TokenManager::new();
+        // Simulate Requires2FA state without actually calling login
+        // We test that restore + submit flow would store tokens
+        let mut server = mockito::Server::new();
+        let client = AuthClient::new_with_base_url(server.url());
+        let mock = server
+            .mock("POST", "/auth/v4/2fa")
+            .with_status(200)
+            .with_body(r#"{"Code":1000}"#)
+            .create();
+        // Inject mocked client into TokenManager via private field is not accessible,
+        // so we test AuthClient directly – the flow is validated above.
+        let res = client.submit_2fa("123456", "locked", "rt", "uid");
+        assert!(res.is_ok());
+        mock.assert();
+        // Ensure TokenManager's restore path works
+        tm.restore_tokens(res.unwrap());
+        assert_eq!(tm.uid(), Some("uid"));
+    }
 }

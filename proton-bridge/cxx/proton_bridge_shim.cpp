@@ -186,6 +186,17 @@ void ProtonContactsPlugin::onSignOnResponse(const SignOn::SessionData &data)
 {
     proton_log(QStringLiteral("onSignOnResponse()"));
 
+    // Detect locked 2FA session returned via custom TwoFARequired flag (QML OTP flow)
+    // or missing scopes. The sync plugin runs with NoUserInteractionPolicy, so it
+    // cannot prompt for OTP – the user must update credentials via Settings.
+    bool twoFARequired = data.getProperty(QStringLiteral("TwoFARequired")).toBool();
+    if (twoFARequired) {
+        QString err = QStringLiteral("Two-factor authentication required – please update credentials in Settings → Proton and enter OTP code");
+        proton_log(QStringLiteral("2FA required but no UI allowed in sync session"));
+        emit error(getProfileName(), err, Buteo::SyncResults::AUTHENTICATION_FAILURE);
+        return;
+    }
+
     QString username = data.UserName();
     QString password = data.Secret();
     QString accessToken = data.getProperty(QStringLiteral("AccessToken")).toString();
@@ -193,11 +204,20 @@ void ProtonContactsPlugin::onSignOnResponse(const SignOn::SessionData &data)
     QString uid = data.getProperty(QStringLiteral("Uid")).toString();
     QString derivedJson = data.getProperty(QStringLiteral("DerivedPasswords")).toString();
 
-    proton_log(QStringLiteral("Got credentials: username=") + username
+    // Try Secret via Secret() and via getProperty for robustness (signond may strip Secret)
+    QString secretViaProperty = data.getProperty(QStringLiteral("Secret")).toString();
+    QString passwordViaProperty = data.getProperty(QStringLiteral("Password")).toString();
+    QString userNameViaProperty = data.getProperty(QStringLiteral("UserName")).toString();
+    if (password.isEmpty() && !secretViaProperty.isEmpty()) password = secretViaProperty;
+    if (password.isEmpty() && !passwordViaProperty.isEmpty()) password = passwordViaProperty;
+    if (username.isEmpty() && !userNameViaProperty.isEmpty()) username = userNameViaProperty;
+    proton_log(QStringLiteral("Got credentials: username=") + username + " (viaProp=" + userNameViaProperty + ")"
+             + " pw_len=" + QString::number(password.length()) + " (Secret prop len=" + QString::number(secretViaProperty.length()) + " Password prop len=" + QString::number(passwordViaProperty.length()) + ")"
              + " access_token=" + (accessToken.isEmpty() ? QStringLiteral("(none)") : QStringLiteral("(present)"))
              + " refresh_token=" + (refreshToken.isEmpty() ? QStringLiteral("(none)") : QStringLiteral("(present)"))
              + " uid=" + (uid.isEmpty() ? QStringLiteral("(none)") : uid)
-             + " derived=" + (derivedJson.isEmpty() ? QStringLiteral("(none)") : QStringLiteral("(present)")));
+             + " derived=" + (derivedJson.isEmpty() ? QStringLiteral("(none)") : QStringLiteral("(present)")) + " derived_len=" + QString::number(derivedJson.length())
+             + " allKeys=" + data.propertyNames().join(","));
 
     if (refreshToken.isEmpty() || uid.isEmpty()) {
         auto tokens = loadPersistedTokens();
@@ -398,6 +418,10 @@ void ProtonContactsPlugin::pollStatus()
         QString errMsg = QString::fromUtf8(reinterpret_cast<const char*>(status.error),
                                            strnlen(reinterpret_cast<const char*>(status.error), 256));
         proton_log(QStringLiteral("Sync error: ") + errMsg);
+        char *keysDbg = proton_bridge_get_keys_debug(m_engine);
+        QString keysDebug = keysDbg ? QString::fromUtf8(keysDbg) : QString();
+        if (keysDbg) proton_bridge_free_string(keysDbg);
+        proton_log(QStringLiteral("Keys debug on error: ") + keysDebug);
         // Emit authentication failure so Settings shows “Account not signed in” and user can re-enter credentials
         auto code = Buteo::SyncResults::AUTHENTICATION_FAILURE;
         sendProtonNotification(QStringLiteral("Proton Contacts sync failed"), errMsg);

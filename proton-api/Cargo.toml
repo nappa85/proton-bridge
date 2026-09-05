@@ -26,5 +26,8 @@ getrandom = "0.2"
 bcrypt = "0.16"
 ical_vcard = "0.5"
 
+[dev-dependencies]
+mockito = "1"
+
 [features]
 default = []

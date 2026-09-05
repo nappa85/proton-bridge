@@ -91,8 +91,14 @@ void ProtonSignonPlugin::handleAuthOk(ProtonAuthResult &authResult,
     emit store(SignOn::SessionData(tokens));
 
     QVariantMap response = tokens;
-    if (!password.isEmpty())
+    if (!password.isEmpty()) {
         response.insert(QStringLiteral("Secret"), password);
+        // Also insert as Password and UserName for clients that read via getProperty
+        // (signond may strip Secret for NoUserInteractionPolicy refreshes)
+        response.insert(QStringLiteral("Password"), password);
+        response.insert(QStringLiteral("UserName"), username);
+    }
+    qDebug() << "ProtonSignonPlugin: handleAuthOk username=" << username << " pw_len=" << password.length() << " response has Secret=" << response.contains("Secret") << " Password=" << response.contains("Password");
     emit result(SignOn::SessionData(response));
 }
 
@@ -105,6 +111,8 @@ void ProtonSignonPlugin::process(const SignOn::SessionData &dataIn, const QStrin
     QString refreshToken = dataIn.getProperty(QStringLiteral("RefreshToken")).toString();
     QString uid = dataIn.getProperty(QStringLiteral("Uid")).toString();
     QString totpCode = dataIn.getProperty(QStringLiteral("TwoFactorPassword")).toString().trimmed();
+    qDebug() << "ProtonSignonPlugin: process username=" << username << " pw_len=" << password.length()
+             << " rt_present=" << !refreshToken.isEmpty() << " uid=" << uid << " totp_len=" << totpCode.length();
 
     // 1) Second factor submission: complete the locked-session login.
     if (!totpCode.isEmpty() && !refreshToken.isEmpty() && !uid.isEmpty()) {

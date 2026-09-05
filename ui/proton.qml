@@ -40,12 +40,28 @@ AccountCreationAgent {
         console.log("Proton account creation failed:", message)
         pageRoot._busy = false
         pageRoot._errorMessage = message
+        delayDeletion = false
         if (creationAccount.identifier > 0 && !pageRoot._needsTwoFA) {
             var id = creationAccount.identifier
             creationAccount.identifier = 0
             var acc = accountManager.account(id)
             if (acc) acc.remove()
         }
+    }
+
+    function _setCredentialsId(identityId) {
+        // QML numbers are double; convertValue rejects double for CredentialsId.
+        // Pass as string – Accounts DB will store as type 's' but toUInt() still parses it.
+        var intId = parseInt(identityId)
+        if (isNaN(intId) || intId === 0) {
+            console.log("proton: invalid identityId", identityId)
+            return false
+        }
+        var strId = "" + intId
+        console.log("proton: _setCredentialsId setting CredentialsId to string \"" + strId + "\"")
+        creationAccount.setConfigurationValue("", "CredentialsId", strId)
+        creationAccount.setConfigurationValue("proton-carddav", "CredentialsId", strId)
+        return true
     }
 
     initialPage: Page {
@@ -57,8 +73,18 @@ AccountCreationAgent {
         property string _pendingAccessToken
         property string _pendingRefreshToken
         property string _pendingUid
+        property string _pendingUsername
+        property string _pendingPassword
 
         backNavigation: !_busy
+
+        on_BusyChanged: {
+            if (_busy) root.delayDeletion = true
+            else if (!_needsTwoFA && !creationAccount._flowComplete) root.delayDeletion = false
+        }
+        on_NeedsTwoFAChanged: {
+            if (_needsTwoFA) root.delayDeletion = true
+        }
 
         SilicaFlickable {
             anchors.fill: parent
@@ -155,9 +181,13 @@ AccountCreationAgent {
                         onClicked: {
                             pageRoot._errorMessage = ""
                             pageRoot._busy = true
+                            root.delayDeletion = true
+                            console.log("proton: verify OTP for " + pageRoot._pendingUsername + " pw_len=" + pageRoot._pendingPassword.length + " code=" + otpField.text)
+                            console.log("proton: pending AccessToken=" + (pageRoot._pendingAccessToken ? "yes" : "no") + " RefreshToken=" + (pageRoot._pendingRefreshToken ? "yes" : "no"))
                             var sip = creationAccount.signInParameters("proton-carddav",
-                                                                      usernameField.text,
-                                                                      passwordField.text)
+                                                                      pageRoot._pendingUsername,
+                                                                      pageRoot._pendingPassword)
+                            console.log("proton: verify sip username=" + sip.username + " password_len=" + (sip.password ? sip.password.length : 0))
                             sip.setParameter("TwoFactorPassword", otpField.text)
                             sip.setParameter("AccessToken", pageRoot._pendingAccessToken)
                             sip.setParameter("RefreshToken", pageRoot._pendingRefreshToken)
@@ -178,6 +208,10 @@ AccountCreationAgent {
                     onClicked: {
                         pageRoot._errorMessage = ""
                         pageRoot._busy = true
+                        root.delayDeletion = true
+                        pageRoot._pendingUsername = usernameField.text
+                        pageRoot._pendingPassword = passwordField.text
+                        console.log("proton: Sign in clicked, stored pending username=" + pageRoot._pendingUsername + " pw_len=" + pageRoot._pendingPassword.length)
                         accountManager.createAccount(root.accountProvider.name)
                     }
                 }
@@ -223,10 +257,16 @@ AccountCreationAgent {
         property bool _flowComplete
 
         onStatusChanged: {
+            console.log("proton: statusChanged status=" + status + " _flowComplete=" + _flowComplete + " _busy=" + pageRoot._busy + " id=" + identifier)
             if (status == Account.Initialized && pageRoot._busy
                     && !_credentialsRequested && !pageRoot._needsTwoFA) {
                 _credentialsRequested = true
-                var sip = signInParameters("proton-carddav", usernameField.text, passwordField.text)
+                // Store pending credentials for OTP second step (fields become hidden)
+                if (pageRoot._pendingUsername === "" ) pageRoot._pendingUsername = usernameField.text
+                if (pageRoot._pendingPassword === "" ) pageRoot._pendingPassword = passwordField.text
+                console.log("proton: creating credentials for " + pageRoot._pendingUsername + " pw_len=" + pageRoot._pendingPassword.length)
+                var sip = signInParameters("proton-carddav", pageRoot._pendingUsername, pageRoot._pendingPassword)
+                console.log("proton: sip username=" + sip.username + " password_len=" + (sip.password ? sip.password.length : 0))
                 createSignInCredentials("Jolla", "Jolla", sip)
             } else if (status == Account.Synced && _flowComplete) {
                 // Credentials verified (OTP included when needed) and the
@@ -235,16 +275,20 @@ AccountCreationAgent {
                 // completion is driven by _flowComplete instead of the
                 // credentials signals alone.
                 pageRoot._busy = false
+                root.delayDeletion = false
+                console.log("proton: flow complete, emitting accountCreated id=" + identifier)
                 root.accountCreated(identifier)
-                pageStack.pop()
+                root.goToEndDestination()
             } else if (status == Account.Error) {
                 root._fail(errorMessage)
             }
         }
 
         onSignInCredentialsCreated: {
+            console.log("proton: onSignInCredentialsCreated data=" + JSON.stringify(data))
             if (data["TwoFARequired"] === true) {
                 // Locked session: reveal the OTP field and wait for the code.
+                console.log("proton: TwoFARequired, pending tokens present: AccessToken=" + (data["AccessToken"] ? "yes" : "no"))
                 _credentialsRequested = false
                 pageRoot._pendingAccessToken = data["AccessToken"] || ""
                 pageRoot._pendingRefreshToken = data["RefreshToken"] || ""
@@ -256,15 +300,11 @@ AccountCreationAgent {
                 // Fully authenticated: enable and save the account; the
                 // Account.Synced status completes the flow.
                 _flowComplete = true
+                root.delayDeletion = true
                 enabled = true
                 enableWithService("proton-carddav")
                 setConfigurationValue("proton-carddav", "server_address", "https://mail.proton.me")
                 setConfigurationValue("proton-carddav", "ignore_ssl_errors", false)
-                // Link the signon identity to the service: the buteo sync
-                // plugin reads authData().credentialsId(), which maps to the
-                // per-service "CredentialsId" account setting. The identity
-                // id was stored by createSignInCredentials under the
-                // segregated credentials key.
                 var globalSettings = configurationValues("")
                 var debugLines = ["global settings:"]
                 for (var gk in globalSettings) {
@@ -273,9 +313,10 @@ AccountCreationAgent {
                 var identityId = globalSettings["Jolla/segregated_credentials/Jolla"]
                 debugLines.push("identityId=" + identityId)
                 _writeDebug(debugLines.join("\n"))
-                if (identityId !== undefined && identityId !== 0) {
-                    setConfigurationValue("", "CredentialsId", identityId)
-                    setConfigurationValue("proton-carddav", "CredentialsId", identityId)
+                if (identityId !== undefined && parseInt(identityId) !== 0) {
+                    root._setCredentialsId(identityId)
+                } else {
+                    console.log("proton: WARNING no identityId found for CredentialsId")
                 }
                 sync()
             }
@@ -284,16 +325,33 @@ AccountCreationAgent {
         onSignInCredentialsUpdated: {
             // OTP verified (2FA pass via updateSignInCredentials). Enable
             // and save the account; Account.Synced completes the flow.
+            console.log("proton: onSignInCredentialsUpdated data=" + JSON.stringify(data))
             _flowComplete = true
+            root.delayDeletion = true
             enabled = true
             enableWithService("proton-carddav")
             setConfigurationValue("proton-carddav", "server_address", "https://mail.proton.me")
             setConfigurationValue("proton-carddav", "ignore_ssl_errors", false)
             var globalSettings = configurationValues("")
-            var identityId = globalSettings["Jolla/segregated_credentials/Jolla"]
-            if (identityId !== undefined) {
-                setConfigurationValue("proton-carddav", "CredentialsId", identityId)
+            var debugLines = ["proton: global settings in update:"]
+            for (var gk in globalSettings) {
+                debugLines.push(gk + "=" + globalSettings[gk])
             }
+            _writeDebug(debugLines.join("\n"))
+            var identityId = configurationValue("", "Jolla/segregated_credentials/Jolla")
+            if (identityId === undefined || parseInt(identityId) === 0) {
+                identityId = globalSettings["Jolla/segregated_credentials/Jolla"]
+            }
+            console.log("proton: update identityId=" + identityId + " type=" + typeof identityId)
+            if (identityId !== undefined && parseInt(identityId) !== 0) {
+                var ok = root._setCredentialsId(identityId)
+                console.log("proton: _setCredentialsId returned " + ok)
+                console.log("proton: after set global CredentialsId=" + configurationValue("", "CredentialsId"))
+                console.log("proton: after set service CredentialsId=" + configurationValue("proton-carddav", "CredentialsId"))
+            } else {
+                console.log("proton: WARNING no identityId in update, globalSettings dump above")
+            }
+            console.log("proton: calling sync() for OTP update")
             sync()
         }
 
@@ -301,6 +359,7 @@ AccountCreationAgent {
             if (pageRoot._needsTwoFA) {
                 // Wrong code: let the user retry in the OTP field.
                 pageRoot._busy = false
+                // Keep delayDeletion true so agent stays alive for retry
                 pageRoot._errorMessage = message
             } else {
                 root._fail(message)

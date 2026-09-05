@@ -23,6 +23,8 @@ AccountCredentialsAgent {
     id: root
 
     canCancelUpdate: true
+    // Keep agent alive while busy or waiting for OTP
+    delayDeletion: updatePage ? (updatePage._busy || updatePage._needsTwoFA) : false
 
     initialPage: Page {
         id: updatePage
@@ -207,7 +209,7 @@ AccountCredentialsAgent {
                 updatePage._pendingUid = data["Uid"] || ""
                 updatePage._needsTwoFA = true
                 updatePage._busy = false
-                otpField.forceActiveFocus()
+                Qt.callLater(function() { otpField.forceActiveFocus() })
             } else {
                 updatePage._busy = false
                 root.credentialsUpdated(accountId)
