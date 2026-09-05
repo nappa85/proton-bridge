@@ -1,19 +1,18 @@
-# SailfishOS Proton Contacts Integration
+# SailfishOS Proton Contacts & Calendar Integration
 
-Native SailfishOS account provider + Buteo sync plugin for Proton Contacts.
-Built with Rust core + CXX-Qt bridge.
+Native SailfishOS account provider + Buteo sync plugin for Proton Contacts and Calendar (single `libproton-client.so`, single RPM). Built with Rust core + `mKCal`/`QOrganizer` bridge.
 
 ## Architecture
 
 ```
-proton-api/       → Pure Rust: Proton REST API client (SRP auth, 2FA, contacts CRUD, PGP, key salts)
-proton-sync/      → Pure Rust: Sync engine (auth, PGP decrypt, vCard mapping, QSettings derived cache)
-proton-bridge/    → Rust FFI + C++: SignOn auth plugin (libprotonplugin.so) + Buteo OOPP plugin (libproton-client.so)
-ui/               → QML AccountCreationAgent / AccountCredentialsAgent (OTP collected in-page, Password transient)
-buteo-profiles/   → Buteo client/sync profile templates (proton / proton-carddav-*.xml)
+proton-api/       → Pure Rust: Proton REST API client (SRP auth, 2FA, contacts CRUD, calendar CRUD, PGP, key salts)
+proton-sync/      → Pure Rust: Sync engines (contacts: SyncEngine, calendar: CalendarSyncEngine) + QSettings derived cache
+proton-bridge/    → Rust FFI + C++: SignOn auth plugin (libprotonplugin.so) + Buteo OOPP plugin (libproton-client.so, QContactManager + QOrganizerManager mkcal)
+ui/               → QML AccountCreationAgent / AccountCredentialsAgent (OTP in-page, Password transient, Contacts+Calendar toggles)
+buteo-profiles/   → Buteo client/sync profile templates (proton / proton-carddav-*.xml / proton-caldav-*.xml + proton.Calendar.xml)
 packaging/        → RPM build artifacts (staged by make-pkg-bundle.sh)
-accounts/         → Accounts&SSO provider/service XML (proton.provider, proton-carddav.service)
-rpm/              → RPM spec files
+accounts/         → Accounts&SSO provider/service XML (proton.provider, proton-carddav.service, proton-caldav.service)
+rpm/              → RPM specs (single buteo-sync-plugin-proton + sailfish-account-proton RPMs)
 ```
 
 **Security note (OTP):** The raw Proton login password is **never persisted** — it is passed only as transient `Password` param to the `proton` SignOn plugin for SRP + `POST /auth/v4/2fa` scope upgrade, then immediately `derive_all_passwords` (`KeysClient` → `derive_mailbox_password`) stores only the per-key `DerivedPasswords` map (`keyID → base64(mailboxPassword)`) in `signond` blob + `QSettings("proton","sync-tokens")` and in `~/.config/signond/signon-secrets.db` `STORE` (+ `QSettings` fallback by `Uid`/`username`). The Buteo sync later runs `NoUserInteractionPolicy` with only `RefreshToken`/`Uid`/`DerivedPasswords` (`pw_len=0` is expected).
@@ -67,13 +66,15 @@ ssh nemo@device "systemctl --user restart msyncd"
 |------|---------|
 | `proton-api/src/auth.rs` | SRP + `is_totp_required` + `submit_2fa` (`/auth/v4/2fa` scope upgrade) + `derive_all_passwords` |
 | `proton-api/src/keys.rs` | `KeysClient` (`/core/v4/users`, `/keys/salts`, `/addresses`) + `derive_all_passwords` |
-| `proton-sync/src/engine.rs` | `SyncEngine` `unlock_keys` via `DerivedPasswords` cache → `QSettings` `sync-tokens.conf` |
+| `proton-api/src/calendar.rs` | `CalendarClient` (`/calendar/v1`/`/keys`/`/passphrase`/`/events`) + `decrypt_calendar_event` + `parse_ical` (VCALENDAR/VEVENT) |
+| `proton-sync/src/engine.rs` | `SyncEngine` `unlock_keys` via `DerivedPasswords` cache → `QContactManager` `Saved 1 contacts` |
+| `proton-sync/src/calendar.rs` / `calendar_full.rs` | `CalendarSyncEngine` (stub → `QOrganizerManager mkcal` `Saved` test event, full VCALENDAR decrypt next) |
 | `proton-bridge/src/auth.rs` | FFI `proton_auth_login/submit_2fa/refresh/derive_passwords` |
-| `proton-bridge/signon/proton_signon_plugin.{h,cpp}` | SignOn `proton` plugin (`process` + `handleAuthOk` stores `AccessToken`/`RefreshToken`/`Uid` + `DerivedPasswords`) |
-| `proton-bridge/cxx/proton_bridge_shim.{h,cpp}` | Buteo OOPP plugin (`requestCredentials` `NoUserInteraction` + `QSettings` fallback by `Uid`/`username`) |
-| `ui/proton.qml` / `proton-update.qml` | `AccountCreationAgent` / `AccountCredentialsAgent` (custom OTP in-page, `Password` transient, `CredentialsId` string fix, `goToEndDestination`) |
-| `buteo-profiles/` / `packaging/accounts/` / `rpm/` | Profile & provider/service XML, RPM specs, `make-pkg-bundle.sh` staging |
-| `FINDINGS_OTP.md` | Full OTP failure analysis + `delayDeletion`/`CredentialsId`/`Secret` stripping fixes |
+| `proton-bridge/signon/proton_signon_plugin.{h,cpp}` | SignOn `proton` plugin (`process` `Password` transient → `handleAuthOk` stores `DerivedPasswords` in `store`+`QSettings`) |
+| `proton-bridge/cxx/proton_bridge_shim.{h,cpp}` | Buteo OOPP `ProtonContactsPlugin` (`QContactManager`) + `ProtonCalendarPlugin` (`QOrganizerManager mkcal`) single `libproton-client.so` |
+| `ui/proton.qml` / `proton-update.qml` / `proton-settings.qml` | `AccountCreationAgent` / `AccountCredentialsAgent` / `OnlineSyncAccountSettingsAgent` (OTP in-page, `Password` transient, `CredentialsId` string, `goToEndDestination`, **Contacts+Calendar toggles**) |
+| `buteo-profiles/` / `packaging/accounts/` / `rpm/` | `proton.provider` + `proton-carddav.service` + `proton-caldav.service` + `proton.Contacts.xml`/`proton.Calendar.xml` + single-RPM `make-pkg-bundle.sh` |
+| `FINDINGS_OTP.md` | Full OTP post-mortem (`delayDeletion`, double `CredentialsId`, `Secret` stripping → `Password` fallback, `QSettings` `DerivedPasswords`) |
 
 ## References
 

@@ -33,10 +33,12 @@ mkdir -p %{buildroot}%{_datadir}/accounts/providers
 install -m 0644 accounts/proton.provider \
     %{buildroot}%{_datadir}/accounts/providers/proton.provider
 
-# Install service description (carddav for contacts; id proton-carddav)
+# Install service descriptions (carddav for contacts + caldav for calendar)
 mkdir -p %{buildroot}%{_datadir}/accounts/services
 install -m 0644 accounts/proton-carddav.service \
     %{buildroot}%{_datadir}/accounts/services/proton-carddav.service
+install -m 0644 accounts/proton-caldav.service \
+    %{buildroot}%{_datadir}/accounts/services/proton-caldav.service
 
 # Install QML UI for account creation (provider id proton → proton.qml, like nextcloud.qml)
 mkdir -p %{buildroot}%{_datadir}/accounts/ui
@@ -56,6 +58,7 @@ install -m 0644 ui/proton-settings.qml \
 %defattr(-,root,root,-)
 %{_datadir}/accounts/providers/proton.provider
 %{_datadir}/accounts/services/proton-carddav.service
+%{_datadir}/accounts/services/proton-caldav.service
 %{_datadir}/accounts/ui/proton.qml
 %{_datadir}/accounts/ui/proton-settings.qml
 # %{_datadir}/icons/hicolor/*/apps/proton.png

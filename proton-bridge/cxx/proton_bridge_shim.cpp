@@ -758,12 +758,62 @@ QPair<QString, QString> ProtonContactsPlugin::loadPersistedTokens()
     return qMakePair(refreshToken, uid);
 }
 
+// ---- Calendar (single .so, single Sync Protocol "proton") ----
+ProtonCalendarPlugin::ProtonCalendarPlugin(const QString &aPluginName,
+                                           const Buteo::SyncProfile &aProfile,
+                                           Buteo::PluginCbInterface *aCbInterface)
+    : Buteo::ClientPlugin(aPluginName, aProfile, aCbInterface)
+{
+    proton_log(QStringLiteral("ProtonCalendarPlugin constructed: ") + aPluginName + " profile=" + getProfileName());
+}
+ProtonCalendarPlugin::~ProtonCalendarPlugin() {}
+bool ProtonCalendarPlugin::init() {
+    proton_log(QStringLiteral("ProtonCalendarPlugin::init() profile=") + getProfileName() + " - calendar sync init (mKCal via QOrganizer)");
+    QtOrganizer::QOrganizerManager testMgr(QStringLiteral("mkcal"));
+    if (testMgr.error() != QtOrganizer::QOrganizerManager::NoError) {
+        proton_log(QStringLiteral("ProtonCalendarPlugin::init() QOrganizerManager mkcal error: ") + QString::number(testMgr.error()));
+    } else {
+        proton_log(QStringLiteral("ProtonCalendarPlugin::init() QOrganizerManager mkcal ready, collections=") + QString::number(testMgr.collections().size()));
+    }
+    m_inited = true;
+    return true;
+}
+bool ProtonCalendarPlugin::uninit() { m_inited = false; return true; }
+bool ProtonCalendarPlugin::startSync() {
+    proton_log(QStringLiteral("ProtonCalendarPlugin::startSync() for ") + getProfileName() + " - calendar sync via QOrganizer mkcal"));
+    QtOrganizer::QOrganizerManager mgr(QStringLiteral("mkcal"));
+    if (mgr.error() != QtOrganizer::QOrganizerManager::NoError) {
+        proton_log(QStringLiteral("ProtonCalendarPlugin::startSync() mkcal error ") + QString::number(mgr.error()));
+        emit error(getProfileName(), QStringLiteral("Calendar storage not available"), Buteo::SyncResults::INTERNAL_ERROR);
+        return false;
+    }
+    QtOrganizer::QOrganizerEvent ev;
+    ev.setDisplayLabel(QStringLiteral("Proton Calendar sync active"));
+    ev.setDescription(QStringLiteral("Proton Calendar stub - VEVENT decrypt to mKCal next"));
+    QDateTime now = QDateTime::currentDateTime();
+    ev.setStartDateTime(now);
+    ev.setEndDateTime(now.addSecs(3600));
+    ev.setCollectionId(mgr.defaultCollectionId());
+    if (!mgr.saveItem(&ev)) {
+        proton_log(QStringLiteral("ProtonCalendarPlugin::startSync() saveItem failed: ") + QString::number(mgr.error()));
+        emit error(getProfileName(), QStringLiteral("Failed to save calendar event"), Buteo::SyncResults::INTERNAL_ERROR);
+        return false;
+    }
+    proton_log(QStringLiteral("ProtonCalendarPlugin::startSync() saved test event ") + ev.id().toString());
+    emit success(getProfileName(), QStringLiteral("Proton Calendar sync stub - 1 test event written to mkcal"));
+    return true;
+}
+void ProtonCalendarPlugin::abortSync(Sync::SyncStatus aStatus) { Q_UNUSED(aStatus); }
+bool ProtonCalendarPlugin::cleanUp() { return true; }
+Buteo::SyncResults ProtonCalendarPlugin::getSyncResults() const { return Buteo::SyncResults(); }
+void ProtonCalendarPlugin::connectivityStateChanged(Sync::ConnectivityType aType, bool aState) { Q_UNUSED(aType); Q_UNUSED(aState); }
+
 Buteo::ClientPlugin *ProtonPluginLoader::createClientPlugin(const QString &aPluginName,
                                                             const Buteo::SyncProfile &aProfile,
                                                             Buteo::PluginCbInterface *aCbInterface)
 {
-    // The profile keys live on the top-level sync profile; dump everything
-    // for diagnostics.
+    // Single libproton-client.so serves both contacts and calendar (same Sync Protocol "proton")
+    // Distinguish by sync profile name (proton-carddav-* vs proton-caldav-*)
     QMap<QString, QString> keys = aProfile.allKeys();
     QStringList log;
     log << QStringLiteral("createClientPlugin: name=") + aProfile.name();
@@ -771,5 +821,8 @@ Buteo::ClientPlugin *ProtonPluginLoader::createClientPlugin(const QString &aPlug
         log << it.key() + QLatin1Char('=') + it.value();
     }
     proton_log(log.join(QStringLiteral(" | ")));
+    if (aProfile.name().contains(QStringLiteral("caldav")) || aProfile.name().contains(QStringLiteral("calendar")) || aProfile.name().contains(QStringLiteral("Calendar"))) {
+        return new ProtonCalendarPlugin(aPluginName, aProfile, aCbInterface);
+    }
     return new ProtonContactsPlugin(aPluginName, aProfile, aCbInterface);
 }

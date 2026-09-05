@@ -208,3 +208,110 @@ pub struct KeySalt {
 pub struct KeySaltsResponse {
     pub KeySalts: Vec<KeySalt>,
 }
+
+// ---- Calendar ----
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Calendar {
+    #[serde(default)]
+    pub ID: String,
+    #[serde(default)]
+    pub Name: String,
+    #[serde(default)]
+    pub Description: String,
+    #[serde(default)]
+    pub Color: String,
+    #[serde(default)]
+    pub Display: Option<bool>,
+    #[serde(default)]
+    pub Type: i64,
+    #[serde(default)]
+    pub Flags: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CalendarKey {
+    #[serde(default)]
+    pub ID: String,
+    #[serde(default)]
+    pub CalendarID: String,
+    #[serde(default)]
+    pub PassphraseID: String,
+    #[serde(default)]
+    pub PrivateKey: String,
+    #[serde(default)]
+    pub Flags: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CalendarPassphrase {
+    #[serde(default)]
+    pub ID: String,
+    #[serde(default)]
+    pub Flags: i64,
+    #[serde(default)]
+    pub MemberPassphrases: Vec<MemberPassphrase>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemberPassphrase {
+    #[serde(default)]
+    pub MemberID: String,
+    #[serde(default)]
+    pub Passphrase: String,
+    #[serde(default)]
+    pub Signature: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CalendarEvent {
+    #[serde(default)]
+    pub ID: String,
+    #[serde(default)]
+    pub UID: String,
+    #[serde(default)]
+    pub CalendarID: String,
+    #[serde(default)]
+    pub SharedEventID: String,
+    #[serde(default)]
+    pub CreateTime: i64,
+    #[serde(default)]
+    pub LastEditTime: i64,
+    #[serde(default)]
+    pub StartTime: i64,
+    #[serde(default)]
+    pub EndTime: i64,
+    #[serde(default)]
+    pub StartTimezone: String,
+    #[serde(default)]
+    pub EndTimezone: String,
+    #[serde(default)]
+    pub FullDay: Option<bool>,
+    #[serde(default)]
+    pub Author: String,
+    #[serde(default)]
+    pub SharedKeyPacket: String,
+    #[serde(default)]
+    pub CalendarKeyPacket: String,
+    #[serde(default)]
+    pub SharedEvents: Vec<CalendarEventPart>,
+    #[serde(default)]
+    pub CalendarEvents: Vec<CalendarEventPart>,
+    #[serde(default)]
+    pub AttendeesEvents: Vec<CalendarEventPart>,
+    #[serde(default)]
+    pub PersonalEvents: Vec<CalendarEventPart>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CalendarEventPart {
+    #[serde(default)]
+    pub MemberID: String,
+    #[serde(default)]
+    pub Type: i64,
+    #[serde(default)]
+    pub Data: String,
+    #[serde(default)]
+    pub Signature: String,
+    #[serde(default)]
+    pub Author: String,
+}

@@ -33,6 +33,9 @@
 #include <QContactUrl>
 #include <QContactGender>
 #include <QContactAnniversary>
+#include <QOrganizerManager>
+#include <QOrganizerEvent>
+#include <QOrganizerItemId>
 
 #include <Accounts/manager.h>
 #include <Accounts/account.h>
@@ -90,6 +93,26 @@ private:
     SignOn::Identity *m_identity = nullptr;
     SignOn::AuthSession *m_authSession = nullptr;
     bool m_credentialsReady = false;
+};
+
+class ProtonCalendarPlugin : public Buteo::ClientPlugin
+{
+    Q_OBJECT
+public:
+    ProtonCalendarPlugin(const QString &aPluginName,
+                         const Buteo::SyncProfile &aProfile,
+                         Buteo::PluginCbInterface *aCbInterface);
+    ~ProtonCalendarPlugin() override;
+    bool init() override;
+    bool uninit() override;
+    bool startSync() override;
+    void abortSync(Sync::SyncStatus aStatus = Sync::SYNC_ABORTED) override;
+    bool cleanUp() override;
+    Buteo::SyncResults getSyncResults() const override;
+public slots:
+    void connectivityStateChanged(Sync::ConnectivityType aType, bool aState) override;
+private:
+    bool m_inited = false;
 };
 
 class ProtonPluginLoader : public Buteo::SyncPluginLoader

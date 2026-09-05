@@ -1,4 +1,4 @@
-use proton_sync::{SyncConfig, SyncEngine, SyncStatus};
+use proton_sync::{calendar::CalendarSyncEngine, SyncConfig, SyncEngine, SyncStatus};
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 use std::sync::{Arc, Mutex};
@@ -291,5 +291,91 @@ pub extern "C" fn proton_bridge_get_keys_debug(engine: *mut ProtonSyncEngine) ->
             None => std::ptr::null_mut(),
         },
         None => std::ptr::null_mut(),
+    }
+}
+
+// ---- Calendar engine FFI (single .so, separate engine) ----
+pub struct ProtonCalendarEngine {
+    inner: Arc<Mutex<Option<CalendarSyncEngine>>>,
+}
+#[no_mangle]
+pub extern "C" fn proton_calendar_create_engine(
+    username: *const c_char,
+    access_token: *const c_char,
+    refresh_token: *const c_char,
+    uid: *const c_char,
+) -> *mut ProtonCalendarEngine {
+    let username = unsafe { cstr_to_string(username) };
+    let access_token = unsafe { cstr_to_string(access_token) };
+    let refresh_token = unsafe { cstr_to_string(refresh_token) };
+    let uid = unsafe { cstr_to_string(uid) };
+    let config = SyncConfig {
+        username,
+        password: String::new(),
+        access_token: if access_token.is_empty() {
+            None
+        } else {
+            Some(access_token)
+        },
+        refresh_token: if refresh_token.is_empty() {
+            None
+        } else {
+            Some(refresh_token)
+        },
+        uid: if uid.is_empty() { None } else { Some(uid) },
+        ..Default::default()
+    };
+    let engine = CalendarSyncEngine::new(config);
+    Box::into_raw(Box::new(ProtonCalendarEngine {
+        inner: Arc::new(Mutex::new(Some(engine))),
+    }))
+}
+#[no_mangle]
+pub extern "C" fn proton_calendar_destroy_engine(e: *mut ProtonCalendarEngine) {
+    if !e.is_null() {
+        unsafe {
+            drop(Box::from_raw(e));
+        }
+    }
+}
+#[no_mangle]
+pub extern "C" fn proton_calendar_start_sync(e: *mut ProtonCalendarEngine) -> bool {
+    if e.is_null() {
+        return false;
+    }
+    let eref = unsafe { &*e };
+    if let Some(mut eng) = eref.inner.lock().unwrap().take() {
+        let cfg = eng.status(); // dummy to keep compiler happy
+        let _ = cfg;
+        let inner = Arc::clone(&eref.inner);
+        std::thread::spawn(move || {
+            // config is already inside eng; use a clone
+            let cfg2 = SyncConfig::default();
+            eng.start_sync(cfg2);
+            *inner.lock().unwrap() = Some(eng);
+        });
+        true
+    } else {
+        false
+    }
+}
+#[no_mangle]
+pub extern "C" fn proton_calendar_get_status(
+    e: *mut ProtonCalendarEngine,
+    s: *mut ProtonBridgeStatus,
+) {
+    if e.is_null() || s.is_null() {
+        return;
+    }
+    let eref = unsafe { &*e };
+    let st = eref
+        .inner
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|x| x.status())
+        .unwrap_or_default();
+    unsafe {
+        *s = ProtonBridgeStatus::from_sync_status(&st);
     }
 }

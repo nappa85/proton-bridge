@@ -308,8 +308,11 @@ AccountCreationAgent {
                 root.delayDeletion = true
                 enabled = true
                 enableWithService("proton-carddav")
+                enableWithService("proton-caldav")
                 setConfigurationValue("proton-carddav", "server_address", "https://mail.proton.me")
                 setConfigurationValue("proton-carddav", "ignore_ssl_errors", false)
+                setConfigurationValue("proton-caldav", "server_address", "https://mail.proton.me")
+                setConfigurationValue("proton-caldav", "ignore_ssl_errors", false)
                 var globalSettings = configurationValues("")
                 var debugLines = ["global settings:"]
                 for (var gk in globalSettings) {
@@ -335,8 +338,11 @@ AccountCreationAgent {
             root.delayDeletion = true
             enabled = true
             enableWithService("proton-carddav")
+            enableWithService("proton-caldav")
             setConfigurationValue("proton-carddav", "server_address", "https://mail.proton.me")
             setConfigurationValue("proton-carddav", "ignore_ssl_errors", false)
+            setConfigurationValue("proton-caldav", "server_address", "https://mail.proton.me")
+            setConfigurationValue("proton-caldav", "ignore_ssl_errors", false)
             var globalSettings = configurationValues("")
             var debugLines = ["proton: global settings in update:"]
             for (var gk in globalSettings) {

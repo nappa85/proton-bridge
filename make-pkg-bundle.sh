@@ -83,6 +83,7 @@ ln -sf /opt/cross/bin/aarch64-meego-linux-gnu-as /opt/cross/bin/as 2>/dev/null |
 ln -sf libbuteosyncfw5.so.0 $TARGET_ROOT/usr/lib64/libbuteosyncfw5.so 2>/dev/null || true
 ln -sf libQt5Core.so.5 $TARGET_ROOT/usr/lib64/libQt5Core.so 2>/dev/null || true
 ln -sf libQt5Contacts.so.5 $TARGET_ROOT/usr/lib64/libQt5Contacts.so 2>/dev/null || true
+ln -sf libQt5Organizer.so.5 $TARGET_ROOT/usr/lib64/libQt5Organizer.so 2>/dev/null || true
 ln -sf libaccounts-qt5.so.1 $TARGET_ROOT/usr/lib64/libaccounts-qt5.so 2>/dev/null || true
 ln -sf libsignon-qt5.so.1 $TARGET_ROOT/usr/lib64/libsignon-qt5.so 2>/dev/null || true
 ln -sf libsignon-plugins-common.so.1 $TARGET_ROOT/usr/lib64/libsignon-plugins-common.so 2>/dev/null || true
@@ -95,6 +96,7 @@ BUTEO_INC="-I/home/mersdk/packaging/buteo-headers \
     -I$TARGET_ROOT/usr/include/qt5 \
     -I$TARGET_ROOT/usr/include/qt5/QtCore \
     -I$TARGET_ROOT/usr/include/qt5/QtContacts \
+    -I$TARGET_ROOT/usr/include/qt5/QtOrganizer \
     -I$TARGET_ROOT/usr/include/qt5/QtDBus \
     -I$TARGET_ROOT/usr/include/qt5/QtXml \
     -I$TARGET_ROOT/usr/include/qt5/QtNetwork \
@@ -142,6 +144,7 @@ aarch64-meego-linux-gnu-g++ \
     -lbuteosyncfw5 \
     -lQt5Core \
     -lQt5Contacts \
+    -lQt5Organizer \
     -lQt5DBus \
     -lQt5Xml \
     -lQt5Network \
@@ -211,13 +214,15 @@ echo "Deploying to $PHONE_IP..."
 scp "$BUTEO_PLUGIN" defaultuser@$PHONE_IP:/tmp/libproton-client.so
 scp "$SIGNON_PLUGIN" defaultuser@$PHONE_IP:/tmp/libprotonplugin.so
 
-# Copy profiles
+# Copy profiles (contacts + calendar, single proton client)
 scp "$repo_root/buteo-profiles/client/proton-contacts.xml" defaultuser@$PHONE_IP:/tmp/
 scp "$repo_root/buteo-profiles/sync/proton.Contacts.xml" defaultuser@$PHONE_IP:/tmp/
+scp "$repo_root/buteo-profiles/sync/proton.Calendar.xml" defaultuser@$PHONE_IP:/tmp/proton.Calendar.xml
 
-# Copy account XMLs
+# Copy account XMLs (provider + both services)
 scp "$repo_root/packaging/accounts/proton.provider" defaultuser@$PHONE_IP:/tmp/
 scp "$repo_root/packaging/accounts/proton-carddav.service" defaultuser@$PHONE_IP:/tmp/
+scp "$repo_root/packaging/accounts/proton-caldav.service" defaultuser@$PHONE_IP:/tmp/
 scp "$repo_root/ui/proton.qml" defaultuser@$PHONE_IP:/tmp/proton.qml
 scp "$repo_root/ui/proton-settings.qml" defaultuser@$PHONE_IP:/tmp/proton-settings.qml
 scp "$repo_root/ui/proton-update.qml" defaultuser@$PHONE_IP:/tmp/proton-update.qml
@@ -239,15 +244,18 @@ rm -f /usr/lib/signon/libproton.so
 rm -f /usr/lib64/signon/libproton.so
 
 cp /tmp/proton-contacts.xml /etc/buteo/profiles/client/proton.xml
-# Sync profile name is proton-carddav – ensure correct filename and cleanup old
+# Sync profiles: proton-carddav (contacts) + proton-caldav (calendar) — single proton client
 cp /tmp/proton.Contacts.xml /etc/buteo/profiles/sync/proton-carddav.xml
 cp /tmp/proton.Contacts.xml /etc/buteo/profiles/sync/proton.Contacts.xml
+cp /tmp/proton.Calendar.xml /etc/buteo/profiles/sync/proton-caldav.xml
+cp /tmp/proton.Calendar.xml /etc/buteo/profiles/sync/proton.Calendar.xml
 rm -f /etc/buteo/profiles/sync/proton.xml 2>/dev/null || true
 
 mkdir -p /usr/share/accounts/providers
 cp /tmp/proton.provider /usr/share/accounts/providers/proton.provider
 mkdir -p /usr/share/accounts/services
 cp /tmp/proton-carddav.service /usr/share/accounts/services/proton-carddav.service
+cp /tmp/proton-caldav.service /usr/share/accounts/services/proton-caldav.service
 mkdir -p /usr/share/accounts/ui
 cp /tmp/proton.qml /usr/share/accounts/ui/proton.qml
 cp /tmp/proton-settings.qml /usr/share/accounts/ui/proton-settings.qml

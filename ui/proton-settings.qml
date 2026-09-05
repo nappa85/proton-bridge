@@ -4,6 +4,6 @@ import Sailfish.Accounts 1.0
 import com.jolla.settings.accounts 1.0
 
 OnlineSyncAccountSettingsAgent {
-    services: [accountManager.service("proton-carddav")]
-    sharedScheduleServices: [accountManager.service("proton-carddav")]
+    services: [accountManager.service("proton-carddav"), accountManager.service("proton-caldav")]
+    sharedScheduleServices: [accountManager.service("proton-carddav"), accountManager.service("proton-caldav")]
 }

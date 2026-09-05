@@ -13,8 +13,10 @@ Requires:       libsignon-qt5 >= 8.61
 Requires:       glibc >= 2.17
 
 %description
-Buteo synchronization plugin for Proton Contacts. Implements two-way sync
-between SailfishOS Contacts (QtPIM) and Proton Mail via the internal REST API.
+Buteo synchronization plugin for Proton Contacts and Calendar. Single OOPP
+plugin (libproton-client.so, Sync Protocol "proton") handles both
+proton-carddav (contacts, QContactManager) and proton-caldav (calendar,
+mKCal/KCalendarCore) sync profiles.
 
 %prep
 %setup -q -n %{name}-%{version}
@@ -37,12 +39,15 @@ install -m 0644 buteo-profiles/client/proton-contacts.xml \
 mkdir -p %{buildroot}%{_sysconfdir}/buteo/profiles/sync
 install -m 0644 buteo-profiles/sync/proton.Contacts.xml \
     %{buildroot}%{_sysconfdir}/buteo/profiles/sync/proton.Contacts.xml
+install -m 0644 buteo-profiles/sync/proton.Calendar.xml \
+    %{buildroot}%{_sysconfdir}/buteo/profiles/sync/proton.Calendar.xml
 
 %files
 %defattr(-,root,root,-)
 %{_libdir}/buteo-plugins-qt5/oopp/libproton-client.so
 %config(noreplace) %{_sysconfdir}/buteo/profiles/client/proton.xml
 %config(noreplace) %{_sysconfdir}/buteo/profiles/sync/proton.Contacts.xml
+%config(noreplace) %{_sysconfdir}/buteo/profiles/sync/proton.Calendar.xml
 
 %post
 systemctl --user reload msyncd 2>/dev/null || true
