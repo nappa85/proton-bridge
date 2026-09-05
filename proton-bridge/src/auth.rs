@@ -104,6 +104,37 @@ pub extern "C" fn proton_auth_refresh(
 }
 
 #[no_mangle]
+pub extern "C" fn proton_derive_passwords(
+    password: *const c_char,
+    access_token: *const c_char,
+    uid: *const c_char,
+) -> *mut c_char {
+    let password = unsafe { cstr_to_string(password) };
+    let access_token = unsafe { cstr_to_string(access_token) };
+    let uid = unsafe { cstr_to_string(uid) };
+    match proton_api::keys::derive_all_passwords(&password, &access_token, &uid) {
+        Ok(map) if !map.is_empty() => {
+            let json = serde_json::to_string(&map).unwrap_or_else(|_| "{}".to_string());
+            CString::new(json).unwrap().into_raw()
+        }
+        Ok(_) => std::ptr::null_mut(),
+        Err(e) => {
+            eprintln!("derive_all_passwords failed: {e}");
+            std::ptr::null_mut()
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn proton_auth_free_string(s: *mut c_char) {
+    if !s.is_null() {
+        unsafe {
+            drop(CString::from_raw(s));
+        }
+    }
+}
+
+#[no_mangle]
 pub extern "C" fn proton_auth_free_result(result: *mut ProtonAuthResult) {
     if result.is_null() {
         return;

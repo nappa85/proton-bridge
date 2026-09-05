@@ -185,10 +185,7 @@ impl AuthClient {
         Ok(resp)
     }
 
-    fn is_totp_required(
-        two_fa: &Option<TwoFAField>,
-        two_factor: &Option<TwoFactorInfo>,
-    ) -> bool {
+    fn is_totp_required(two_fa: &Option<TwoFAField>, two_factor: &Option<TwoFactorInfo>) -> bool {
         if let Some(f) = two_fa {
             // Enabled 1 = TOTP, 2 = FIDO2, 3 = both. TOTP field may also be set.
             if f.Enabled == 1 || f.Enabled == 3 || f.TOTP == 1 {
@@ -822,19 +819,26 @@ mod tests {
             "Scopes":["self","parent","user","twofactor"]
         }"#;
         let resp_locked = make_auth_response(json_locked);
-        assert!(AuthClient::is_totp_required(&resp_locked.TwoFA, &resp_locked.TwoFactor));
+        assert!(AuthClient::is_totp_required(
+            &resp_locked.TwoFA,
+            &resp_locked.TwoFactor
+        ));
 
         let json_full = r#"{
             "AccessToken":"full_at","RefreshToken":"rt","UID":"uid","ExpiresIn":3600,"ServerProof":"sp",
             "Scopes":["self","parent","user","full"]
         }"#;
         let resp_full = make_auth_response(json_full);
-        assert!(!AuthClient::is_totp_required(&resp_full.TwoFA, &resp_full.TwoFactor));
+        assert!(!AuthClient::is_totp_required(
+            &resp_full.TwoFA,
+            &resp_full.TwoFactor
+        ));
     }
 
     #[test]
     fn test_refresh_response_parsing() {
-        let json = r#"{"AccessToken":"new_at","RefreshToken":"new_rt","UID":"uid","ExpiresIn":3600}"#;
+        let json =
+            r#"{"AccessToken":"new_at","RefreshToken":"new_rt","UID":"uid","ExpiresIn":3600}"#;
         let resp: RefreshResponse = serde_json::from_str(json).unwrap();
         assert_eq!(resp.AccessToken, "new_at");
     }
@@ -902,7 +906,9 @@ mod tests {
             .mock("POST", "/auth/v4/refresh")
             .with_status(200)
             .with_header("content-type", "application/json")
-            .with_body(r#"{"AccessToken":"new_at","RefreshToken":"new_rt","UID":"uid","ExpiresIn":3600}"#)
+            .with_body(
+                r#"{"AccessToken":"new_at","RefreshToken":"new_rt","UID":"uid","ExpiresIn":3600}"#,
+            )
             .create();
         let res = client.refresh("old_rt", "uid");
         assert!(res.is_ok());

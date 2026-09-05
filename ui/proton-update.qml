@@ -35,21 +35,29 @@ AccountCredentialsAgent {
         property string _pendingAccessToken
         property string _pendingRefreshToken
         property string _pendingUid
+        property string _pendingPassword
 
         backNavigation: !_busy
 
         function _update(extraParams) {
             _errorMessage = ""
             _busy = true
+            // Password is passed as transient "Password" param, not as Secret, so raw password is never persisted
+            // Use dummy "x" for Secret to avoid isNull() encryption error
+            if (!extraParams && passwordField.text.length > 0) {
+                _pendingPassword = passwordField.text
+            }
             var sip = account.signInParameters("proton-carddav",
                                                 account.defaultCredentialsUserName,
-                                                passwordField.text)
+                                                "x")
+            sip.setParameter("Password", _pendingPassword)
             if (extraParams) {
                 for (var key in extraParams) {
                     sip.setParameter(key, extraParams[key])
                 }
             }
-            account.updateSignInCredentials("Jolla", "Jolla", sip)
+            console.log("proton-update: _update pw_len=" + _pendingPassword.length + " extra=" + (extraParams ? JSON.stringify(extraParams) : "null") + " sip pw_len=" + (sip.password ? sip.password.length : 0))
+            account.updateSignInCredentials("Jolla", "Jolla", sip, "")
         }
 
         SilicaFlickable {
@@ -202,6 +210,7 @@ AccountCredentialsAgent {
         identifier: root.accountId
 
         onSignInCredentialsUpdated: {
+            console.log("proton-update: onSignInCredentialsUpdated data=" + JSON.stringify(data))
             if (data["TwoFARequired"] === true) {
                 // Locked session: reveal the OTP field and wait for the code.
                 updatePage._pendingAccessToken = data["AccessToken"] || ""
@@ -209,7 +218,7 @@ AccountCredentialsAgent {
                 updatePage._pendingUid = data["Uid"] || ""
                 updatePage._needsTwoFA = true
                 updatePage._busy = false
-                Qt.callLater(function() { otpField.forceActiveFocus() })
+                otpField.forceActiveFocus()
             } else {
                 updatePage._busy = false
                 root.credentialsUpdated(accountId)

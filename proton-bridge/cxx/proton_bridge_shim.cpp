@@ -226,11 +226,27 @@ void ProtonContactsPlugin::onSignOnResponse(const SignOn::SessionData &data)
     }
     if (derivedJson.isEmpty()) {
         QSettings settings(QStringLiteral("proton"), QStringLiteral("sync-tokens"));
+        // Try accountId group (legacy)
         settings.beginGroup(m_accountId);
         derivedJson = settings.value(QStringLiteral("derived_passwords")).toString();
         settings.endGroup();
         if (!derivedJson.isEmpty()) {
-            proton_log(QStringLiteral("Loaded derived passwords from QSettings cache"));
+            proton_log(QStringLiteral("Loaded derived passwords from QSettings cache (accountId)"));
+        } else if (!uid.isEmpty()) {
+            settings.beginGroup(uid);
+            derivedJson = settings.value(QStringLiteral("derived_passwords")).toString();
+            settings.endGroup();
+            if (!derivedJson.isEmpty()) {
+                proton_log(QStringLiteral("Loaded derived passwords from QSettings cache (Uid)"));
+            }
+        }
+        if (derivedJson.isEmpty() && !username.isEmpty()) {
+            settings.beginGroup(username);
+            derivedJson = settings.value(QStringLiteral("derived_passwords")).toString();
+            settings.endGroup();
+            if (!derivedJson.isEmpty()) {
+                proton_log(QStringLiteral("Loaded derived passwords from QSettings cache (username)"));
+            }
         }
     }
 

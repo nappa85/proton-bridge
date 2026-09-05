@@ -51,14 +51,13 @@ impl UnlockedKey {
         for ka in cert.keys().secret() {
             let mut key = ka.key().clone();
             let pk_algo = key.pk_algo();
-            if key.secret().is_encrypted() {
-                if key
+            if key.secret().is_encrypted()
+                && key
                     .secret_mut()
                     .decrypt_in_place(pk_algo, &Password::from(passphrase.to_vec()))
                     .is_err()
-                {
-                    continue;
-                }
+            {
+                continue;
             }
             match key.into_keypair() {
                 Ok(pair) => {
@@ -91,14 +90,13 @@ impl UnlockedKey {
         for ka in cert.keys().secret() {
             let mut key = ka.key().clone();
             let pk_algo = key.pk_algo();
-            if key.secret().is_encrypted() {
-                if key
+            if key.secret().is_encrypted()
+                && key
                     .secret_mut()
                     .decrypt_in_place(pk_algo, &Password::from(passphrase.to_vec()))
                     .is_err()
-                {
-                    continue;
-                }
+            {
+                continue;
             }
             match key.into_keypair() {
                 Ok(pair) => {

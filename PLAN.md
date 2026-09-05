@@ -26,13 +26,9 @@ Native SailfishOS Buteo sync plugin for Proton Contacts, using a Rust sync engin
 
 ## What Works
 
-- SRP authentication with v4 endpoints (`/core/v4/auth/info`, `/core/v4/auth`, `/auth/v4/refresh`)
-- TOTP 2FA during account creation and credentials update: the "proton"
-  SignOn plugin performs login, requests the OTP via the in-process signon
-  UI, and submits it to `/auth/v4/2fa` (locked-session scope upgrade)
-- Token persistence: RefreshToken/Uid/AccessToken stored in signond's
-  per-method blob store (via plugin `store()`); sync runs tokens-only
-  (buteo plugin session uses NoUserInteractionPolicy)
+- SRP authentication with v4 endpoints (`/core/v4/auth/info`, `/core/v4/auth`, `/auth/v4/refresh`) + `is_totp_required` handling `Enabled=1/3` (go-proton-api `TwoFAStatus`)
+- TOTP 2FA during account creation (`proton.qml` custom `AccountCreationAgent`) and credentials update (`proton-update.qml` `AccountCredentialsAgent`): OTP collected **in-page** (`TextField`), not via `signon-ui` `InProcessEntryView` (SIGSEGV on this SFOS). SignOn `proton` plugin does SRP → `TwoFARequired` + locked tokens, QML shows OTP, `updateSignInCredentials` with `TwoFactorPassword` + locked `AccessToken`/`RefreshToken`/`Uid` + transient `Password` → `POST /auth/v4/2fa` scope upgrade → `derive_all_passwords` → `store(tokens+DerivedPasswords)` + `QSettings` fallback
+- Token + derived persistence: `RefreshToken`/`Uid`/`AccessToken` + `DerivedPasswords` (`keyID→base64`) stored in `signond` blob (`STORE` `identity_id=…` + `signond` `storeData`) and `QSettings("proton","sync-tokens")` `[<Uid>]`/`[<username>]` + `Healing CredentialsId` for `variant type double` QML bug; sync runs `NoUserInteractionPolicy` refresh → `pw_len=0` but `derived_len=139` → `total_unlocked=1`
 - Contact fetching: list v4 → individual GET per contact → full Cards data
 - PGP decryption of Type 3 (encrypted) contact cards using `sequoia-openpgp`
 - vCard parsing with `ical_vcard` (handles `ITEM1.EMAIL` groups, `PREF` params, etc.)
@@ -60,40 +56,45 @@ sleep 2
 dbus-send --session --type=method_call --dest=com.meego.msyncd /synchronizer com.meego.msyncd.startSync string:"proton.Contacts-<accountid>"
 ```
 
-## 2FA / OTP Design (implemented)
+## 2FA / OTP Design (implemented — raw password never persisted)
 
 ```
-Account creation (proton.qml, custom agent):
-  Dialog collects username/password
-    → AccountManager.createAccount("proton")
-    → Account.createSignInCredentials("Jolla","Jolla", sip + InProcess* params)
-        signond → proton plugin process():
-          stored tokens? → refresh → result
-          else login:
-            no 2FA  → tokens → store(tokens) → result
-            2FA     → userActionRequired(Title=Proton, QueryPassword, msg)
-                       in-process dialog (SignonUiService overlay)
-                       user enters code → userActionFinished(Secret=code)
-                       → POST /auth/v4/2fa (session scope upgrade)
-                       → store(tokens) → result
-    → signInCredentialsCreated → enable service, save account → accountCreated
+Account creation (proton.qml, custom AccountCreationAgent, OTP in-page):
+  Page collects username/password → _pendingUsername/_pendingPassword
+    → AccountManager.createAccount("proton") → creationAccount.identifier = id
+    → creationAccount.onStatusChanged(Initialized) → signInParameters("proton-carddav", user, "x")
+         + sip.setParameter("Password", _pendingPassword)  // transient, not Secret
+         → Account.createSignInCredentials("Jolla","Jolla", sip, "")  // Secret="x" dummy, symmetricKey=""
+        signond → proton plugin process(hasPasswordParam=true, pw_len=20):
+          2FA? → userActionRequired path is NOT used (SIGSEGV in InProcessEntryView on this SFOS)
+                 instead plugin returns TwoFARequired + locked tokens (store NOT called)
+                 QML shows OTP TextField, user enters 6-digit code → updateSignInCredentials("Jolla","Jolla", sip+TwoFactorPassword+lockedTokens)
+                 signond → process(totp+lockedTokens, Password=20) → POST /auth/v4/2fa (scope upgrade, no new tokens)
+                 handleAuthOk → derive_all_passwords(Password, AccessToken, Uid) → tokens+DerivedPasswords → store(tokens+DerivedPasswords) + QSettings("proton","sync-tokens") [Uid]/[username] → result(UserName+tokens+DerivedPasswords, no Secret)
+    → onSignInCredentialsUpdated → _setCredentialsId(string) for ""+service "CredentialsId" (parseInt+string, not double) → sync() → accountCreated → goToEndDestination()
 
-Sync (buteo plugin):
-  identity session, UiPolicy=NoUserInteractionPolicy
-    → signond merges stored RefreshToken/Uid blob
-    → plugin refreshes → tokens-only result → SyncEngine fetch
+Credentials update (proton-update.qml, AccountCredentialsAgent):
+  Same Password-transient + hasFreshPassword guard in proton_signon_plugin.cpp:process
+  (skips blind refresh when Password present, forces SRP → TwoFARequired → OTP)
+
+Sync (buteo OOPP, proton_bridge_shim.cpp, NoUserInteractionPolicy):
+  requestCredentials → signond merges stored RefreshToken/Uid/DerivedPasswords blob
+  (signond strips Secret; DerivedPasswords may be filtered, so shim falls back to QSettings by m_accountId → Uid → username)
+  → plugin does POST /auth/v4/refresh → handleAuthOk (no Secret, Password via fallback) → SyncEngine with pw_len=0, derived_len=139 → unlock_keys via DerivedPasswords cache (QSettings) → contacts
 ```
 
-The SignOn plugin fails cleanly (no re-prompt loop) when userActionFinished
-carries `QueryErrorCode != 0` (NO_SIGNONUI/cancelled).
+* Raw 20-char login password is **only** the transient `Password` param for `derive_all_passwords` at `Verify`; `Secret` in `signond` stays dummy `"x"` (`signon-secrets.db` `CREDENTIALS` `password` column is `"x"`), `handleAuthOk` never `emit result(Secret)`.
+* `QSettings("proton","sync-tokens")` holds `[<Uid>]` + `[<username>]` `derived_passwords` JSON (`keyID → base64(mailboxPassword)`) for `engine.rs` `get_passphrase_for_key` fallback.
+* `delayDeletion` + `goToEndDestination()` (not `pop`) prevents double-pop to provider picker; `Qt.callLater` replaced by direct `forceActiveFocus()` (Qt 5.6 has no `callLater`).
 
 ## Known Issues / TODO
 
-- **Token-based address keys**: Address keys with non-empty `Token` field can't be decrypted yet — contacts using those keys won't sync
+- **Token-based address keys**: Address keys with non-empty `Token` field can't be decrypted yet — contacts using those keys won't sync (shows `addrkey_…_no_pp_token=true` in `Keys debug`)
 - **Two-way sync**: Currently download-only (Proton → phone). No upload of local changes
 - **Incremental sync**: No sync token support; full fetch every time
 - **Contact dedup**: No duplicate detection across Proton + local contacts
 - **Multiple photos**: People app only supports one avatar; only first photo is used
+- **Password never persisted** (intentional): raw 20-char login password is transient `Password` param only for `derive_all_passwords` at `Verify`; `signon-secrets.db` `CREDENTIALS.password` stays dummy `"x"`, `handleAuthOk` never returns `Secret`. New `KeySalt` after manual Proton key rotation will need one more **Update credentials → OTP** to re-derive and re-store `DerivedPasswords`.
 
 ## Key Technical Details
 
@@ -227,23 +228,29 @@ com/jolla/settings/accounts.
 
 ```
 proton-api/       — Pure Rust Proton API client
-  auth.rs           SRP auth + 2FA + refresh
-  crypto.rs         derive_mailbox_password(), decrypt_contact_card()
-  keys.rs           User/address key management
+  auth.rs           SRP auth + is_totp_required(1/3) + submit_2fa(/auth/v4/2fa) + TokenManager
+  crypto.rs         derive_mailbox_password(), decrypt_contact_card(), UnlockedKey
+  keys.rs           KeysClient + derive_all_passwords() → DerivedPasswords JSON
   contacts.rs       Contacts list/get API
   models.rs         Contact, ContactCard, UserKey, etc.
   vcard.rs          ical_vcard parser + download_url_photos()
 
 proton-sync/      — Sync engine orchestration
-  engine.rs         SyncEngine: auth → unlock keys → fetch → parse → JSON
+  engine.rs         SyncEngine: auth (refresh) → unlock_keys via DerivedPasswords cache (QSettings) → fetch → parse → JSON
 
-proton-bridge/    — C++ FFI layer
-  cxx/proton_bridge_shim.cpp   Buteo plugin + QContactManager
-  cxx/proton_bridge_shim.h     QtContacts includes
-  src/lib.rs                    FFI bridge (proton_bridge_* C functions)
+proton-bridge/    — Rust FFI + C++ plugins
+  src/auth.rs       FFI proton_auth_login/submit_2fa/refresh/derive_passwords
+  src/bridge.rs     FFI proton_bridge_* (SyncEngine JSON, status, tokens, derived)
+  signon/proton_signon_plugin.{h,cpp}  SignOn "proton" plugin: process(Password transient) → handleAuthOk(derive → store DerivedPasswords)
+  cxx/proton_bridge_shim.{h,cpp}      Buteo OOPP plugin: requestCredentials(NoUserInteraction) + QSettings fallback by Uid/username, pollStatus Keys debug
 
-buteo-profiles/   — Buteo sync profile XMLs
-accounts/         — Accounts/SSO provider + service XMLs
-ui/               — QML account creation/settings UI
+ui/               — QML
+  proton.qml                 AccountCreationAgent (custom, _pendingUsername/_pendingPassword, TwoFARequired OTP TextField, _setCredentialsId string, goToEndDestination)
+  proton-update.qml          AccountCredentialsAgent (same Password transient + hasFreshPassword guard)
+  proton-settings.qml        OnlineSyncAccountSettingsAgent
+
+buteo-profiles/   — Buteo sync profile XMLs (proton / proton-carddav-*.xml)
+accounts/         — Accounts&SSO provider/service XML (proton.provider, proton-carddav.service)
 rpm/              — RPM spec files
+FINDINGS_OTP.md   — Full OTP failure post-mortem (delayDeletion, double CredentialsId, Secret stripping, pw_len=0 → derived)
 ```

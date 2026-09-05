@@ -173,29 +173,11 @@ Key observations from CardDAV:
 - Auth happens in `startSync()`, not in `init()`
 - Uses `TwoWayContactSyncAdaptor` for proper two-way sync
 
-## Fix Plan
+## Fix Plan — OTP follow-up (2026-09-05, now done)
 
-1. **Use qmake build system** for the C++ plugin (like CardDAV does)
-   - Create a .pro file with `CONFIG += plugin`
-   - Let qmake handle moc, linking, etc.
-   - This ensures the .so is a proper Qt plugin
+1. **SignOn `Secret` stripping** (`NoUserInteraction` refresh drops `Secret`): `proton_signon_plugin.cpp:handleAuthOk` now also emits `Password` and `DerivedPasswords` (`derive_all_passwords`) + `QSettings("proton","sync-tokens")` fallback by `Uid`/`username` (`proton_bridge_shim.cpp:219`), so `Got credentials … pw_len=0` still succeeds via `derived_keys=1`.
+2. **`CredentialsId` double** (`Account.setConfigurationValue` `convertValue` rejects `double`): `ui/proton.qml:_setCredentialsId` now passes `""+intId` string and writes both `""` and `proton-carddav` `CredentialsId`; `proton_bridge_shim.cpp:131` heals wrong variant type.
+3. **`AccountCreationAgent` double-pop** (`pageStack.pop()` vs `goToEndDestination()` + `delayDeletion`): `ui/proton.qml` now uses `root.goToEndDestination()` and `delayDeletion` driven by `_busy/_needsTwoFA/_flowComplete` + `Qt.callLater` → direct `forceActiveFocus()` (Qt 5.6 has no `callLater`).
+4. **Transient `Password` vs persisted `Secret`**: `ui/proton.qml` + `proton-update.qml` now use `signInParameters(…, "x")` + `sip.setParameter("Password", _pendingPassword)` with explicit `, ""` `symmetricKey`, and `proton_signon_plugin.cpp:process` prefers `Password` param over `Secret` (dummy `"x"`), so raw 20-char login password is never persisted (`signon-secrets.db` `CREDENTIALS.password` stays `"x"`).
 
-2. **Consistent naming**: 
-   - `.so` name = `libproton-client.so` → plugin name `proton`
-   - Client profile name = `proton`
-   - Sync Protocol key = `proton`
-   - OR keep `proton-contacts` everywhere consistently
-
-3. **Remove `<conditions>` from sync profile** (already done but verify)
-
-4. **Test plugin loading independently**: Run `buteo-oopp-runner` manually
-   to verify the .so loads as a Qt plugin before testing via msyncd
-
-5. **Fix accounts DB permissions** on the phone before testing `start(accountId)`
-
-6. **Auth in startSync, not init**: Follow CardDAV's pattern of requesting
-   credentials in `startSync()` rather than `init()`
-
-7. **Debug logging**: Use Qt's logging categories (like CardDAV's `lcCardDav`)
-   instead of file-based logging, since the OOP runner's output goes to
-   the journal or is forwarded by msyncd
+Remaining original items (qmake `CONFIG+=plugin`, consistent naming, etc.) are verified and documented in `FINDINGS_OTP.md`.

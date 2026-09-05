@@ -103,7 +103,7 @@ impl ContactsClient {
         }
         let parsed: serde_json::Value = serde_json::from_str(&text)?;
         let contact: Contact =
-            serde_json::from_value(parsed["Contact"].clone()).map_err(|e| ProtonError::Serde(e))?;
+            serde_json::from_value(parsed["Contact"].clone()).map_err(ProtonError::Serde)?;
         Ok(contact)
     }
 

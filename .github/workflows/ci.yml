@@ -35,7 +35,7 @@ jobs:
       - run: cargo test -p proton-api -p proton-sync --all-features
       - run: cargo check -p proton-bridge
 
-  # Cross-compilation test for aarch64 (host-only, no SDK)
+  # Cross-compilation test for aarch64 (host-only, no SDK) — needs aarch64 gcc for ring
   rust-cross:
     name: Rust cross-compile check (aarch64)
     runs-on: ubuntu-latest
@@ -44,6 +44,8 @@ jobs:
         working-directory: .
     steps:
       - uses: actions/checkout@v4
+      - name: Install aarch64 gcc for ring
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-unknown-linux-gnu

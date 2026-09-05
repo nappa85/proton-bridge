@@ -42,7 +42,7 @@ pub struct ParsedAddress {
     pub types: Vec<String>,
 }
 
-fn get_param_values<'a>(cl: &'a ical_vcard::Contentline, param_name: &str) -> Vec<String> {
+fn get_param_values(cl: &ical_vcard::Contentline, param_name: &str) -> Vec<String> {
     cl.params()
         .iter()
         .filter(|p| p.name().eq_ignore_ascii_case(param_name))
@@ -104,10 +104,8 @@ pub fn parse_vcard(data: &str) -> Result<ParsedContact, String> {
         let value = unescape_vcard(cl.value());
 
         match name.to_uppercase().as_str() {
-            "FN" => {
-                if contact.display_name.is_empty() {
-                    contact.display_name = value;
-                }
+            "FN" if contact.display_name.is_empty() => {
+                contact.display_name = value;
             }
             "N" => {
                 let parts: Vec<&str> = value.split(';').collect();
@@ -144,71 +142,48 @@ pub fn parse_vcard(data: &str) -> Result<ParsedContact, String> {
                     types,
                 });
             }
-            "ORG" => {
-                if contact.organization.is_empty() {
-                    contact.organization = value;
-                }
+            "ORG" if contact.organization.is_empty() => {
+                contact.organization = value;
             }
-            "TITLE" => {
-                if contact.title.is_empty() {
-                    contact.title = value;
-                }
+            "TITLE" if contact.title.is_empty() => {
+                contact.title = value;
             }
-            "ROLE" => {
-                if contact.role.is_empty() {
-                    contact.role = value;
-                }
+            "ROLE" if contact.role.is_empty() => {
+                contact.role = value;
             }
             "NOTE" => {
                 contact.notes.push(value);
             }
-            "URL" => {
-                if contact.url.is_empty() {
-                    contact.url = value;
-                }
+            "URL" if contact.url.is_empty() => {
+                contact.url = value;
             }
-            "BDAY" => {
-                if contact.birthday.is_empty() {
-                    contact.birthday = format_bday(value);
-                }
+            "BDAY" if contact.birthday.is_empty() => {
+                contact.birthday = format_bday(value);
             }
-            "ANNIVERSARY" | "X-ANNIVERSARY" => {
-                if contact.anniversary.is_empty() {
-                    contact.anniversary = format_bday(value);
-                }
+            "ANNIVERSARY" | "X-ANNIVERSARY" if contact.anniversary.is_empty() => {
+                contact.anniversary = format_bday(value);
             }
-            "NICKNAME" => {
-                if contact.nickname.is_empty() {
-                    contact.nickname = value;
-                }
+            "NICKNAME" if contact.nickname.is_empty() => {
+                contact.nickname = value;
             }
-            "GENDER" => {
-                if contact.gender.is_empty() {
-                    let v = value.to_uppercase();
-                    if v.starts_with('M') {
-                        contact.gender = "Male".to_string();
-                    } else if v.starts_with('F') {
-                        contact.gender = "Female".to_string();
-                    } else if v.starts_with('O') {
-                        contact.gender = "Other".to_string();
-                    } else if v.starts_with('N') {
-                        contact.gender = "N/A".to_string();
-                    } else if v.starts_with('U') {
-                        contact.gender = "Unknown".to_string();
-                    } else if !value.is_empty() {
-                        contact.gender = value;
-                    }
-                }
-            }
-            "PHOTO" | "LOGO" => {
-                if value.starts_with("data:")
-                    || value.starts_with("http://")
-                    || value.starts_with("https://")
-                {
-                    contact.photos.push(value);
+            "GENDER" if contact.gender.is_empty() => {
+                let v = value.to_uppercase();
+                if v.starts_with('M') {
+                    contact.gender = "Male".to_string();
+                } else if v.starts_with('F') {
+                    contact.gender = "Female".to_string();
+                } else if v.starts_with('O') {
+                    contact.gender = "Other".to_string();
+                } else if v.starts_with('N') {
+                    contact.gender = "N/A".to_string();
+                } else if v.starts_with('U') {
+                    contact.gender = "Unknown".to_string();
                 } else if !value.is_empty() {
-                    contact.photos.push(value);
+                    contact.gender = value;
                 }
+            }
+            "PHOTO" | "LOGO" if !value.is_empty() => {
+                contact.photos.push(value);
             }
             _ => {}
         }
@@ -217,7 +192,7 @@ pub fn parse_vcard(data: &str) -> Result<ParsedContact, String> {
     Ok(contact)
 }
 
-pub fn download_url_photos(photos: &mut Vec<String>) {
+pub fn download_url_photos(photos: &mut [String]) {
     let mut replacements: Vec<(usize, String)> = Vec::new();
     for (i, photo) in photos.iter().enumerate() {
         if photo.starts_with("http://") || photo.starts_with("https://") {

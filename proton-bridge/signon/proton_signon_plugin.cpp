@@ -1,6 +1,12 @@
 #include "proton_signon_plugin.h"
 #include <QDebug>
 #include <QVariantMap>
+#include <QSettings>
+
+extern "C" {
+    char* proton_derive_passwords(const char* password, const char* access_token, const char* uid);
+    void proton_auth_free_string(char* s);
+}
 
 /*
  * Proton SignOn authentication plugin (method "proton", mechanism "password").
@@ -86,19 +92,63 @@ void ProtonSignonPlugin::handleAuthOk(ProtonAuthResult &authResult,
 
     QVariantMap tokens = tokensMap(username, newAccess, newRefresh, newUid);
 
-    // Persist the tokens in signond's blob store (UserName/Secret are
-    // stripped by signond when storing; the identity secret stays as-is).
+    // If the raw password is available (transient "Password" param during
+    // creation/update), derive mailbox passwords now and store them as
+    // DerivedPasswords in the same blob. This allows future syncs to
+    // unlock PGP keys without the raw password (requirement: never persist
+    // raw Secret).
+    // Also persist directly to QSettings as fallback, since signond may
+    // filter unknown keys like DerivedPasswords from the blob.
+    if (!password.isEmpty() && !newAccess.isEmpty() && !newUid.isEmpty()) {
+        char* derivedJson = proton_derive_passwords(
+            password.toUtf8().constData(),
+            newAccess.toUtf8().constData(),
+            newUid.toUtf8().constData());
+        if (derivedJson) {
+            QString derivedStr = QString::fromUtf8(derivedJson);
+            proton_auth_free_string(derivedJson);
+            if (!derivedStr.isEmpty() && derivedStr != QStringLiteral("{}") && derivedStr != QStringLiteral("null")) {
+                tokens.insert(QStringLiteral("DerivedPasswords"), derivedStr);
+                qDebug() << "ProtonSignonPlugin: derived" << derivedStr.length() << "chars for" << (derivedStr.count(":") ) << "keys";
+                // Direct QSettings fallback for buteo sync (signond may drop DerivedPasswords)
+                {
+                    QSettings settings(QStringLiteral("proton"), QStringLiteral("sync-tokens"));
+                    // Store by Uid and by username for buteo fallback
+                    if (!newUid.isEmpty()) {
+                        settings.beginGroup(newUid);
+                        settings.setValue(QStringLiteral("derived_passwords"), derivedStr);
+                        settings.endGroup();
+                    }
+                    if (!username.isEmpty()) {
+                        settings.beginGroup(username);
+                        settings.setValue(QStringLiteral("derived_passwords"), derivedStr);
+                        settings.endGroup();
+                    }
+                    settings.sync();
+                    qDebug() << "ProtonSignonPlugin: also stored DerivedPasswords in QSettings for Uid/username";
+                }
+            } else {
+                qDebug() << "ProtonSignonPlugin: derive returned empty";
+            }
+        } else {
+            qDebug() << "ProtonSignonPlugin: derive failed or no keys";
+        }
+    }
+
+    // Persist the tokens (+ DerivedPasswords if derived) in signond's blob store
+    // (UserName/Secret are stripped by signond when storing; the identity secret stays as-is,
+    // but we are not storing Secret anyway – password is transient).
     emit store(SignOn::SessionData(tokens));
 
     QVariantMap response = tokens;
-    if (!password.isEmpty()) {
-        response.insert(QStringLiteral("Secret"), password);
-        // Also insert as Password and UserName for clients that read via getProperty
-        // (signond may strip Secret for NoUserInteractionPolicy refreshes)
-        response.insert(QStringLiteral("Password"), password);
+    // Do NOT return Secret/Password in the result – the raw login password
+    // must not be persisted or echoed back to the client. Only tokens are
+    // returned; the password is transient for SRP and for deriving mailbox
+    // keys (derived passwords are cached in the blob).
+    // Keep UserName for display purposes.
+    if (!username.isEmpty())
         response.insert(QStringLiteral("UserName"), username);
-    }
-    qDebug() << "ProtonSignonPlugin: handleAuthOk username=" << username << " pw_len=" << password.length() << " response has Secret=" << response.contains("Secret") << " Password=" << response.contains("Password");
+    qDebug() << "ProtonSignonPlugin: handleAuthOk username=" << username << " pw_len=" << password.length() << " response has Secret=" << response.contains("Secret") << " has Derived=" << response.contains("DerivedPasswords");
     emit result(SignOn::SessionData(response));
 }
 
@@ -107,12 +157,17 @@ void ProtonSignonPlugin::process(const SignOn::SessionData &dataIn, const QStrin
     Q_UNUSED(mechanism);
 
     QString username = dataIn.UserName();
-    QString password = dataIn.Secret();
+    // Password is passed as transient "Password" property (not stored as Secret)
+    // to avoid persisting the raw login password. Prefer Password param over
+    // Secret (which now holds dummy "x").
+    QString passwordParam = dataIn.getProperty(QStringLiteral("Password")).toString();
+    QString password = !passwordParam.isEmpty() ? passwordParam : dataIn.Secret();
     QString refreshToken = dataIn.getProperty(QStringLiteral("RefreshToken")).toString();
     QString uid = dataIn.getProperty(QStringLiteral("Uid")).toString();
     QString totpCode = dataIn.getProperty(QStringLiteral("TwoFactorPassword")).toString().trimmed();
     qDebug() << "ProtonSignonPlugin: process username=" << username << " pw_len=" << password.length()
-             << " rt_present=" << !refreshToken.isEmpty() << " uid=" << uid << " totp_len=" << totpCode.length();
+             << " rt_present=" << !refreshToken.isEmpty() << " uid=" << uid << " totp_len=" << totpCode.length()
+             << " hasPasswordParam=" << !passwordParam.isEmpty();
 
     // 1) Second factor submission: complete the locked-session login.
     if (!totpCode.isEmpty() && !refreshToken.isEmpty() && !uid.isEmpty()) {
@@ -137,8 +192,16 @@ void ProtonSignonPlugin::process(const SignOn::SessionData &dataIn, const QStrin
         }
     }
 
+    // If a fresh password was supplied via transient "Password" param (account
+    // creation / credentials update), prefer a full SRP login over a blind
+    // token refresh – the refresh would succeed with the old tokens even though
+    // the user just changed the password, and would never trigger the needed
+    // 2FA flow.
+    bool hasFreshPassword = !passwordParam.isEmpty();
+
     // 2) Stored tokens available: refresh, never prompt for anything.
-    if (!refreshToken.isEmpty() && !uid.isEmpty()) {
+    //    Only do this when we are NOT in a fresh-password update flow.
+    if (!hasFreshPassword && !refreshToken.isEmpty() && !uid.isEmpty()) {
         ProtonAuthResult authResult = proton_auth_refresh(
             refreshToken.toUtf8().constData(),
             uid.toUtf8().constData());

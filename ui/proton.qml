@@ -186,13 +186,14 @@ AccountCreationAgent {
                             console.log("proton: pending AccessToken=" + (pageRoot._pendingAccessToken ? "yes" : "no") + " RefreshToken=" + (pageRoot._pendingRefreshToken ? "yes" : "no"))
                             var sip = creationAccount.signInParameters("proton-carddav",
                                                                       pageRoot._pendingUsername,
-                                                                      pageRoot._pendingPassword)
-                            console.log("proton: verify sip username=" + sip.username + " password_len=" + (sip.password ? sip.password.length : 0))
+                                                                      "x")
+                            sip.setParameter("Password", pageRoot._pendingPassword)
+                            console.log("proton: verify sip username=" + sip.username + " password_len=" + (sip.password ? sip.password.length : 0) + " hasPasswordParam set")
                             sip.setParameter("TwoFactorPassword", otpField.text)
                             sip.setParameter("AccessToken", pageRoot._pendingAccessToken)
                             sip.setParameter("RefreshToken", pageRoot._pendingRefreshToken)
                             sip.setParameter("Uid", pageRoot._pendingUid)
-                            creationAccount.updateSignInCredentials("Jolla", "Jolla", sip)
+                            creationAccount.updateSignInCredentials("Jolla", "Jolla", sip, "")
                         }
                     }
                 }
@@ -257,17 +258,21 @@ AccountCreationAgent {
         property bool _flowComplete
 
         onStatusChanged: {
-            console.log("proton: statusChanged status=" + status + " _flowComplete=" + _flowComplete + " _busy=" + pageRoot._busy + " id=" + identifier)
+            console.log("proton: statusChanged status=" + status + " Account.Initialized=" + Account.Initialized + " Initializing=" + Account.Initializing + " Invalid=" + Account.Invalid + " SyncInProgress=" + Account.SyncInProgress + " Synced=" + Account.Synced + " SigningIn=" + Account.SigningIn + " Error=" + Account.Error + " _flowComplete=" + _flowComplete + " _busy=" + pageRoot._busy + " id=" + identifier + " hasCreds=" + hasSignInCredentials("Jolla","Jolla"))
             if (status == Account.Initialized && pageRoot._busy
                     && !_credentialsRequested && !pageRoot._needsTwoFA) {
                 _credentialsRequested = true
                 // Store pending credentials for OTP second step (fields become hidden)
+                // Password is passed as transient "Password" param, NOT as Secret, so it is never stored in signond
                 if (pageRoot._pendingUsername === "" ) pageRoot._pendingUsername = usernameField.text
                 if (pageRoot._pendingPassword === "" ) pageRoot._pendingPassword = passwordField.text
                 console.log("proton: creating credentials for " + pageRoot._pendingUsername + " pw_len=" + pageRoot._pendingPassword.length)
-                var sip = signInParameters("proton-carddav", pageRoot._pendingUsername, pageRoot._pendingPassword)
-                console.log("proton: sip username=" + sip.username + " password_len=" + (sip.password ? sip.password.length : 0))
-                createSignInCredentials("Jolla", "Jolla", sip)
+                // Use dummy "x" for Secret (stored) and real password as transient "Password" param
+                // so raw password is never persisted (empty Secret with symmetricKey="" triggers isNull() error)
+                var sip = signInParameters("proton-carddav", pageRoot._pendingUsername, "x")
+                sip.setParameter("Password", pageRoot._pendingPassword)
+                console.log("proton: sip username=" + sip.username + " password_len=" + (sip.password ? sip.password.length : 0) + " hasPasswordParam set")
+                createSignInCredentials("Jolla", "Jolla", sip, "")
             } else if (status == Account.Synced && _flowComplete) {
                 // Credentials verified (OTP included when needed) and the
                 // account settings saved: done. Note: setStatus(Synced) is

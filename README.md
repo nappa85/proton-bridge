@@ -6,17 +6,19 @@ Built with Rust core + CXX-Qt bridge.
 ## Architecture
 
 ```
-proton-api/       → Pure Rust: Proton REST API client (auth, contacts CRUD, PGP)
-proton-sync/      → Pure Rust: Sync engine (delta, conflict resolution, vCard mapping)
-proton-bridge/    → CXX-Qt: Buteo plugin (cdylib) + QtPIM FFI
+proton-api/       → Pure Rust: Proton REST API client (SRP auth, 2FA, contacts CRUD, PGP, key salts)
+proton-sync/      → Pure Rust: Sync engine (auth, PGP decrypt, vCard mapping, QSettings derived cache)
+proton-bridge/    → Rust FFI + C++: SignOn auth plugin (libprotonplugin.so) + Buteo OOPP plugin (libproton-client.so)
+ui/               → QML AccountCreationAgent / AccountCredentialsAgent (OTP collected in-page, Password transient)
+buteo-profiles/   → Buteo client/sync profile templates (proton / proton-carddav-*.xml)
 packaging/        → RPM build artifacts (staged by make-pkg-bundle.sh)
-accounts/         → Accounts&SSO provider/service XML
-ui/               → QML account creation/settings UI
-buteo-profiles/   → Buteo client/sync profile templates
+accounts/         → Accounts&SSO provider/service XML (proton.provider, proton-carddav.service)
 rpm/              → RPM spec files
 ```
 
-## Build System (from ElectricEel)
+**Security note (OTP):** The raw Proton login password is **never persisted** — it is passed only as transient `Password` param to the `proton` SignOn plugin for SRP + `POST /auth/v4/2fa` scope upgrade, then immediately `derive_all_passwords` (`KeysClient` → `derive_mailbox_password`) stores only the per-key `DerivedPasswords` map (`keyID → base64(mailboxPassword)`) in `signond` blob + `QSettings("proton","sync-tokens")` and in `~/.config/signond/signon-secrets.db` `STORE` (+ `QSettings` fallback by `Uid`/`username`). The Buteo sync later runs `NoUserInteractionPolicy` with only `RefreshToken`/`Uid`/`DerivedPasswords` (`pw_len=0` is expected).
+
+## Build System
 
 - **Host CI**: `cargo fmt/clippy/test` on x86_64
 - **Release**: Cross-compile to `aarch64-unknown-linux-gnu` → stage into `packaging/` → build RPMs inside `coderus/sailfishos-platform-sdk-aarch64` container via `mb2`
@@ -63,16 +65,15 @@ ssh nemo@device "systemctl --user restart msyncd"
 
 | Path | Purpose |
 |------|---------|
-| `proton-api/src/` | Proton API client |
-| `proton-sync/src/` | Sync engine |
-| `proton-bridge/src/` | CXX-Qt bridge (Rust) |
-| `proton-bridge/cxx/` | Buteo plugin shim (C++) |
-| `accounts/` | Provider/service XML |
-| `ui/` | QML UI |
-| `buteo-profiles/` | Sync profile templates |
-| `rpm/` | RPM specs |
-| `make-pkg-bundle.sh` | Staging script |
-| `.github/workflows/` | CI + Release |
+| `proton-api/src/auth.rs` | SRP + `is_totp_required` + `submit_2fa` (`/auth/v4/2fa` scope upgrade) + `derive_all_passwords` |
+| `proton-api/src/keys.rs` | `KeysClient` (`/core/v4/users`, `/keys/salts`, `/addresses`) + `derive_all_passwords` |
+| `proton-sync/src/engine.rs` | `SyncEngine` `unlock_keys` via `DerivedPasswords` cache → `QSettings` `sync-tokens.conf` |
+| `proton-bridge/src/auth.rs` | FFI `proton_auth_login/submit_2fa/refresh/derive_passwords` |
+| `proton-bridge/signon/proton_signon_plugin.{h,cpp}` | SignOn `proton` plugin (`process` + `handleAuthOk` stores `AccessToken`/`RefreshToken`/`Uid` + `DerivedPasswords`) |
+| `proton-bridge/cxx/proton_bridge_shim.{h,cpp}` | Buteo OOPP plugin (`requestCredentials` `NoUserInteraction` + `QSettings` fallback by `Uid`/`username`) |
+| `ui/proton.qml` / `proton-update.qml` | `AccountCreationAgent` / `AccountCredentialsAgent` (custom OTP in-page, `Password` transient, `CredentialsId` string fix, `goToEndDestination`) |
+| `buteo-profiles/` / `packaging/accounts/` / `rpm/` | Profile & provider/service XML, RPM specs, `make-pkg-bundle.sh` staging |
+| `FINDINGS_OTP.md` | Full OTP failure analysis + `delayDeletion`/`CredentialsId`/`Secret` stripping fixes |
 
 ## References
 
