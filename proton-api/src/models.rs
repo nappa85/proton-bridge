@@ -395,6 +395,34 @@ pub struct CalendarBootstrap {
     pub Keys: Vec<CalendarKey>,
     #[serde(default)]
     pub Passphrase: Option<CalendarPassphrase>,
+    #[serde(default)]
+    pub Settings: Option<CalendarSettings>,
+}
+
+/// Per-calendar defaults from bootstrap (api.md): default reminder sets for
+/// timed (`DefaultPartDayNotifications`) and all-day
+/// (`DefaultFullDayNotifications`) events, as `{Type, Trigger}` entries just
+/// like event-level `Notifications`. `null`/absent on the event means
+/// "inherit these"; `[]` means explicitly none.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CalendarSettings {
+    #[serde(default)]
+    pub DefaultEventDuration: Option<i64>,
+    #[serde(default)]
+    pub DefaultPartDayNotifications: Option<Vec<serde_json::Value>>,
+    #[serde(default)]
+    pub DefaultFullDayNotifications: Option<Vec<serde_json::Value>>,
+    #[serde(default, deserialize_with = "deserialize_opt_bool")]
+    pub MakesUserBusy: Option<bool>,
+}
+
+impl CalendarSettings {
+    /// True when no usable defaults are present (v2 sends an empty `{}` on
+    /// some servers — treat exactly like absent so the v1 fill-in runs).
+    pub fn is_empty(&self) -> bool {
+        let empty = |v: &Option<Vec<serde_json::Value>>| v.as_ref().is_none_or(Vec::is_empty);
+        empty(&self.DefaultPartDayNotifications) && empty(&self.DefaultFullDayNotifications)
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

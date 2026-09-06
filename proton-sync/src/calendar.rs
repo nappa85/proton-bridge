@@ -4,6 +4,7 @@ use proton_api::{
     calendar as cal_api, CalendarClient, CalendarEvent, KeysClient, TokenManager, UnlockedKey,
 };
 use serde::Serialize;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 /// JSON shape consumed by the C++ mKCal shim.
@@ -34,6 +35,7 @@ pub struct CalEventJson {
     pub full_day: bool,
     pub color: Option<String>,
     pub recurrence_id: Option<i64>,
+    pub notifications: Vec<proton_api::CalNotification>,
 }
 
 use serde::Deserialize;
@@ -44,6 +46,10 @@ pub struct CalendarSyncEngine {
     token_manager: Arc<Mutex<TokenManager>>,
     events_json: Arc<Mutex<Option<String>>>,
     keys_debug: Arc<Mutex<Option<String>>>,
+    // Last-seen non-empty per-calendar reminder defaults (this run). The
+    // shim persists them via get_defaults_json so restored sessions (whose
+    // live settings come back empty) can seed the same fallbacks.
+    last_defaults: Arc<Mutex<HashMap<String, crate::config::CalendarDefaults>>>,
 }
 
 impl CalendarSyncEngine {
@@ -68,7 +74,18 @@ impl CalendarSyncEngine {
             token_manager: Arc::new(Mutex::new(tm)),
             events_json: Arc::new(Mutex::new(None)),
             keys_debug: Arc::new(Mutex::new(None)),
+            last_defaults: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Serialized last-seen non-empty per-calendar defaults (`{}` when none
+    /// this run — caller must not overwrite a good cache with it).
+    pub fn defaults_json(&self) -> String {
+        let map = self.last_defaults.lock().unwrap();
+        if map.is_empty() {
+            return String::new();
+        }
+        serde_json::to_string(&*map).unwrap_or_default()
     }
 
     pub fn config(&self) -> SyncConfig {
@@ -121,7 +138,11 @@ impl CalendarSyncEngine {
             ));
         };
         let uid = tm.uid().unwrap_or(&config.username).to_string();
+        let refresh_scopes = tm.last_refresh_scopes();
         drop(tm);
+        if let Some(rs) = refresh_scopes {
+            self.set_debug(format!("refresh_scopes={rs}"));
+        }
         if std::env::var("LIVE_TRACE").is_ok() {
             eprintln!(
                 "engine token={} uid={uid}",
@@ -152,14 +173,57 @@ impl CalendarSyncEngine {
         let mut address_keys = self.unlock_address_keys(&access_token, &uid, config)?;
         for (cal, events) in &fetched {
             // Bootstrap: members + keys + passphrase in one call (v2, fallback v1).
-            let bootstrap =
+            let mut bootstrap =
                 cal_client
                     .get_bootstrap(&cal.ID)
                     .unwrap_or(proton_api::CalendarBootstrap {
                         Members: Vec::new(),
                         Keys: Vec::new(),
                         Passphrase: None,
+                        Settings: None,
                     });
+            // Standalone settings top-up with visible outcome: a single
+            // fetch whose shape is always reported, so empty results stay
+            // attributable (server-sent-nothing vs unparsed-shape).
+            if bootstrap.Settings.as_ref().is_none_or(|s| s.is_empty()) {
+                match cal_client.get_settings_verbose(&cal.ID) {
+                    Ok((s, _)) if !s.is_empty() => {
+                        bootstrap.Settings = Some(s);
+                    }
+                    Ok((_, shape)) => {
+                        self.set_debug(format!(
+                            "cal={} settings_empty {shape}",
+                            &cal.ID[..8.min(cal.ID.len())]
+                        ));
+                    }
+                    Err(e) => {
+                        let msg = format!("{e}");
+                        let short: String = msg.chars().take(90).collect();
+                        self.set_debug(format!(
+                            "cal={} settings_err:{short}",
+                            &cal.ID[..8.min(cal.ID.len())]
+                        ));
+                    }
+                }
+            }
+            // Remember non-empty live defaults so the shim can cache them
+            // for restored sessions (whose live settings come back empty).
+            if let Some(s) = bootstrap.Settings.as_ref().filter(|s| !s.is_empty()) {
+                let part = s
+                    .DefaultPartDayNotifications
+                    .as_deref()
+                    .map_or_else(Vec::new, Self::parse_notification_list);
+                let full = s
+                    .DefaultFullDayNotifications
+                    .as_deref()
+                    .map_or_else(Vec::new, Self::parse_notification_list);
+                if !part.is_empty() || !full.is_empty() {
+                    self.last_defaults.lock().unwrap().insert(
+                        cal.ID.clone(),
+                        crate::config::CalendarDefaults { part, full },
+                    );
+                }
+            }
             // Display metadata lives on the member entry (api.md drift),
             // top-level Name is a legacy fallback.
             let cal_name = bootstrap
@@ -207,18 +271,48 @@ impl CalendarSyncEngine {
                 }
             }
             self.set_debug(format!(
-                "cal={} members={} calkeys={} addrkeys={}",
+                "cal={} members={} calkeys={} addrkeys={} settings={}",
                 &cal.ID[..8.min(cal.ID.len())],
                 bootstrap.Members.len(),
                 cal_keys.len(),
-                address_keys.len()
+                address_keys.len(),
+                if bootstrap.Settings.is_some() {
+                    "1"
+                } else {
+                    "0"
+                }
             ));
             for ev in events {
-                if let Some(json) =
-                    Self::process_event(ev, &cal.ID, &cal_name, &mut cal_keys, &mut address_keys)
-                {
+                let cached = config
+                    .calendar_defaults
+                    .as_ref()
+                    .and_then(|m| m.get(&cal.ID));
+                if let Some(json) = Self::process_event(
+                    ev,
+                    &cal.ID,
+                    &cal_name,
+                    &mut cal_keys,
+                    &mut address_keys,
+                    bootstrap.Settings.as_ref(),
+                    cached,
+                ) {
                     out.push(json);
                 }
+            }
+        }
+        // Account-level calendar settings in full (default reminder sets
+        // may live here rather than per-calendar — one small call/sync).
+        match cal_client.fetch_account_calendar_settings_raw() {
+            Ok((v, status)) => self.set_debug(format!(
+                "account_calendar_settings http{status} {}",
+                proton_api::diag::diag_body(&v)
+            )),
+            Err(e) => {
+                let msg = format!("{e}");
+                self.set_debug(format!(
+                    "account_calendar_settings err:{}",
+                    msg.chars().take(80).collect::<String>()
+                ));
             }
         }
         // Never report a silent empty success when every query failed.
@@ -237,6 +331,8 @@ impl CalendarSyncEngine {
         cal_name: &str,
         cal_keys: &mut [UnlockedKey],
         addr_keys: &mut [UnlockedKey],
+        settings: Option<&proton_api::CalendarSettings>,
+        cached: Option<&crate::config::CalendarDefaults>,
     ) -> Option<CalEventJson> {
         let mut fragments: Vec<String> = Vec::new();
         // Shared-signed first (structural wins in merge), then shared-encrypted,
@@ -320,7 +416,60 @@ impl CalendarSyncEngine {
             full_day: ev.FullDay.unwrap_or(false),
             color: ev.Color.clone(),
             recurrence_id: ev.RecurrenceID,
+            notifications: Self::resolve_notifications(ev, settings, cached),
         })
+    }
+
+    /// Effective reminders for one event: explicit array (even empty =
+    /// none) wins; `null`/absent falls back to live calendar defaults, then
+    /// to cached defaults (same precedence); nothing anywhere means none.
+    fn resolve_notifications(
+        ev: &CalendarEvent,
+        settings: Option<&proton_api::CalendarSettings>,
+        cached: Option<&crate::config::CalendarDefaults>,
+    ) -> Vec<proton_api::CalNotification> {
+        if let Some(list) = ev.Notifications.as_ref() {
+            return Self::parse_notification_list(list);
+        }
+        let live = settings.and_then(|s| {
+            if ev.FullDay.unwrap_or(false) {
+                s.DefaultFullDayNotifications.as_ref()
+            } else {
+                s.DefaultPartDayNotifications.as_ref()
+            }
+        });
+        if let Some(list) = live {
+            if !list.is_empty() {
+                return Self::parse_notification_list(list);
+            }
+        }
+        let fallback = cached.map(|c| {
+            if ev.FullDay.unwrap_or(false) {
+                &c.full
+            } else {
+                &c.part
+            }
+        });
+        fallback.cloned().unwrap_or_default()
+    }
+
+    fn parse_notification_list(list: &[serde_json::Value]) -> Vec<proton_api::CalNotification> {
+        list.iter()
+            .filter_map(|n| {
+                let kind = n.get("Type").and_then(|v| v.as_i64()).unwrap_or(1);
+                // Email reminders (Type 0) are sent by the Proton server —
+                // only on-device (display) alarms belong in mKCal.
+                if kind == 0 {
+                    return None;
+                }
+                let trigger = n.get("Trigger").and_then(|v| v.as_str())?;
+                let offset_secs = proton_api::parse_notification_trigger(trigger)?;
+                Some(proton_api::CalNotification {
+                    action: "display".into(),
+                    offset_secs,
+                })
+            })
+            .collect()
     }
 
     /// Unlock user keys via derived/salted passphrase, then address keys via
@@ -350,20 +499,39 @@ impl CalendarSyncEngine {
         let addresses = keys_client.get_addresses().unwrap_or_default();
         let mut unlocked: Vec<UnlockedKey> = Vec::new();
         let mut debug_parts: Vec<String> = Vec::new();
+        debug_parts.push(format!(
+            "derived_keys={}",
+            config
+                .derived_passwords
+                .as_ref()
+                .map(|m| m.len())
+                .unwrap_or(0)
+        ));
         // User keys.
         for key in &user.Keys {
             if key.PrivateKey.is_empty() {
                 continue;
             }
-            if let Some(pp) = Self::passphrase_for(
+            match Self::passphrase_for(
                 &key.ID,
                 &config.password,
                 config.derived_passwords.as_ref(),
                 salts.iter().find(|s| s.ID == key.ID),
             ) {
-                if let Ok(uk) = UnlockedKey::from_armored(&key.PrivateKey, &pp) {
-                    debug_parts.push(format!("u_{}_ok", &key.ID[..8.min(key.ID.len())]));
-                    unlocked.push(uk);
+                Some((pp, src)) => match UnlockedKey::from_armored(&key.PrivateKey, &pp) {
+                    Ok(uk) => {
+                        debug_parts.push(format!("u_{}_{src}", &key.ID[..8.min(key.ID.len())]));
+                        unlocked.push(uk);
+                    }
+                    Err(_) => {
+                        debug_parts.push(format!(
+                            "u_{}_unlock_err_{src}",
+                            &key.ID[..8.min(key.ID.len())]
+                        ));
+                    }
+                },
+                None => {
+                    debug_parts.push(format!("u_{}_no_pp", &key.ID[..8.min(key.ID.len())]));
                 }
             }
         }
@@ -393,15 +561,26 @@ impl CalendarSyncEngine {
                         }
                     }
                 }
-                if let Some(pp) = Self::passphrase_for(
+                match Self::passphrase_for(
                     &key.ID,
                     &config.password,
                     config.derived_passwords.as_ref(),
                     salts.iter().find(|s| s.ID == key.ID),
                 ) {
-                    if let Ok(ak) = UnlockedKey::from_armored(&key.PrivateKey, &pp) {
-                        debug_parts.push(format!("a_{}_salt_ok", &key.ID[..8.min(key.ID.len())]));
-                        unlocked.push(ak);
+                    Some((pp, src)) => match UnlockedKey::from_armored(&key.PrivateKey, &pp) {
+                        Ok(ak) => {
+                            debug_parts.push(format!("a_{}_{src}", &key.ID[..8.min(key.ID.len())]));
+                            unlocked.push(ak);
+                        }
+                        Err(_) => {
+                            debug_parts.push(format!(
+                                "a_{}_unlock_err_{src}",
+                                &key.ID[..8.min(key.ID.len())]
+                            ));
+                        }
+                    },
+                    None => {
+                        debug_parts.push(format!("a_{}_no_pp", &key.ID[..8.min(key.ID.len())]));
                     }
                 }
             }
@@ -416,11 +595,11 @@ impl CalendarSyncEngine {
         password: &str,
         derived: Option<&std::collections::HashMap<String, String>>,
         salt: Option<&proton_api::KeySalt>,
-    ) -> Option<Vec<u8>> {
+    ) -> Option<(Vec<u8>, &'static str)> {
         if let Some(map) = derived {
             if let Some(b64) = map.get(key_id) {
                 if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64) {
-                    return Some(bytes);
+                    return Some((bytes, "derived"));
                 }
             }
         }
@@ -430,9 +609,11 @@ impl CalendarSyncEngine {
         let salt = salt?;
         let ks = salt.KeySalt.as_ref()?;
         if ks.is_empty() {
-            return Some(password.as_bytes().to_vec());
+            return Some((password.as_bytes().to_vec(), "plain"));
         }
-        proton_api::derive_mailbox_password(password.as_bytes(), ks).ok()
+        proton_api::derive_mailbox_password(password.as_bytes(), ks)
+            .ok()
+            .map(|pp| (pp, "salt"))
     }
 
     fn set_debug(&self, s: String) {
@@ -515,7 +696,8 @@ mod tests {
             ..Default::default()
         };
         // Manual Default (CalendarEvent has no Default derive – build via serde).
-        let got = CalendarSyncEngine::process_event(&ev, "c1", "Work", &mut [], &mut []);
+        let got =
+            CalendarSyncEngine::process_event(&ev, "c1", "Work", &mut [], &mut [], None, None);
         assert!(got.is_some());
         let g = got.unwrap();
         assert_eq!(g.uid, "uid-1");
@@ -538,8 +720,130 @@ mod tests {
             }],
             ..Default::default()
         };
-        let got = CalendarSyncEngine::process_event(&ev, "c1", "Work", &mut [], &mut []);
+        let got =
+            CalendarSyncEngine::process_event(&ev, "c1", "Work", &mut [], &mut [], None, None);
         assert!(got.is_none());
+    }
+
+    fn notif_json() -> serde_json::Value {
+        serde_json::from_str(
+            r#"[{"Type":1,"Trigger":"-PT15M"},{"Type":0,"Trigger":"-P1D"},{"Type":9,"Trigger":"garbage"}]"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_resolve_notifications_explicit_wins() {
+        let ev = CalendarEvent {
+            Notifications: Some(notif_json().as_array().unwrap().clone()),
+            ..Default::default()
+        };
+        let out = CalendarSyncEngine::resolve_notifications(&ev, None, None);
+        // Garbage entry skipped, email entry skipped (server-sent), no
+        // defaults consulted.
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].action, "display");
+        assert_eq!(out[0].offset_secs, -900);
+    }
+
+    #[test]
+    fn test_calendar_settings_is_empty() {
+        assert!(proton_api::CalendarSettings::default().is_empty());
+        let empty_obj = proton_api::CalendarSettings {
+            DefaultPartDayNotifications: Some(vec![]),
+            ..Default::default()
+        };
+        assert!(empty_obj.is_empty());
+        let full = proton_api::CalendarSettings {
+            DefaultPartDayNotifications: Some(
+                serde_json::from_str::<Vec<serde_json::Value>>(
+                    r#"[{"Type":1,"Trigger":"-PT15M"}]"#,
+                )
+                .unwrap(),
+            ),
+            ..Default::default()
+        };
+        assert!(!full.is_empty());
+    }
+
+    #[test]
+    fn test_resolve_notifications_explicit_empty_means_none() {
+        let ev = CalendarEvent {
+            Notifications: Some(vec![]),
+            ..Default::default()
+        };
+        let settings = proton_api::CalendarSettings {
+            DefaultPartDayNotifications: Some(notif_json().as_array().unwrap().clone()),
+            ..Default::default()
+        };
+        assert!(CalendarSyncEngine::resolve_notifications(&ev, Some(&settings), None).is_empty());
+    }
+
+    #[test]
+    fn test_resolve_notifications_inherits_calendar_defaults() {
+        let timed = CalendarEvent {
+            FullDay: Some(false),
+            ..Default::default()
+        };
+        let allday = CalendarEvent {
+            FullDay: Some(true),
+            ..Default::default()
+        };
+        let settings = proton_api::CalendarSettings {
+            DefaultPartDayNotifications: Some(
+                serde_json::from_str::<Vec<serde_json::Value>>(
+                    r#"[{"Type":1,"Trigger":"-PT15M"}]"#,
+                )
+                .unwrap(),
+            ),
+            DefaultFullDayNotifications: Some(
+                serde_json::from_str::<Vec<serde_json::Value>>(r#"[{"Type":1,"Trigger":"-P1D"}]"#)
+                    .unwrap(),
+            ),
+            ..Default::default()
+        };
+        let t = CalendarSyncEngine::resolve_notifications(&timed, Some(&settings), None);
+        assert_eq!(t.len(), 1);
+        assert_eq!(t[0].offset_secs, -900);
+        let a = CalendarSyncEngine::resolve_notifications(&allday, Some(&settings), None);
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[0].offset_secs, -86400);
+        // No settings at all: nothing.
+        let n = CalendarSyncEngine::resolve_notifications(&timed, None, None);
+        assert!(n.is_empty());
+    }
+
+    #[test]
+    fn test_resolve_notifications_cached_fallback() {
+        use crate::config::CalendarDefaults;
+        // Live settings empty (v2 `{}` on restored sessions) + cache hit.
+        let timed = CalendarEvent {
+            FullDay: Some(false),
+            ..Default::default()
+        };
+        let empty_live = proton_api::CalendarSettings::default();
+        let cached = CalendarDefaults {
+            part: vec![proton_api::CalNotification {
+                action: "display".into(),
+                offset_secs: -900,
+            }],
+            full: vec![],
+        };
+        let out =
+            CalendarSyncEngine::resolve_notifications(&timed, Some(&empty_live), Some(&cached));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].offset_secs, -900);
+        // Live non-empty wins over cache.
+        let live = proton_api::CalendarSettings {
+            DefaultPartDayNotifications: Some(
+                serde_json::from_str::<Vec<serde_json::Value>>(r#"[{"Type":1,"Trigger":"-PT1H"}]"#)
+                    .unwrap(),
+            ),
+            ..Default::default()
+        };
+        let out2 = CalendarSyncEngine::resolve_notifications(&timed, Some(&live), Some(&cached));
+        assert_eq!(out2.len(), 1);
+        assert_eq!(out2[0].offset_secs, -3600);
     }
 
     #[test]

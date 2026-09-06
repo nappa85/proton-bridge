@@ -31,9 +31,8 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
       - run: cargo fmt --check --all
-      - run: cargo clippy -p proton-api -p proton-sync --all-targets --all-features -- -D warnings
-      - run: cargo test -p proton-api -p proton-sync --all-features
-      - run: cargo check -p proton-bridge
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: cargo test --workspace --all-features
 
   qml:
     name: QML lint (qmllint syntax)

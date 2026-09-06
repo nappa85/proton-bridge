@@ -140,26 +140,91 @@ impl CalendarClient {
                         serde_json::from_value(v["Keys"].clone()).unwrap_or_default();
                     let passphrase: Option<CalendarPassphrase> =
                         serde_json::from_value(v["Passphrase"].clone()).unwrap_or(None);
+                    let settings: Option<CalendarSettings> =
+                        serde_json::from_value(v["CalendarSettings"].clone()).unwrap_or(None);
                     // v2 returns passphrase object directly (not Option-wrapped null issue)
                     if !members.is_empty() || !keys.is_empty() || passphrase.is_some() {
-                        return Ok(CalendarBootstrap {
+                        let mut boot = CalendarBootstrap {
                             Members: members,
                             Keys: keys,
                             Passphrase: passphrase,
-                        });
+                            Settings: settings,
+                        };
+                        // v2 omits CalendarSettings on some servers/accounts
+                        // (verified live: present via v1, absent via v2) —
+                        // fill it from the standalone route when missing.
+                        // An empty `{}` counts as missing too.
+                        if boot.Settings.as_ref().is_none_or(|s| s.is_empty()) {
+                            boot.Settings =
+                                self.get_settings(cal_id).ok().filter(|s| !s.is_empty());
+                        }
+                        return Ok(boot);
                     }
                 }
             }
         }
-        // Fallback: three v1 calls (same shapes per api.md).
+        // Fallback: v1 calls (same shapes per api.md).
         let members = self.get_members(cal_id).unwrap_or_default();
         let keys = self.get_calendar_keys(cal_id).unwrap_or_default();
         let passphrase = self.get_passphrase(cal_id).ok();
+        let settings = self.get_settings(cal_id).ok().filter(|s| !s.is_empty());
         Ok(CalendarBootstrap {
             Members: members,
             Keys: keys,
             Passphrase: passphrase,
+            Settings: settings,
         })
+    }
+
+    /// Standalone calendar settings (v1 route; bootstrap carries the same).
+    /// Single-fetch variant also returns the full scrubbed response body,
+    /// so an empty result is always attributable: "server sent nothing" vs
+    /// "server sent a shape we don't parse". Never silently default.
+    pub fn get_settings_verbose(&self, cal_id: &str) -> Result<(CalendarSettings, String)> {
+        let (v, status) = self.fetch_settings_raw(cal_id)?;
+        let body = format!("http{status} {}", crate::diag::diag_body(&v));
+        let inner = v.get("CalendarSettings").unwrap_or(&v);
+        let settings: CalendarSettings = serde_json::from_value(inner.clone()).unwrap_or_default();
+        Ok((settings, body))
+    }
+
+    pub fn get_settings(&self, cal_id: &str) -> Result<CalendarSettings> {
+        Ok(self.get_settings_verbose(cal_id)?.0)
+    }
+
+    /// Raw settings payloads for diagnostics (v1 + account-level).
+    pub fn fetch_settings_raw(&self, cal_id: &str) -> Result<(serde_json::Value, u16)> {
+        let resp = self
+            .client
+            .get(format!("{}/calendar/v1/{}/settings", self.base_url, cal_id))
+            .header("Authorization", self.auth_header())
+            .header("x-pm-uid", &self.uid)
+            .header("x-pm-appversion", APP_VERSION)
+            .send()?;
+        let status = resp.status().as_u16();
+        let body = resp.text().unwrap_or_default();
+        Ok((
+            serde_json::from_str(&body).unwrap_or(serde_json::Value::Null),
+            status,
+        ))
+    }
+
+    /// Raw per-account calendar user settings (`DefaultCalendarID` lives
+    /// here; default reminder sets may too — verified live).
+    pub fn fetch_account_calendar_settings_raw(&self) -> Result<(serde_json::Value, u16)> {
+        let resp = self
+            .client
+            .get(format!("{}/settings/calendar", self.base_url))
+            .header("Authorization", self.auth_header())
+            .header("x-pm-uid", &self.uid)
+            .header("x-pm-appversion", APP_VERSION)
+            .send()?;
+        let status = resp.status().as_u16();
+        let body = resp.text().unwrap_or_default();
+        Ok((
+            serde_json::from_str(&body).unwrap_or(serde_json::Value::Null),
+            status,
+        ))
     }
 
     /// Single Type-scoped page (Type 0..3 required for server-side windowing,
@@ -727,6 +792,65 @@ pub fn parse_ical(ical_str: &str) -> Result<ParsedCalendarEvent> {
     Ok(out)
 }
 
+/// One Proton reminder (`Notifications` row entry) normalized for storage.
+/// `action` is `"display"` (device) or `"email"`; `offset_secs` is signed
+/// seconds relative to the event start (negative = before).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CalNotification {
+    pub action: String,
+    pub offset_secs: i64,
+}
+
+/// Parses Proton reminder Trigger values (`-PT15M`, `-PT1H`, `-P1D`,
+/// `-PT0S`, `-P1W`; optional `+`/unsigned). Returns signed seconds.
+/// Months are rejected (not exactly representable); garbage returns None
+/// so the caller skips that entry instead of failing the event.
+pub fn parse_notification_trigger(s: &str) -> Option<i64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let (neg, rest) = match s.strip_prefix('-') {
+        Some(r) => (true, r),
+        None => (false, s.strip_prefix('+').unwrap_or(s)),
+    };
+    let rest = rest.strip_prefix('P')?;
+    let (date_part, time_part) = match rest.find('T') {
+        Some(i) => (&rest[..i], &rest[i + 1..]),
+        None => (rest, ""),
+    };
+    let secs = parse_duration_part(date_part, &[('W', 7 * 86400), ('D', 86400)])?.checked_add(
+        parse_duration_part(time_part, &[('H', 3600), ('M', 60), ('S', 1)])?,
+    )?;
+    Some(if neg { -secs } else { secs })
+}
+
+fn parse_duration_part(s: &str, units: &[(char, i64)]) -> Option<i64> {
+    if s.is_empty() {
+        return Some(0);
+    }
+    let mut total: i64 = 0;
+    let mut num = String::new();
+    for c in s.chars() {
+        if c.is_ascii_digit() {
+            num.push(c);
+            continue;
+        }
+        if num.is_empty() {
+            return None;
+        }
+        let v: i64 = num.parse().ok()?;
+        let mult = units.iter().find(|(u, _)| *u == c)?.1;
+        total = total.checked_add(v.checked_mul(mult)?)?;
+        num.clear();
+    }
+    if num.is_empty() {
+        Some(total)
+    } else {
+        None
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ParsedCalendarEvent {
     pub uid: String,
@@ -873,6 +997,25 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_notification_trigger() {
+        assert_eq!(parse_notification_trigger("-PT15M"), Some(-900));
+        assert_eq!(parse_notification_trigger("-PT1H"), Some(-3600));
+        assert_eq!(parse_notification_trigger("-PT1H30M"), Some(-5400));
+        assert_eq!(parse_notification_trigger("-P1D"), Some(-86400));
+        assert_eq!(parse_notification_trigger("-P1W"), Some(-604800));
+        assert_eq!(parse_notification_trigger("-PT0S"), Some(0));
+        assert_eq!(parse_notification_trigger("PT30S"), Some(30));
+        assert_eq!(parse_notification_trigger(""), None);
+        assert_eq!(parse_notification_trigger("tomorrow"), None);
+        assert_eq!(parse_notification_trigger("-P1M"), None); // months rejected
+        assert_eq!(parse_notification_trigger("-PT"), Some(0));
+        assert_eq!(
+            parse_notification_trigger("-P1DT2H3M4S"),
+            Some(-(86400 + 7200 + 180 + 4))
+        );
+    }
+
+    #[test]
     fn test_list_events_page_mock_pagination() {
         let mut server = mockito::Server::new();
         let _m0 = server
@@ -966,6 +1109,98 @@ mod tests {
         let b = c.get_bootstrap("cal1").unwrap();
         assert_eq!(b.Members.len(), 1);
         assert_eq!(b.Members[0].ID, "m1");
+    }
+
+    #[test]
+    fn test_bootstrap_v2_settings_parsed() {
+        let mut server = mockito::Server::new();
+        let _m = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"/calendar/v2/cal1/bootstrap.*".into()),
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"Members":[{"ID":"m1"}],"Keys":[],
+                    "Passphrase":{"ID":"p1","MemberPassphrases":[]},
+                    "CalendarSettings":{"DefaultEventDuration":30,
+                      "DefaultPartDayNotifications":[{"Trigger":"-PT15M","Type":1}],
+                      "DefaultFullDayNotifications":[]}}"#,
+            )
+            .create();
+        let c = CalendarClient::new_with_base_url(server.url(), "at".into(), "uid".into());
+        let b = c.get_bootstrap("cal1").unwrap();
+        let s = b.Settings.expect("v2 settings parsed");
+        assert_eq!(s.DefaultEventDuration, Some(30));
+        assert_eq!(s.DefaultPartDayNotifications.unwrap().len(), 1);
+        assert!(s.DefaultFullDayNotifications.unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_settings_live_envelope_with_int_bool() {
+        // Exact live shape 2026-09-06: MakesUserBusy arrives as Go int-bool
+        // 1, and each default list mixes display (Type 1) + email (Type 0)
+        // entries. A strict bool field silently failed the WHOLE struct
+        // parse (unwrap_or_default → fake "empty"), hiding real defaults.
+        let mut server = mockito::Server::new();
+        let _m = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"/calendar/v1/cal1/settings.*".into()),
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"Code":1000,"CalendarSettings":{"CalendarID":"c1",
+                    "DefaultEventDuration":30,
+                    "DefaultFullDayNotifications":[
+                      {"Trigger":"-PT15H","Type":1},{"Trigger":"-PT15H","Type":0}],
+                    "DefaultPartDayNotifications":[
+                      {"Trigger":"-PT15M","Type":1},{"Trigger":"-PT15M","Type":0}],
+                    "ID":"s1","MakesUserBusy":1}}"#,
+            )
+            .create();
+        let c = CalendarClient::new_with_base_url(server.url(), "at".into(), "uid".into());
+        let (s, _) = c.get_settings_verbose("cal1").unwrap();
+        assert!(!s.is_empty());
+        assert_eq!(s.MakesUserBusy, Some(true));
+        assert_eq!(s.DefaultPartDayNotifications.unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_bootstrap_settings_filled_from_v1() {
+        // Live shape 2026-09-06: v2 omits CalendarSettings; the standalone
+        // v1 route carries it. get_bootstrap must fill the gap.
+        let mut server = mockito::Server::new();
+        let _v2 = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"/calendar/v2/cal1/bootstrap.*".into()),
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"Members":[{"ID":"m1"}],"Keys":[],"Passphrase":null}"#)
+            .create();
+        let _settings = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"/calendar/v1/cal1/settings.*".into()),
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"CalendarSettings":{"DefaultEventDuration":30,
+                    "DefaultPartDayNotifications":[{"Trigger":"-PT15M","Type":1},{"Trigger":"-PT15M","Type":0}]}}"#,
+            )
+            .create();
+        let c = CalendarClient::new_with_base_url(server.url(), "at".into(), "uid".into());
+        let b = c.get_bootstrap("cal1").unwrap();
+        let s = b.Settings.expect("v1 settings fill the v2 gap");
+        assert_eq!(s.DefaultEventDuration, Some(30));
+        assert_eq!(s.DefaultPartDayNotifications.unwrap().len(), 2);
+        _v2.assert();
+        _settings.assert();
     }
 
     #[test]

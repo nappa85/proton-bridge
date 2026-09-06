@@ -307,11 +307,17 @@ fn calendar_config_from_parts(
     refresh_token: String,
     uid: String,
     derived_json: String,
+    defaults_json: String,
 ) -> SyncConfig {
     let derived_passwords = if derived_json.is_empty() {
         None
     } else {
         serde_json::from_str(&derived_json).ok()
+    };
+    let calendar_defaults = if defaults_json.is_empty() {
+        None
+    } else {
+        serde_json::from_str(&defaults_json).ok()
     };
     SyncConfig {
         username,
@@ -328,6 +334,7 @@ fn calendar_config_from_parts(
             Some(refresh_token)
         },
         uid: if uid.is_empty() { None } else { Some(uid) },
+        calendar_defaults,
         ..Default::default()
     }
 }
@@ -360,8 +367,43 @@ pub extern "C" fn proton_calendar_create_engine_with_derived(
     let refresh_token = unsafe { cstr_to_string(refresh_token) };
     let uid = unsafe { cstr_to_string(uid) };
     let derived_json = unsafe { cstr_to_string(derived_passwords_json) };
-    let config =
-        calendar_config_from_parts(username, access_token, refresh_token, uid, derived_json);
+    let config = calendar_config_from_parts(
+        username,
+        access_token,
+        refresh_token,
+        uid,
+        derived_json,
+        String::new(),
+    );
+    let engine = CalendarSyncEngine::new(config);
+    Box::into_raw(Box::new(ProtonCalendarEngine {
+        inner: Arc::new(Mutex::new(Some(engine))),
+        synced_events_json: Arc::new(Mutex::new(None)),
+    }))
+}
+#[no_mangle]
+pub extern "C" fn proton_calendar_create_engine_with_derived_and_defaults(
+    username: *const c_char,
+    access_token: *const c_char,
+    refresh_token: *const c_char,
+    uid: *const c_char,
+    derived_passwords_json: *const c_char,
+    defaults_json: *const c_char,
+) -> *mut ProtonCalendarEngine {
+    let username = unsafe { cstr_to_string(username) };
+    let access_token = unsafe { cstr_to_string(access_token) };
+    let refresh_token = unsafe { cstr_to_string(refresh_token) };
+    let uid = unsafe { cstr_to_string(uid) };
+    let derived_json = unsafe { cstr_to_string(derived_passwords_json) };
+    let defaults_json = unsafe { cstr_to_string(defaults_json) };
+    let config = calendar_config_from_parts(
+        username,
+        access_token,
+        refresh_token,
+        uid,
+        derived_json,
+        defaults_json,
+    );
     let engine = CalendarSyncEngine::new(config);
     Box::into_raw(Box::new(ProtonCalendarEngine {
         inner: Arc::new(Mutex::new(Some(engine))),
@@ -475,6 +517,28 @@ pub extern "C" fn proton_calendar_get_uid(e: *mut ProtonCalendarEngine) -> *mut 
     let guard = eref.inner.lock().unwrap();
     match guard.as_ref().and_then(|eng| eng.get_uid()) {
         Some(s) => CString::new(s).unwrap().into_raw(),
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// Last-seen non-empty per-calendar reminder defaults as JSON, or null when
+/// this run saw none (caller must not overwrite a good cache with that).
+#[no_mangle]
+pub extern "C" fn proton_calendar_get_defaults_json(e: *mut ProtonCalendarEngine) -> *mut c_char {
+    if e.is_null() {
+        return std::ptr::null_mut();
+    }
+    let eref = unsafe { &*e };
+    let guard = eref.inner.lock().unwrap();
+    match guard.as_ref() {
+        Some(eng) => {
+            let s = eng.defaults_json();
+            if s.is_empty() {
+                std::ptr::null_mut()
+            } else {
+                CString::new(s).unwrap().into_raw()
+            }
+        }
         None => std::ptr::null_mut(),
     }
 }

@@ -50,6 +50,18 @@ fn main() {
     };
     eprintln!("auth OK (tokens withheld from output)");
 
+    if std::env::var("LIVE_SCOPE_PROBE").is_ok() {
+        run_scope_probe(
+            &auth,
+            &tokens.access_token,
+            &tokens.refresh_token,
+            &tokens.uid,
+        );
+        // Stop here: the probe's refresh rotates the server-side token,
+        // which would 401 the engine run below and muddy the results.
+        return;
+    }
+
     if std::env::var("LIVE_DIAG").is_ok() {
         run_diag(&tokens.access_token, &tokens.uid);
     }
@@ -77,6 +89,58 @@ fn main() {
         eprintln!("keys_debug: {dbg}");
     }
     /// Diagnostic: dump calendar list + raw envelope shapes (no secrets).
+    /// Scope-narrowing probe: compares /settings + key salts on the fresh
+    /// post-2FA token vs the refreshed token. Answers whether refresh
+    /// drops scopes (e.g. `locked`), which would explain empty settings
+    /// and salts 403 on every phone sync (the engines always refresh
+    /// first, since restored tokens carry no expiry).
+    fn run_scope_probe(
+        auth: &proton_api::AuthClient,
+        access_token: &str,
+        refresh_token: &str,
+        uid: &str,
+    ) {
+        fn probe(tag: &str, access_token: &str, uid: &str) {
+            let cal_client =
+                proton_api::CalendarClient::new(access_token.to_string(), uid.to_string());
+            let cals = cal_client.list_calendars().unwrap_or_default();
+            for cal in &cals {
+                match cal_client.get_settings_verbose(&cal.ID) {
+                    Ok((s, body)) => eprintln!(
+                        "scope_probe[{tag}] cal={} settings_empty={}\n{body}",
+                        &cal.ID[..8.min(cal.ID.len())],
+                        s.is_empty(),
+                    ),
+                    Err(e) => {
+                        let msg = format!("{e}");
+                        let short: String = msg.chars().take(80).collect();
+                        eprintln!(
+                            "scope_probe[{tag}] cal={} settings_err:{short}",
+                            &cal.ID[..8.min(cal.ID.len())]
+                        );
+                    }
+                }
+            }
+            let keys_client =
+                proton_api::KeysClient::new(access_token.to_string(), uid.to_string());
+            match keys_client.get_key_salts() {
+                Ok(salts) => eprintln!("scope_probe[{tag}] salts_ok n={}", salts.len()),
+                Err(e) => {
+                    let msg = format!("{e}");
+                    let short: String = msg.chars().take(80).collect();
+                    eprintln!("scope_probe[{tag}] salts_err:{short}");
+                }
+            }
+        }
+        probe("fresh", access_token, uid);
+        match auth.refresh_verbose(refresh_token, uid) {
+            Ok((new_tokens, scope, scopes)) => {
+                eprintln!("scope_probe[refresh] Scope={scope:?} Scopes={scopes:?}");
+                probe("refreshed", &new_tokens.access_token, &new_tokens.uid);
+            }
+            Err(e) => eprintln!("scope_probe[refresh] failed: {e}"),
+        }
+    }
     fn run_diag(access_token: &str, uid: &str) {
         eprintln!(
             "diag token={} uid={uid}",
@@ -165,9 +229,58 @@ fn main() {
                 }
             }
         }
-        // Raw-row dump: full JSON for UID-substring matches, 3 passes with gaps.
-        // Purpose: field-level ground truth + stability across reads (RecurrenceID
-        // rendered 20:00Z here vs 22:00Z on device for the same UID — live 2026).
+        // Bootstrap settings + per-event raw Notifications (reminder forensics).
+        if std::env::var("LIVE_CALSET").is_ok() {
+            for cal in &cals {
+                match client.get_bootstrap(&cal.ID) {
+                    Ok(b) => eprintln!(
+                        "diag bootstrap cal={} settings={}",
+                        &cal.ID[..8.min(cal.ID.len())],
+                        serde_json::to_value(&b.Settings).unwrap_or_default()
+                    ),
+                    Err(e) => eprintln!(
+                        "diag bootstrap cal={} ERROR: {e}",
+                        &cal.ID[..8.min(cal.ID.len())]
+                    ),
+                }
+                match client.fetch_settings_raw(&cal.ID) {
+                    Ok((v, st)) => {
+                        let snippet: String = v.to_string().chars().take(400).collect();
+                        eprintln!(
+                            "diag v1settings cal={} status={st} {snippet}",
+                            &cal.ID[..8.min(cal.ID.len())]
+                        );
+                    }
+                    Err(e) => eprintln!("diag v1settings TRANSPORT-ERROR: {e}"),
+                }
+            }
+            match client.fetch_account_calendar_settings_raw() {
+                Ok((v, st)) => {
+                    let snippet: String = v.to_string().chars().take(600).collect();
+                    eprintln!("diag acctsettings status={st} {snippet}");
+                }
+                Err(e) => eprintln!("diag acctsettings TRANSPORT-ERROR: {e}"),
+            }
+            for cal in &cals {
+                let rows = client
+                    .list_all_events_untyped(
+                        &cal.ID,
+                        chrono::Utc::now().timestamp() - 365 * 24 * 3600,
+                        chrono::Utc::now().timestamp() + 365 * 24 * 3600,
+                    )
+                    .unwrap_or_default();
+                for ev in &rows {
+                    let v = serde_json::to_value(ev).unwrap_or(serde_json::Value::Null);
+                    eprintln!(
+                        "diag row cal={} uid={} notif={} fullday={}",
+                        &cal.ID[..8.min(cal.ID.len())],
+                        v.get("UID").and_then(|u| u.as_str()).unwrap_or("?"),
+                        v.get("Notifications").map_or("?".into(), |n| n.to_string()),
+                        v.get("FullDay").map_or("?".into(), |n| n.to_string()),
+                    );
+                }
+            }
+        }
         if let Ok(want) = std::env::var("LIVE_DUMP_UID") {
             for pass in 0..3 {
                 if pass > 0 {

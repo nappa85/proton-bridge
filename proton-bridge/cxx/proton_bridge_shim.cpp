@@ -20,6 +20,61 @@ static void proton_log(const QString &msg) {
     qDebug() << msg;
 }
 
+// Merges DerivedPasswords maps from every known source into one JSON object.
+// Different logins stored single-key maps in different QSettings groups
+// ([accountId]={addr}, [Uid]={user}); first-hit-wins shadowed one key and
+// broke whichever engine needed it (verified live 2026-09-06). Union is
+// safe: every entry was verified by trial-unlock at login time.
+// Priority on conflict (later overwrites): accountId < username < Uid < blob.
+static void mergeDerivedMap(QVariantMap &into, const QString &json, const QString &src,
+                            QStringList &used) {
+    if (json.isEmpty()) {
+        return;
+    }
+    QJsonParseError err;
+    QJsonDocument doc = QJsonDocument::fromJson(json.toUtf8(), &err);
+    if (err.error != QJsonParseError::NoError || !doc.isObject()) {
+        return;
+    }
+    const QVariantMap map = doc.toVariant().toMap();
+    if (map.isEmpty()) {
+        return;
+    }
+    for (auto it = map.constBegin(); it != map.constEnd(); ++it) {
+        into.insert(it.key(), it.value());
+    }
+    used << QStringLiteral("%1(%2)").arg(src).arg(map.size());
+}
+
+static QString loadMergedDerivedPasswords(const QString &accountId, const QString &uid,
+                                          const QString &username, const QString &blobJson) {
+    QSettings settings(QStringLiteral("proton"), QStringLiteral("sync-tokens"));
+    QVariantMap merged;
+    QStringList used;
+    settings.beginGroup(accountId);
+    mergeDerivedMap(merged, settings.value(QStringLiteral("derived_passwords")).toString(),
+                    QStringLiteral("accountId"), used);
+    settings.endGroup();
+    if (!username.isEmpty()) {
+        settings.beginGroup(username);
+        mergeDerivedMap(merged, settings.value(QStringLiteral("derived_passwords")).toString(),
+                        QStringLiteral("username"), used);
+        settings.endGroup();
+    }
+    if (!uid.isEmpty()) {
+        settings.beginGroup(uid);
+        mergeDerivedMap(merged, settings.value(QStringLiteral("derived_passwords")).toString(),
+                        QStringLiteral("Uid"), used);
+        settings.endGroup();
+    }
+    mergeDerivedMap(merged, blobJson, QStringLiteral("blob"), used);
+    if (merged.isEmpty()) {
+        return QString();
+    }
+    proton_log(QStringLiteral("Merged DerivedPasswords from ") + used.join(QStringLiteral("+")));
+    return QString::fromUtf8(QJsonDocument::fromVariant(merged).toJson(QJsonDocument::Compact));
+}
+
 static void sendProtonNotification(const QString &summary, const QString &body) {
     QDBusMessage msg = QDBusMessage::createMethodCall(
         QStringLiteral("org.freedesktop.Notifications"),
@@ -225,28 +280,14 @@ void ProtonContactsPlugin::onSignOnResponse(const SignOn::SessionData &data)
         if (uid.isEmpty()) uid = tokens.second;
     }
     if (derivedJson.isEmpty()) {
-        QSettings settings(QStringLiteral("proton"), QStringLiteral("sync-tokens"));
-        // Try accountId group (legacy)
-        settings.beginGroup(m_accountId);
-        derivedJson = settings.value(QStringLiteral("derived_passwords")).toString();
-        settings.endGroup();
-        if (!derivedJson.isEmpty()) {
-            proton_log(QStringLiteral("Loaded derived passwords from QSettings cache (accountId)"));
-        } else if (!uid.isEmpty()) {
-            settings.beginGroup(uid);
-            derivedJson = settings.value(QStringLiteral("derived_passwords")).toString();
-            settings.endGroup();
-            if (!derivedJson.isEmpty()) {
-                proton_log(QStringLiteral("Loaded derived passwords from QSettings cache (Uid)"));
-            }
-        }
-        if (derivedJson.isEmpty() && !username.isEmpty()) {
-            settings.beginGroup(username);
-            derivedJson = settings.value(QStringLiteral("derived_passwords")).toString();
-            settings.endGroup();
-            if (!derivedJson.isEmpty()) {
-                proton_log(QStringLiteral("Loaded derived passwords from QSettings cache (username)"));
-            }
+        derivedJson = loadMergedDerivedPasswords(m_accountId, uid, username, QString());
+    } else {
+        proton_log(QStringLiteral("Using DerivedPasswords from SignOn blob"));
+        // Still merge QSettings groups underneath: the blob is wiped to
+        // tokens-only on every refresh, so it may hold fewer keys.
+        QString merged = loadMergedDerivedPasswords(m_accountId, uid, username, derivedJson);
+        if (!merged.isEmpty()) {
+            derivedJson = merged;
         }
     }
 
@@ -776,8 +817,10 @@ QPair<QString, QString> ProtonContactsPlugin::loadPersistedTokens()
 // Real implementation: SignOn (NoUserInteraction) → Rust CalendarSyncEngine
 // (bootstrap → unlock → windowed decrypt → JSON) → QOrganizer mkcal.
 // Mirrors ProtonContactsPlugin credential handling; per-account collection
-// "Proton Calendar (<accountId>)", full-replacement sync via GUID
-// "proton-cal-<accountId>-<eventId>" (recurrence limited to FREQ daily/weekly/
+// "Proton Calendar (<accountId>)", full-replacement sync via namespaced UID
+// "proton-cal-<accountId>-<rawUid>" (namespacedUid(); raw Proton UIDs are
+// account-independent and clash across re-created accounts – see
+// FINDINGS_CALENDAR.md). Recurrence limited to FREQ daily/weekly/
 // monthly/yearly v1 – see FINDINGS_CALENDAR.md).
 static const QString PROTON_CALDAV_SERVICE_NAME = QStringLiteral("proton-caldav");
 
@@ -919,31 +962,25 @@ void ProtonCalendarPlugin::onCalendarSignOnResponse(const SignOn::SessionData &d
         if (uid.isEmpty()) uid = tokens.second;
     }
     if (derivedJson.isEmpty()) {
-        QSettings settings(QStringLiteral("proton"), QStringLiteral("sync-tokens"));
-        settings.beginGroup(m_accountId);
-        derivedJson = settings.value(QStringLiteral("derived_passwords")).toString();
-        settings.endGroup();
-        if (derivedJson.isEmpty() && !uid.isEmpty()) {
-            settings.beginGroup(uid);
-            derivedJson = settings.value(QStringLiteral("derived_passwords")).toString();
-            settings.endGroup();
-        }
-        if (derivedJson.isEmpty() && !username.isEmpty()) {
-            settings.beginGroup(username);
-            derivedJson = settings.value(QStringLiteral("derived_passwords")).toString();
-            settings.endGroup();
+        derivedJson = loadMergedDerivedPasswords(m_accountId, uid, username, QString());
+    } else {
+        proton_log(QStringLiteral("Calendar: DerivedPasswords from SignOn blob"));
+        QString merged = loadMergedDerivedPasswords(m_accountId, uid, username, derivedJson);
+        if (!merged.isEmpty()) {
+            derivedJson = merged;
         }
     }
     if (accessToken.isEmpty() && refreshToken.isEmpty()) {
         emit error(getProfileName(), QStringLiteral("No auth tokens received"), Buteo::SyncResults::AUTHENTICATION_FAILURE);
         return;
     }
-    m_calEngine = proton_calendar_create_engine_with_derived(
+    m_calEngine = proton_calendar_create_engine_with_derived_and_defaults(
         username.toUtf8().constData(),
         accessToken.toUtf8().constData(),
         refreshToken.toUtf8().constData(),
         uid.toUtf8().constData(),
-        derivedJson.toUtf8().constData());
+        derivedJson.toUtf8().constData(),
+        loadCalendarDefaults().toUtf8().constData());
     if (!m_calEngine) {
         emit error(getProfileName(), QStringLiteral("Failed to create calendar engine"), Buteo::SyncResults::INTERNAL_ERROR);
         return;
@@ -992,6 +1029,11 @@ void ProtonCalendarPlugin::pollCalendarStatus() {
         if (keysDbg) {
             proton_log(QStringLiteral("Calendar keys debug: ") + QString::fromUtf8(keysDbg));
             proton_bridge_free_string(keysDbg);
+        }
+        char *defaults = proton_calendar_get_defaults_json(m_calEngine);
+        if (defaults) {
+            persistCalendarDefaults(QString::fromUtf8(defaults));
+            proton_bridge_free_string(defaults);
         }
         char *json = proton_calendar_get_events_json(m_calEngine);
         if (json) {
@@ -1096,6 +1138,15 @@ QString ProtonCalendarPlugin::findOrCreateNotebook(mKCal::ExtendedCalendar::Ptr 
     proton_log(QStringLiteral("Created calendar notebook ") + nbUid);
     return nbUid;
 }
+// mKCal enforces UNIQUE incidence UIDs across the whole storage, but the
+// Proton/ical UID is account-independent: re-creating the account (104 →
+// 105) re-inserts the same UIDs next to the orphaned notebooks and the
+// batch INSERT fails, rolling back the entire save() (verified 2026-09-06:
+// deterministic "mKCal storage save failed"). Namespace every stored UID
+// by account; lookups must use the same form.
+QString ProtonCalendarPlugin::namespacedUid(const QString &raw) const {
+    return QStringLiteral("proton-cal-%1-%2").arg(m_accountId, raw);
+}
 
 static QString stripMailto(const QString &s) {
     QString email = s.trimmed();
@@ -1178,8 +1229,25 @@ static void fillEventFromJson(const KCalendarCore::Event::Ptr &ev, const QJsonOb
     if (o.value(QLatin1String("transp")).toString().compare(QLatin1String("TRANSPARENT"), Qt::CaseInsensitive) == 0) {
         ev->setTransparency(KCalendarCore::Event::Transparent);
     }
-    QString color = o.value(QLatin1String("color")).toString();
-    if (!color.isEmpty()) ev->setColor(color);
+        QString color = o.value(QLatin1String("color")).toString();
+        if (!color.isEmpty()) ev->setColor(color);
+        // Reminders (Proton Notifications tri-state; null = inherit calendar
+        // defaults, which the Calendar app applies itself).
+        QJsonArray notifs = o.value(QLatin1String("notifications")).toArray();
+        for (const QJsonValue &nv : notifs) {
+            QJsonObject no = nv.toObject();
+            qint64 offSecs = no.value(QLatin1String("offset_secs")).toVariant().toLongLong();
+            KCalendarCore::Alarm::Ptr alarm(new KCalendarCore::Alarm(ev.data()));
+            if (no.value(QLatin1String("action")).toString() == QLatin1String("email")) {
+                alarm->setType(KCalendarCore::Alarm::Email);
+            } else {
+                alarm->setType(KCalendarCore::Alarm::Display);
+            }
+            alarm->setStartOffset(KCalendarCore::Duration(static_cast<int>(offSecs),
+                                                          KCalendarCore::Duration::Seconds));
+            alarm->setEnabled(true);
+            ev->addAlarm(alarm);
+        }
 }
 
 // Shared start/end computation (unix fallback, full-day exclusive-end fix).
@@ -1255,12 +1323,16 @@ bool ProtonCalendarPlugin::writeEventsToMkCal(const QByteArray &json) {
         }
     }
     int saved = 0;
+    QStringList syncedNotebooks;
+    // Retired v1 notebook id is also purged below (its tombstones linger).
+    syncedNotebooks << QStringLiteral("proton-calendar-%1").arg(m_accountId);
     auto rowRecurrenceId = [](const QJsonObject &o) {
         return o.value(QLatin1String("recurrence_id")).toVariant().toLongLong();
     };
     for (auto it = byCal.constBegin(); it != byCal.constEnd(); ++it) {
         QString nbUid = findOrCreateNotebook(cal, storage, it.key(), calNames.value(it.key()));
         if (nbUid.isEmpty()) continue;
+        if (!syncedNotebooks.contains(nbUid)) syncedNotebooks << nbUid;
         if (!storage->loadNotebookIncidences(nbUid)) {
             proton_log(QStringLiteral("loadNotebookIncidences failed, continuing anyway"));
         }
@@ -1281,6 +1353,7 @@ bool ProtonCalendarPlugin::writeEventsToMkCal(const QByteArray &json) {
         if (!isException) {
             KCalendarCore::Event::Ptr ev(new KCalendarCore::Event());
             fillEventFromJson(ev, o, uid, start, end, fullDay);
+            ev->setUid(namespacedUid(uid));
             if (cal->addEvent(ev, nbUid)) {
                 saved++;
             } else {
@@ -1297,7 +1370,7 @@ bool ProtonCalendarPlugin::writeEventsToMkCal(const QByteArray &json) {
         // as a plain event with a stable suffixed UID. Display result is
         // identical; no recurrenceId anywhere.
         QDateTime rid = utcFromUnix(recurrenceId);
-        KCalendarCore::Event::Ptr master = cal->event(uid);
+        KCalendarCore::Event::Ptr master = cal->event(namespacedUid(uid));
         if (master && master->recursAt(rid)) {
             master->recurrence()->addExDateTime(rid);
         } else if (master) {
@@ -1308,6 +1381,7 @@ bool ProtonCalendarPlugin::writeEventsToMkCal(const QByteArray &json) {
         KCalendarCore::Event::Ptr solo(new KCalendarCore::Event());
         QString soloUid = QStringLiteral("%1#%2").arg(uid, QString::number(recurrenceId));
         fillEventFromJson(solo, o, soloUid, start, end, fullDay);
+        solo->setUid(namespacedUid(soloUid));
         if (cal->addEvent(solo, nbUid)) {
             saved++;
         } else {
@@ -1322,6 +1396,21 @@ bool ProtonCalendarPlugin::writeEventsToMkCal(const QByteArray &json) {
         return false;
     }
     proton_log(QStringLiteral("Saved %1 calendar events to mkcal").arg(saved));
+    // Purge soft-deleted tombstones in our notebooks (full-replacement leaves
+    // them behind every sync; e.g. superseded exception rows). Scoped to our
+    // notebook uids only. NOTE for future upsync work: purging destroys the
+    // delete-history a server upload would need — upsync must track deletes
+    // by Proton event id instead.
+    for (const QString &purgedNbUid : syncedNotebooks) {
+        KCalendarCore::Incidence::List deleted;
+        if (storage->deletedIncidences(&deleted, QDateTime(), purgedNbUid) && !deleted.isEmpty()) {
+            if (storage->purgeDeletedIncidences(deleted, purgedNbUid)) {
+                proton_log(QStringLiteral("Purged %1 tombstones from %2").arg(deleted.size()).arg(purgedNbUid));
+            } else {
+                proton_log(QStringLiteral("purgeDeletedIncidences failed ") + purgedNbUid);
+            }
+        }
+    }
     return true;
 }
 void ProtonCalendarPlugin::persistCalendarTokens(const QString &refreshToken, const QString &uid) {
@@ -1338,6 +1427,26 @@ QPair<QString, QString> ProtonCalendarPlugin::loadPersistedCalendarTokens() {
     QString uid = settings.value(QStringLiteral("uid")).toString();
     settings.endGroup();
     return qMakePair(rt, uid);
+}
+// Cached per-calendar reminder defaults ({calId: {part:[...], full:[...]}}).
+// Written on fresh sessions (live settings non-empty) so restored sessions
+// — whose live settings come back empty — resolve the same VALARMs.
+void ProtonCalendarPlugin::persistCalendarDefaults(const QString &defaultsJson) {
+    if (defaultsJson.isEmpty()) {
+        return;
+    }
+    QSettings settings(QStringLiteral("proton"), QStringLiteral("sync-tokens"));
+    settings.beginGroup(m_accountId);
+    settings.setValue(QStringLiteral("calendar_defaults"), defaultsJson);
+    settings.endGroup();
+    proton_log(QStringLiteral("Persisted calendar defaults for account ") + m_accountId);
+}
+QString ProtonCalendarPlugin::loadCalendarDefaults() {
+    QSettings settings(QStringLiteral("proton"), QStringLiteral("sync-tokens"));
+    settings.beginGroup(m_accountId);
+    QString d = settings.value(QStringLiteral("calendar_defaults")).toString();
+    settings.endGroup();
+    return d;
 }
 void ProtonCalendarPlugin::abortSync(Sync::SyncStatus aStatus) {
     Q_UNUSED(aStatus);

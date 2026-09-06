@@ -447,8 +447,112 @@ Calendar sync:
   (`proton-bridge/settings/`, `ProtonDataPurger.purgeData`) with remorse.
   VERIFIED 2026-09-06 end to end: purge deleted collection + both notebooks
   (`purgeData done ok=1`, UI empty), re-sync restored 1 contact + 20 events.
-- [ ] Reminders (`Notifications` tri-state row field) → VALARM mapping on
-  write; currently parsed and carried in JSON but not stored.
+- [x] Reminders (2026-09-06): `Notifications` tri-state row field now flows
+  to JSON (`parse_notification_trigger` + offline tests for -PT15M/-PT1H/
+  -P1D/-P1W/-PT0S/unsigned/garbage/months-rejected) and is stored as
+  KCalendarCore VALARMs (display/email, start-offset). Null (inherit
+  calendar defaults) stays untouched for the app to resolve. Staged
+  `/tmp/libproton-client.so` — needs a reminder-bearing event to verify
+  (none of T01–T20 has custom reminders).
+- [x] Calendar-default reminders (2026-09-06): events with `Notifications:
+  null` inherit the calendar's `DefaultPartDayNotifications` /
+  `DefaultFullDayNotifications` (fetched via bootstrap `CalendarSettings`
+  + v1 `/settings` fallback) so the phone fires the same reminders Proton
+  shows (e.g. 15 min before). Explicit `[]` stays reminder-free. Covered by
+  offline resolve tests (timed/all-day/explicit/garbage-skipped). Restaged
+  `/tmp/libproton-client.so` (18:25) with both halves.
+- [x] Reminder live-fire (2026-09-06): user created an event 20 min out
+  with a 15-min reminder; sync stored 21 events.
+- [ ] Verify VALARM rows (`Alarm` table count is 0 despite 21 events):
+  bootstrap v2 carries NO `CalendarSettings` and all rows are
+  `Notifications: null` — defaults live only on the v1 `/settings` route
+  (verified: 15-min timed / 15-hour full-day). `get_bootstrap` now fills
+  the gap (+ mock tests). Staged `/tmp/libproton-client.so` (18:44).
+- [x] UID clash across re-created accounts (ROOT-CAUSED + FIXED
+  2026-09-06, user spotted it): stored mKCal UIDs were the RAW Proton/ical
+  UIDs while mKCal enforces storage-wide uniqueness → orphan 104 rows made
+  every 105 batch INSERT fail the whole `save()`. Fix `namespacedUid()`
+  (`proton-cal-<id>-<raw>`) at all three UID sites. VERIFIED 21:03:
+  `Saved 21`, and full-replacement correctly `Removed 20+1` then re-saved.
+- [ ] Reminder defaults (RESOLVED as server-null 2026-09-06 21:03): the
+  verbose shape line shows `http200 keys=[CalendarSettings,Code]
+  inner=[...DefaultFullDayNotifications,DefaultPartDayNotifications...]`
+  yet parsed empty — struct field names match, so the server sends the
+  keys with NULL values: this account has NO default reminders
+  configured. Our parser is innocent; the earlier "15-min/15-hour"
+  reading was Proton clients' client-side fallback, not stored data.
+  Consequence: `Notifications:null` events correctly get no VALARM;
+  only the explicit 21st-event reminder stores (expect Alarm=1). Open
+  product call: mirror Proton clients with a hardcoded client-side
+  default (e.g. 15 min before) for null-Notification events.
+  REJECTED by user (horrible idea) — and unnecessary, see next entry.
+- [x] SILENT PARSE KILLER (found 2026-09-06 21:15 via full-body logging,
+  user-requested): the live envelope DOES carry real defaults
+  (`-PT15M` display+email part-day, `-PT15H` display+email full-day) but
+  `"MakesUserBusy": 1` (Go int-bool) failed the strict
+  `Option<bool>` field → whole-struct `from_value` failed →
+  `unwrap_or_default()` → fake "empty". The codebase already had
+  `deserialize_opt_bool` for this hazard (`Display`, `FullDay`) —
+  `MakesUserBusy` just missed the attribute.   Fixed + regression test
+  with the exact live envelope. Shipped 21:19; expect `settings=1` and
+  Alarm ≈ 21 (display Type 1 inherited, email Type 0 skipped as
+  server-sent).   VERIFIED 21:22: `settings=1` both cals, `Saved 21`, and
+  `Persisted calendar defaults for account 105` (cache seeded — later
+  restored sessions inherit even if live settings ever go empty).
+  VERIFIED 21:2x: `Alarm COUNT(*) = 21` on device. Reminders saga closed. Lesson applied per user feedback: settings responses now
+  log full scrubbed bodies (`diag.rs`: secret redaction + 8k cap), and
+  the account-level `/settings/calendar` route is logged per sync too
+  (view prefs only — defaults live per-calendar, confirmed).
+- Correction (2026-09-06): the "every sync refreshes first" theory was
+  WRONG for the calendar engine — `CalendarSyncEngine::new` calls
+  `set_expiry(3600)` when an access token is present, so the phone uses
+  SignOn's token directly (hence no `refresh_scopes=` line: no refresh
+  ran). Salts 403 + `locked` remains unexplained but non-blocking
+  (derived path unlocks everything).
+  Note: fresh login ALSO returns `settings_empty` (20:08, minutes-old
+  session), so the defaults cache cannot self-seed from the phone —
+  seeding via host live tool + direct QSettings write is the fallback
+  plan (needs fresh OTP).
+- [ ] Scope probe results (host, OTP 20:4x): refresh does NOT narrow
+  scopes — `Scope=full self payments keys parent user loggedin
+  nondelinquent mail calendar drive pass verified settings wallet meet`
+  (note: NO `locked` in the list, yet salts work) — and salts_ok both
+  fresh and refreshed. BUT `/settings` parses empty on the FRESH
+  full-scope session too: the emptiness is NOT scope-related at all.
+  Open: server truly has no defaults vs our parser dropping the shape
+  (`get_settings` falls back to the whole envelope when the
+  `CalendarSettings` key is absent, then `unwrap_or_default()` hides
+  the difference). Next: instrumented build logs `refresh_scopes=`
+  (what the phone session really holds) and `settings_empty http..
+  keys=[..] inner=[..]` per cal. (Probe artifact noted: the probe's own
+  refresh rotates the server token, 401ing the subsequent engine run —
+  probe now exits early.)
+- [ ] Cache calendar defaults for restored sessions (in progress
+  2026-09-06): on restored logins the v1 `/settings` ALSO returns `{}`
+  (`settings_empty` on all three cals, verified 19:05) — so there is
+  nothing to inherit and `Alarm COUNT(*)` stays 1 (custom-only event).
+  Design: engine records last-seen non-empty defaults per cal
+  (`last_defaults`, parsed via the same Type-0-skipping parser) and
+  exposes them via `proton_calendar_get_defaults_json` (null when this
+  run saw none — never clobbers a good cache); the shim persists them to
+  QSettings `proton/sync-tokens/<accountId>/calendar_defaults` on
+  `complete` and feeds them back through
+  `..._with_derived_and_defaults` as `SyncConfig.calendar_defaults`.
+  Precedence: explicit array > live defaults > cached defaults > none.
+  Unit-tested (`test_resolve_notifications_cached_fallback`); workspace
+  green (35+2+11), clippy/fmt clean. NOT yet staged — needs a FRESH login
+  first (only fresh sessions return real settings to seed the cache),
+  then a restored-session sync to verify `Alarm COUNT(*)` ≈ 21.
+- Empty-`{}` normalization (2026-09-06): v2 can also send an empty
+  `CalendarSettings` object (present-but-useless → old code skipped the v1
+  fill-in). `is_empty()` treats it as absent on both paths. Email
+  reminders (Type 0) are server-sent — no longer stored (display only).
+  Process note: verify deploys by sha256, not timestamps (phone/host
+  clocks disagree by minutes).
+- [ ] Verify VALARM rows (`Alarm` table count is 0 despite 21 events):
+  either bootstrap carries no defaults (parse gap?) or rows are all null
+  and defaults resolution isn't triggering. Added `LIVE_CALSET` diag
+  (bootstrap Settings dump + per-row raw Notifications).
 - [ ] Upsync (currently read-only): local creates/edits/deletes never reach
   Proton (`PUT .../events/sync` whole-object replace — see api.md pitfalls:
   re-send Notifications/Color/Attendees verbatim, patch cards in place,
@@ -458,16 +562,24 @@ Calendar sync:
   (correct times) instead of linked.
 - [ ] Attendees/invites: identities stored display-only; no RSVP status
   sync, no invitation sending.
-- [ ] Tombstone accumulation: soft-deleted rows (e.g. row 59) are never
-  purged — consider `purgeDeletedIncidences` once replacement is proven.
+- [x] Tombstone accumulation: purge soft-deleted rows scoped to our
+  notebooks after each successful save (`deletedIncidences` +
+  `purgeDeletedIncidences`; upsync caveat noted in code). Staged
+  `/tmp/libproton-client.so` — verify via sqlite tombstone count.
 - [ ] Typed windowed listing anomaly (runs 1–10 notes above): identical
   typed queries intermittently 200-empty while untyped succeeds; untyped +
   client filter is primary, typed code retained mock-tested for future work.
 - [ ] Token `Signature` verify skipped (lenient, proton-cal behavior) —
   consider sequoia detached-verify once author public keys are available.
-- [ ] Debug scaffolding in shipped lib code (`LIVE_TRACE` eprintlns,
-  `fetch_events_raw`/`fetch_events_page_raw` diag helpers, token-prefix
-  logs, parse-skip logs): feature-gate or remove before release hardening.
+- Derived-map shadowing (2026-09-06): different logins stored single-key
+  maps per group (`[104]`={addr}, `[Uid]`={user}); first-hit-wins broke
+  contacts (user key needed, shadowed). Fix: merge all sources
+  (accountId < username < Uid < blob) in both handlers, with source
+  logging.
+- Merge VERIFIED 2026-09-06 17:45: `derived_keys=2`, `userkey_…_ok`,
+  `addrkey_…_ok_via_token`, contact decrypted + saved. The complete
+  go-proton-api chain (derived user unlock → Token decrypt → address
+  unlock → card decrypt) works live on restored sessions.
 
 Contacts sync (from PLAN.md, still open):
 - [ ] Two-way sync (download-only today), incremental sync (full fetch),

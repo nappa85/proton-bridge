@@ -13,7 +13,8 @@ pub use bridge::{
     proton_bridge_get_keys_debug, proton_bridge_get_refresh_token, proton_bridge_get_status,
     proton_bridge_get_synced_contacts_json, proton_bridge_get_uid, proton_bridge_start_sync,
     proton_calendar_create_engine, proton_calendar_create_engine_with_derived,
-    proton_calendar_destroy_engine, proton_calendar_get_events_json,
+    proton_calendar_create_engine_with_derived_and_defaults, proton_calendar_destroy_engine,
+    proton_calendar_get_defaults_json, proton_calendar_get_events_json,
     proton_calendar_get_keys_debug, proton_calendar_get_refresh_token, proton_calendar_get_status,
     proton_calendar_get_uid, proton_calendar_start_sync, ProtonBridgeStatus,
 };

@@ -41,6 +41,7 @@
 #include <KCalendarCore/Recurrence>
 #include <KCalendarCore/RecurrenceRule>
 #include <KCalendarCore/Attendee>
+#include <KCalendarCore/Alarm>
 
 #include <Accounts/manager.h>
 #include <Accounts/account.h>
@@ -129,8 +130,11 @@ private:
                                  mKCal::ExtendedStorage::Ptr storage,
                                  const QString &calId,
                                  const QString &calName);
+    QString namespacedUid(const QString &raw) const;
     void persistCalendarTokens(const QString &refreshToken, const QString &uid);
     QPair<QString, QString> loadPersistedCalendarTokens();
+    void persistCalendarDefaults(const QString &defaultsJson);
+    QString loadCalendarDefaults();
 
     ProtonCalendarEngine *m_calEngine = nullptr;
     QTimer *m_calTimer = nullptr;

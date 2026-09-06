@@ -188,6 +188,46 @@ impl AuthClient {
         })
     }
 
+    /// Refresh variant that also returns the granted scope info, for
+    /// diagnosing scope narrowing (e.g. `locked` present after password
+    /// login but absent after refresh). Production `refresh()` delegates.
+    pub fn refresh_verbose(
+        &self,
+        refresh_token: &str,
+        uid: &str,
+    ) -> Result<(AuthTokens, Option<String>, Vec<String>)> {
+        let resp = self
+            .client
+            .post(format!("{}/auth/v4/refresh", self.base_url))
+            .header("x-pm-appversion", APP_VERSION)
+            .header("x-pm-uid", uid)
+            .json(&RefreshRequest {
+                GrantType: "refresh_token".to_string(),
+                RefreshToken: refresh_token.to_string(),
+            })
+            .send()?;
+
+        let status = resp.status();
+        let body = resp.text()?;
+
+        if !status.is_success() {
+            return Err(ProtonError::Auth(format!(
+                "Refresh POST failed {status}: {body}"
+            )));
+        }
+
+        let refresh_resp: RefreshResponse = serde_json::from_str(&body)?;
+        Ok((
+            AuthTokens {
+                access_token: refresh_resp.AccessToken,
+                refresh_token: refresh_resp.RefreshToken,
+                uid: refresh_resp.UID,
+            },
+            refresh_resp.Scope,
+            refresh_resp.Scopes.unwrap_or_default(),
+        ))
+    }
+
     fn get_auth_info(&self, username: &str) -> Result<AuthInfoResponse> {
         let resp = self
             .client
@@ -277,6 +317,7 @@ pub struct TokenManager {
     auth: AuthClient,
     tokens: Option<AuthTokens>,
     expires_at: Option<Instant>,
+    last_refresh_scopes: Option<(Option<String>, Vec<String>)>,
 }
 
 impl TokenManager {
@@ -285,6 +326,7 @@ impl TokenManager {
             auth: AuthClient::new(),
             tokens: None,
             expires_at: None,
+            last_refresh_scopes: None,
         }
     }
 
@@ -314,7 +356,6 @@ impl TokenManager {
         self.tokens = Some(tokens);
         Ok(())
     }
-
     pub fn restore_tokens(&mut self, tokens: AuthTokens) {
         self.tokens = Some(tokens);
         self.expires_at = None;
@@ -346,10 +387,21 @@ impl TokenManager {
         if tokens.refresh_token.is_empty() {
             return Err(ProtonError::Auth("No refresh token available".into()));
         }
-        let new_tokens = self.auth.refresh(&tokens.refresh_token, &tokens.uid)?;
+        let (new_tokens, scope, scopes) = self
+            .auth
+            .refresh_verbose(&tokens.refresh_token, &tokens.uid)?;
+        self.last_refresh_scopes = Some((scope, scopes));
         self.expires_at = Some(Instant::now() + Duration::from_secs(3600));
         self.tokens = Some(new_tokens);
         Ok(())
+    }
+
+    /// Scope info from the most recent refresh (None when no refresh ran
+    /// this process). Compact `Scope|a,b,c` form is log-safe.
+    pub fn last_refresh_scopes(&self) -> Option<String> {
+        self.last_refresh_scopes.as_ref().map(|(scope, scopes)| {
+            format!("{}|{}", scope.as_deref().unwrap_or("?"), scopes.join(","))
+        })
     }
 
     pub fn uid(&self) -> Option<&str> {
@@ -499,6 +551,10 @@ struct RefreshResponse {
     RefreshToken: String,
     UID: String,
     ExpiresIn: i64,
+    #[serde(default)]
+    Scope: Option<String>,
+    #[serde(default)]
+    Scopes: Option<Vec<String>>,
 }
 
 struct SrpProofs {
