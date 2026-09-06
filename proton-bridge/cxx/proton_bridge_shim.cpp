@@ -442,6 +442,20 @@ void ProtonContactsPlugin::pollStatus()
         auto code = Buteo::SyncResults::AUTHENTICATION_FAILURE;
         sendProtonNotification(QStringLiteral("Proton Contacts sync failed"), errMsg);
         emit error(getProfileName(), errMsg, code);
+    } else if (state == QLatin1String("needs_2fa")) {
+        // Distinct from generic auth failure: the account needs a fresh OTP
+        // code (Settings → Proton → Update credentials). Without this branch
+        // the poll timer would spin forever on a non-terminal state.
+        m_timer->stop();
+        QString errMsg = QString::fromUtf8(reinterpret_cast<const char*>(status.error),
+                                           strnlen(reinterpret_cast<const char*>(status.error), 256));
+        if (errMsg.isEmpty()) {
+            errMsg = QStringLiteral("Two-factor authentication required");
+        }
+        proton_log(QStringLiteral("Sync needs 2FA: ") + errMsg);
+        sendProtonNotification(QStringLiteral("Proton Contacts needs verification"),
+                               errMsg + QStringLiteral(" – open Settings → Accounts → Proton, update credentials and enter your one-time code"));
+        emit error(getProfileName(), errMsg, Buteo::SyncResults::AUTHENTICATION_FAILURE);
     }
 }
 

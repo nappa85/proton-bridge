@@ -3,7 +3,7 @@ Summary:        Buteo sync plugin for Proton Contacts
 Version:        0.1.0
 Release:        1
 License:        GPL-3.0-or-later
-URL:            https://github.com/yourusername/sailfish-proton
+URL:            https://github.com/nappa85/sailfish-proton
 Source0:        %{name}-%{version}.tar.bz2
 
 Requires:       buteo-syncfw-qt5 >= 0.11

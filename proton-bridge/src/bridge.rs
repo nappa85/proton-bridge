@@ -478,3 +478,52 @@ pub extern "C" fn proton_calendar_get_uid(e: *mut ProtonCalendarEngine) -> *mut 
         None => std::ptr::null_mut(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn decode_state(status: &ProtonBridgeStatus) -> String {
+        let len = status
+            .state
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(status.state.len());
+        String::from_utf8_lossy(&status.state[..len]).into_owned()
+    }
+
+    fn decode_error(status: &ProtonBridgeStatus) -> String {
+        let len = status
+            .error
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(status.error.len());
+        String::from_utf8_lossy(&status.error[..len]).into_owned()
+    }
+
+    #[test]
+    fn test_status_needs_2fa_round_trips_over_ffi() {
+        // The C++ shim branches on the literal "needs_2fa": it must survive
+        // the fixed-size FFI buffers intact (state has 16 bytes, it needs 9).
+        let sync = SyncStatus {
+            state: "needs_2fa".into(),
+            error: Some("2FA verification required".into()),
+            ..Default::default()
+        };
+        let bridge = ProtonBridgeStatus::from_sync_status(&sync);
+        assert_eq!(decode_state(&bridge), "needs_2fa");
+        assert_eq!(decode_error(&bridge), "2FA verification required");
+    }
+
+    #[test]
+    fn test_status_error_round_trips_over_ffi() {
+        let sync = SyncStatus {
+            state: "error".into(),
+            error: Some("Auth failed: bad password".into()),
+            ..Default::default()
+        };
+        let bridge = ProtonBridgeStatus::from_sync_status(&sync);
+        assert_eq!(decode_state(&bridge), "error");
+        assert!(decode_error(&bridge).contains("bad password"));
+    }
+}

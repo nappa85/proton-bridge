@@ -133,11 +133,11 @@ impl SyncEngine {
         }
 
         if let Err(e) = self.authenticate(&config) {
-            self.set_status(SyncStatus {
-                state: "error".into(),
-                error: Some(format!("Auth failed: {e}")),
-                ..Default::default()
-            });
+            // Preserve the distinct needs_2fa state (OTP code required):
+            // authenticate() already set it with the right message, and the
+            // sync plugin turns it into an "OTP required" notification
+            // instead of a generic auth failure.
+            self.set_status(Self::auth_error_status(&self.status(), &e));
             return;
         }
 
@@ -820,7 +820,51 @@ impl SyncEngine {
         *self.status.lock().unwrap() = status;
     }
 
+    /// Maps an `authenticate` failure to the status `run_sync` reports.
+    /// A `needs_2fa` state set by `authenticate` (OTP code required) is
+    /// preserved as-is so the sync plugin can notify distinctly; anything
+    /// else collapses to a generic auth error.
+    fn auth_error_status(current: &SyncStatus, err: &proton_api::ProtonError) -> SyncStatus {
+        if current.state == "needs_2fa" {
+            current.clone()
+        } else {
+            SyncStatus {
+                state: "error".into(),
+                error: Some(format!("Auth failed: {err}")),
+                ..Default::default()
+            }
+        }
+    }
+
     fn should_abort(&self) -> bool {
         *self.abort_flag.lock().unwrap()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_auth_error_preserves_needs_2fa() {
+        let current = SyncStatus {
+            state: "needs_2fa".into(),
+            error: Some("2FA verification required".into()),
+            ..Default::default()
+        };
+        let err = proton_api::ProtonError::Auth("2FA_REQUIRED".into());
+        assert_eq!(SyncEngine::auth_error_status(&current, &err), current);
+    }
+
+    #[test]
+    fn test_auth_error_collapses_generic_failures() {
+        let current = SyncStatus {
+            state: "syncing".into(),
+            ..Default::default()
+        };
+        let err = proton_api::ProtonError::Auth("bad password".into());
+        let out = SyncEngine::auth_error_status(&current, &err);
+        assert_eq!(out.state, "error");
+        assert!(out.error.unwrap_or_default().contains("bad password"));
     }
 }
