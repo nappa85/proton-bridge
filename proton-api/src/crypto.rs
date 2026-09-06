@@ -171,6 +171,48 @@ pub fn decrypt_with_key(encrypted_data: &str, key: &mut UnlockedKey) -> Result<S
     String::from_utf8(decrypted).map_err(|e| ProtonError::Crypto(format!("UTF-8: {e}")))
 }
 
+pub fn decrypt_bytes_with_key(encrypted_bytes: &[u8], key: &mut UnlockedKey) -> Result<String> {
+    let p = &StandardPolicy::new();
+    let helper = Helper { key };
+    let mut decryptor = DecryptorBuilder::from_bytes(encrypted_bytes)
+        .map_err(|e| ProtonError::Crypto(format!("Parse message: {e}")))?
+        .with_policy(p, None, helper)
+        .map_err(|e| ProtonError::Crypto(format!("Decrypt: {e}")))?;
+    let mut decrypted = Vec::new();
+    std::io::Read::read_to_end(&mut decryptor, &mut decrypted)
+        .map_err(|e| ProtonError::Crypto(format!("Read: {e}")))?;
+    String::from_utf8(decrypted).map_err(|e| ProtonError::Crypto(format!("UTF-8: {e}")))
+}
+
+pub fn decrypt_raw_with_key(encrypted_data: &str, key: &mut UnlockedKey) -> Result<Vec<u8>> {
+    let p = &StandardPolicy::new();
+    let helper = Helper { key };
+    let mut decryptor = DecryptorBuilder::from_bytes(encrypted_data.as_bytes())
+        .map_err(|e| ProtonError::Crypto(format!("Parse message: {e}")))?
+        .with_policy(p, None, helper)
+        .map_err(|e| ProtonError::Crypto(format!("Decrypt: {e}")))?;
+    let mut decrypted = Vec::new();
+    std::io::Read::read_to_end(&mut decryptor, &mut decrypted)
+        .map_err(|e| ProtonError::Crypto(format!("Read: {e}")))?;
+    Ok(decrypted)
+}
+
+pub fn decrypt_raw_bytes_with_key(
+    encrypted_bytes: &[u8],
+    key: &mut UnlockedKey,
+) -> Result<Vec<u8>> {
+    let p = &StandardPolicy::new();
+    let helper = Helper { key };
+    let mut decryptor = DecryptorBuilder::from_bytes(encrypted_bytes)
+        .map_err(|e| ProtonError::Crypto(format!("Parse message: {e}")))?
+        .with_policy(p, None, helper)
+        .map_err(|e| ProtonError::Crypto(format!("Decrypt: {e}")))?;
+    let mut decrypted = Vec::new();
+    std::io::Read::read_to_end(&mut decryptor, &mut decrypted)
+        .map_err(|e| ProtonError::Crypto(format!("Read: {e}")))?;
+    Ok(decrypted)
+}
+
 pub fn decrypt_contact_card(
     encrypted_data: &str,
     unlocked_keys: &mut [UnlockedKey],

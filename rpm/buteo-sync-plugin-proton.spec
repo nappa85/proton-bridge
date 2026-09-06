@@ -8,6 +8,8 @@ Source0:        %{name}-%{version}.tar.bz2
 
 Requires:       buteo-syncfw-qt5 >= 0.11
 Requires:       qt5-qtpim-contacts
+Requires:       mkcal-qt5
+Requires:       kf5-calendarcore
 Requires:       libaccounts-qt5 >= 1.16
 Requires:       libsignon-qt5 >= 8.61
 Requires:       glibc >= 2.17

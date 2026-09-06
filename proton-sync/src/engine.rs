@@ -409,12 +409,17 @@ impl SyncEngine {
             }
         };
         let salts = match keys_client.get_key_salts() {
-            Ok(s) => s,
+            Ok(s) => (s, None),
             Err(e) => {
-                self.keys_debug = Some(format!("get_salts_err={e}"));
-                return Err(e);
+                // Best-effort (see calendar.rs): restored sessions lack the
+                // elevated ("locked") scope for salts (403/9101). Derived +
+                // Token paths proceed without them.
+                let msg = format!("{e}");
+                let short: String = msg.chars().take(80).collect();
+                (Vec::new(), Some(format!("salts_unavailable:{short}")))
             }
         };
+        let (salts, salts_note) = salts;
         let addresses = match keys_client.get_addresses() {
             Ok(a) => a,
             Err(e) => {
@@ -427,6 +432,9 @@ impl SyncEngine {
         let mut derived_map: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
         let mut debug_parts: Vec<String> = Vec::new();
+        if let Some(note) = salts_note {
+            debug_parts.push(note);
+        }
         debug_parts.push(format!("user_keys={}", user.Keys.len()));
         debug_parts.push(format!("salts={}", salts.len()));
         debug_parts.push(format!("addrs={}", addresses.len()));
@@ -511,6 +519,57 @@ impl SyncEngine {
                 let salt = salts.iter().find(|s| s.ID == key.ID);
                 let has_token = !key.Token.is_empty();
 
+                // Token path first (go-proton-api Key::Unlock): Token is an
+                // armored PGP message encrypted to a user key whose binary
+                // content IS this address key's passphrase. Signature verify
+                // is lenient-skipped (proton-cal behavior).
+                if has_token && !unlocked_keys.is_empty() {
+                    if let Some(secret) = Self::decrypt_token_secret(&key.Token, &mut unlocked_keys)
+                    {
+                        match UnlockedKey::from_armored(&key.PrivateKey, &secret) {
+                            Ok(unlocked) => {
+                                debug_parts.push(format!(
+                                    "addrkey_{}_ok_via_token",
+                                    &key.ID[..8.min(key.ID.len())]
+                                ));
+                                if !config.password.is_empty() {
+                                    derived_map.insert(
+                                        key.ID.clone(),
+                                        base64::engine::general_purpose::STANDARD.encode(&secret),
+                                    );
+                                } else if config
+                                    .derived_passwords
+                                    .as_ref()
+                                    .and_then(|m| m.get(&key.ID))
+                                    .is_none()
+                                {
+                                    // Cache Token-derived secret even in derived-only
+                                    // mode so future runs can use the fast path.
+                                    derived_map.insert(
+                                        key.ID.clone(),
+                                        base64::engine::general_purpose::STANDARD.encode(&secret),
+                                    );
+                                }
+                                unlocked_keys.push(unlocked);
+                                continue;
+                            }
+                            Err(e) => {
+                                debug_parts.push(format!(
+                                    "addrkey_{}_token_unlock_err={}",
+                                    &key.ID[..8.min(key.ID.len())],
+                                    e
+                                ));
+                                // Fall through to salt path.
+                            }
+                        }
+                    } else {
+                        debug_parts.push(format!(
+                            "addrkey_{}_token_decrypt_fail",
+                            &key.ID[..8.min(key.ID.len())]
+                        ));
+                    }
+                }
+
                 let passphrase = Self::get_passphrase_for_key(
                     &key.ID,
                     &config.password,
@@ -568,6 +627,21 @@ impl SyncEngine {
             *self.derived_passwords.lock().unwrap() = Some(derived_map);
         }
         Ok(unlocked_keys)
+    }
+
+    /// Decrypt an address-key Token with any unlocked user key.
+    /// Per go-proton-api `Key::getPassphraseFromToken`: Token is armored PGP
+    /// to userKR; binary plaintext is the address key passphrase. Signature
+    /// verification is intentionally lenient-skipped (proton-cal behavior).
+    fn decrypt_token_secret(token_armored: &str, user_keys: &mut [UnlockedKey]) -> Option<Vec<u8>> {
+        for uk in user_keys.iter_mut() {
+            if let Ok(secret) = proton_api::crypto::decrypt_raw_with_key(token_armored, uk) {
+                if !secret.is_empty() {
+                    return Some(secret);
+                }
+            }
+        }
+        None
     }
 
     fn get_passphrase_for_key(

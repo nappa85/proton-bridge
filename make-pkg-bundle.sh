@@ -65,6 +65,13 @@ if [ -d "$repo_root/buteo-syncfw/libbuteosyncfw" ]; then
     done
 fi
 
+# Device-versioned mKCal/KCalendarCore headers (exact -devel RPM content from
+# the phone: mkcal-qt5-devel-0.7.33, kf5-calendarcore-devel-5.116.0). The SDK
+# sysroot ships the .so files but not these headers.
+mkdir -p "$packaging_dir/device-headers"
+cp -r "$repo_root/proton-bridge/device-headers/mkcal-qt5" "$packaging_dir/device-headers/"
+cp -r "$repo_root/proton-bridge/device-headers/KF5" "$packaging_dir/device-headers/"
+
 docker run --rm --user root \
     -v "$packaging_dir":/home/mersdk/packaging \
     coderus/sailfishos-platform-sdk-aarch64 bash -c '
@@ -83,7 +90,8 @@ ln -sf /opt/cross/bin/aarch64-meego-linux-gnu-as /opt/cross/bin/as 2>/dev/null |
 ln -sf libbuteosyncfw5.so.0 $TARGET_ROOT/usr/lib64/libbuteosyncfw5.so 2>/dev/null || true
 ln -sf libQt5Core.so.5 $TARGET_ROOT/usr/lib64/libQt5Core.so 2>/dev/null || true
 ln -sf libQt5Contacts.so.5 $TARGET_ROOT/usr/lib64/libQt5Contacts.so 2>/dev/null || true
-ln -sf libQt5Organizer.so.5 $TARGET_ROOT/usr/lib64/libQt5Organizer.so 2>/dev/null || true
+ln -sf libmkcal-qt5.so.0 $TARGET_ROOT/usr/lib64/libmkcal-qt5.so 2>/dev/null || true
+ln -sf libKF5CalendarCore.so.5 $TARGET_ROOT/usr/lib64/libKF5CalendarCore.so 2>/dev/null || true
 ln -sf libaccounts-qt5.so.1 $TARGET_ROOT/usr/lib64/libaccounts-qt5.so 2>/dev/null || true
 ln -sf libsignon-qt5.so.1 $TARGET_ROOT/usr/lib64/libsignon-qt5.so 2>/dev/null || true
 ln -sf libsignon-plugins-common.so.1 $TARGET_ROOT/usr/lib64/libsignon-plugins-common.so 2>/dev/null || true
@@ -93,10 +101,13 @@ ln -sf libQt5Network.so.5 $TARGET_ROOT/usr/lib64/libQt5Network.so 2>/dev/null ||
 
 BUTEO_INC="-I/home/mersdk/packaging/buteo-headers \
     -I/home/mersdk/packaging/buteo-headers/Buteo \
+    -I/home/mersdk/packaging/device-headers/mkcal-qt5 \
+    -I/home/mersdk/packaging/device-headers/KF5 \
+    -I/home/mersdk/packaging/device-headers/KF5/KCalendarCore \
     -I$TARGET_ROOT/usr/include/qt5 \
     -I$TARGET_ROOT/usr/include/qt5/QtCore \
+    -I$TARGET_ROOT/usr/include/qt5/QtGui \
     -I$TARGET_ROOT/usr/include/qt5/QtContacts \
-    -I$TARGET_ROOT/usr/include/qt5/QtOrganizer \
     -I$TARGET_ROOT/usr/include/qt5/QtDBus \
     -I$TARGET_ROOT/usr/include/qt5/QtXml \
     -I$TARGET_ROOT/usr/include/qt5/QtNetwork \
@@ -144,7 +155,8 @@ aarch64-meego-linux-gnu-g++ \
     -lbuteosyncfw5 \
     -lQt5Core \
     -lQt5Contacts \
-    -lQt5Organizer \
+    -lmkcal-qt5 \
+    -lKF5CalendarCore \
     -lQt5DBus \
     -lQt5Xml \
     -lQt5Network \
@@ -201,7 +213,22 @@ echo "========================================="
 echo " Step 3: Deploy to phone                 "
 echo "========================================="
 
-PHONE_IP="${1:-192.168.1.124}"
+# Usage: ./make-pkg-bundle.sh [PHONE_IP] [--no-deploy]
+# --no-deploy (or SKIP_DEPLOY=1) builds everything but skips all ssh/scp
+# contact with the phone.
+SKIP_DEPLOY="${SKIP_DEPLOY:-0}"
+PHONE_IP="192.168.1.124"
+for arg in "$@"; do
+    case "$arg" in
+        --no-deploy) SKIP_DEPLOY=1 ;;
+        *) PHONE_IP="$arg" ;;
+    esac
+done
+if [ "$SKIP_DEPLOY" = "1" ]; then
+    echo "Skipping deploy (--no-deploy). Artifacts are in $packaging_dir."
+    echo "Done. Copy to phone manually, then test with: ssh defaultuser@$PHONE_IP 'DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/100000/dbus/user_bus_socket dbus-send --session --print-reply --dest=com.meego.msyncd /synchronizer com.meego.msyncd.startSync string:proton.Contacts-2'"
+    exit 0
+fi
 BUTEO_PLUGIN="$packaging_dir/buteo-plugin/libproton-client.so"
 # Plugin is now correctly named libprotonplugin.so
 if [ -f "$packaging_dir/signon-plugin/libprotonplugin.so" ]; then

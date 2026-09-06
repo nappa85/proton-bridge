@@ -89,7 +89,9 @@ Sync (buteo OOPP, proton_bridge_shim.cpp, NoUserInteractionPolicy):
 
 ## Known Issues / TODO
 
-- **Token-based address keys**: Address keys with non-empty `Token` field can't be decrypted yet — contacts using those keys won't sync (shows `addrkey_…_no_pp_token=true` in `Keys debug`)
+- **Token-based address keys**: FIXED 2026-09-06 — `Token` is decrypted with
+  the unlocked user keys (go-proton-api `Key::Unlock`), verified live on
+  device (`addrkey_…_ok_via_token` with `pw_len=0`)
 - **Two-way sync**: Currently download-only (Proton → phone). No upload of local changes
 - **Incremental sync**: No sync token support; full fetch every time
 - **Contact dedup**: No duplicate detection across Proton + local contacts

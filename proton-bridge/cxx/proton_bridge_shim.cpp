@@ -759,6 +759,14 @@ QPair<QString, QString> ProtonContactsPlugin::loadPersistedTokens()
 }
 
 // ---- Calendar (single .so, single Sync Protocol "proton") ----
+// Real implementation: SignOn (NoUserInteraction) → Rust CalendarSyncEngine
+// (bootstrap → unlock → windowed decrypt → JSON) → QOrganizer mkcal.
+// Mirrors ProtonContactsPlugin credential handling; per-account collection
+// "Proton Calendar (<accountId>)", full-replacement sync via GUID
+// "proton-cal-<accountId>-<eventId>" (recurrence limited to FREQ daily/weekly/
+// monthly/yearly v1 – see FINDINGS_CALENDAR.md).
+static const QString PROTON_CALDAV_SERVICE_NAME = QStringLiteral("proton-caldav");
+
 ProtonCalendarPlugin::ProtonCalendarPlugin(const QString &aPluginName,
                                            const Buteo::SyncProfile &aProfile,
                                            Buteo::PluginCbInterface *aCbInterface)
@@ -766,44 +774,561 @@ ProtonCalendarPlugin::ProtonCalendarPlugin(const QString &aPluginName,
 {
     proton_log(QStringLiteral("ProtonCalendarPlugin constructed: ") + aPluginName + " profile=" + getProfileName());
 }
-ProtonCalendarPlugin::~ProtonCalendarPlugin() {}
+ProtonCalendarPlugin::~ProtonCalendarPlugin() {
+    if (m_calEngine) {
+        proton_calendar_destroy_engine(m_calEngine);
+        m_calEngine = nullptr;
+    }
+}
 bool ProtonCalendarPlugin::init() {
-    proton_log(QStringLiteral("ProtonCalendarPlugin::init() profile=") + getProfileName() + " - calendar sync init (mKCal via QOrganizer)");
-    QtOrganizer::QOrganizerManager testMgr(QStringLiteral("mkcal"));
-    if (testMgr.error() != QtOrganizer::QOrganizerManager::NoError) {
-        proton_log(QStringLiteral("ProtonCalendarPlugin::init() QOrganizerManager mkcal error: ") + QString::number(testMgr.error()));
+    proton_log(QStringLiteral("ProtonCalendarPlugin::init() profile=") + getProfileName());
+    // Storage backend is mKCal + KCalendarCore (the documented Sailfish stack;
+    // QtOrganizer is not shipped on this image). Probe open here so failures
+    // surface at init instead of mid-sync.
+    mKCal::ExtendedCalendar::Ptr cal(new mKCal::ExtendedCalendar(QTimeZone::systemTimeZone()));
+    mKCal::ExtendedStorage::Ptr storage = mKCal::ExtendedCalendar::defaultStorage(cal);
+    if (!storage->open()) {
+        proton_log(QStringLiteral("ProtonCalendarPlugin::init() mKCal storage open failed"));
     } else {
-        proton_log(QStringLiteral("ProtonCalendarPlugin::init() QOrganizerManager mkcal ready, collections=") + QString::number(testMgr.collections().size()));
+        proton_log(QStringLiteral("ProtonCalendarPlugin::init() mKCal ready, notebooks=") + QString::number(storage->notebooks().size()));
+        mKCal::SqliteStorage::Ptr sql = storage.dynamicCast<mKCal::SqliteStorage>();
+        if (sql) {
+            proton_log(QStringLiteral("ProtonCalendarPlugin::init() mKCal db=") + sql->databaseName());
+        }
+    }
+    m_accountId = iProfile.key(QStringLiteral("accountid"));
+    if (m_accountId.isEmpty()) {
+        QString profileName = getProfileName();
+        QRegularExpression re("-(\\d+)$");
+        QRegularExpressionMatch match = re.match(profileName);
+        if (match.hasMatch()) {
+            m_accountId = match.captured(1);
+        }
+    }
+    if (m_accountId.isEmpty()) {
+        m_accountId = iProfile.key(QStringLiteral("account_id"));
+    }
+    if (m_accountId.isEmpty()) {
+        proton_log(QStringLiteral("ERROR: Cannot determine accountid for calendar"));
+        return false;
+    }
+    m_accountManager = new Accounts::Manager(this);
+    if (!m_accountManager) {
+        return false;
     }
     m_inited = true;
+    return requestCalendarCredentials();
+}
+bool ProtonCalendarPlugin::uninit() {
+    if (m_calTimer) {
+        m_calTimer->stop();
+        delete m_calTimer;
+        m_calTimer = nullptr;
+    }
+    if (m_calEngine) {
+        proton_calendar_destroy_engine(m_calEngine);
+        m_calEngine = nullptr;
+    }
+    m_credentialsReady = false;
+    m_inited = false;
     return true;
 }
-bool ProtonCalendarPlugin::uninit() { m_inited = false; return true; }
+bool ProtonCalendarPlugin::requestCalendarCredentials() {
+    Accounts::AccountId accId = static_cast<Accounts::AccountId>(m_accountId.toUInt());
+    Accounts::Account *account = Accounts::Account::fromId(m_accountManager, accId, this);
+    if (!account) {
+        proton_log(QStringLiteral("ERROR: Unable to load account ") + m_accountId);
+        return false;
+    }
+    Accounts::Service service = m_accountManager->service(PROTON_CALDAV_SERVICE_NAME);
+    if (!service.isValid()) {
+        // Shared identity lives on the contacts service; fall back.
+        service = m_accountManager->service(PROTON_SERVICE_NAME);
+    }
+    if (!service.isValid()) {
+        proton_log(QStringLiteral("ERROR: Unable to find calendar/contacts service"));
+        return false;
+    }
+    account->selectService(service);
+    Accounts::AccountService *accountService = new Accounts::AccountService(account, service, this);
+    Accounts::AuthData authData = accountService->authData();
+    quint32 credentialsId = authData.credentialsId();
+    if (credentialsId == 0) {
+        account->selectService(service);
+        QVariant raw = account->value(QStringLiteral("CredentialsId"));
+        if (raw.isValid() && raw.toUInt() > 0) {
+            credentialsId = raw.toUInt();
+            account->setCredentialsId(credentialsId);
+            account->sync();
+        }
+    }
+    if (credentialsId == 0) {
+        account->selectService(Accounts::Service());
+        credentialsId = account->credentialsId();
+        if (credentialsId > 0) {
+            account->selectService(service);
+        }
+    }
+    m_identity = SignOn::Identity::existingIdentity(credentialsId, this);
+    if (!m_identity) {
+        return false;
+    }
+    m_authSession = m_identity->createSession(authData.method());
+    if (!m_authSession) {
+        return false;
+    }
+    connect(m_authSession, &SignOn::AuthSession::response,
+            this, &ProtonCalendarPlugin::onCalendarSignOnResponse);
+    connect(m_authSession, &SignOn::AuthSession::error,
+            this, &ProtonCalendarPlugin::onCalendarSignOnError);
+    SignOn::SessionData sessionData;
+    sessionData.setUiPolicy(SignOn::NoUserInteractionPolicy);
+    m_authSession->process(sessionData, authData.mechanism());
+    return true;
+}
+void ProtonCalendarPlugin::onCalendarSignOnResponse(const SignOn::SessionData &data) {
+    bool twoFARequired = data.getProperty(QStringLiteral("TwoFARequired")).toBool();
+    if (twoFARequired) {
+        emit error(getProfileName(), QStringLiteral("Two-factor authentication required – please update credentials in Settings → Proton and enter OTP code"), Buteo::SyncResults::AUTHENTICATION_FAILURE);
+        return;
+    }
+    QString username = data.UserName();
+    QString userNameViaProperty = data.getProperty(QStringLiteral("UserName")).toString();
+    if (username.isEmpty() && !userNameViaProperty.isEmpty()) username = userNameViaProperty;
+    QString accessToken = data.getProperty(QStringLiteral("AccessToken")).toString();
+    QString refreshToken = data.getProperty(QStringLiteral("RefreshToken")).toString();
+    QString uid = data.getProperty(QStringLiteral("Uid")).toString();
+    QString derivedJson = data.getProperty(QStringLiteral("DerivedPasswords")).toString();
+    if (refreshToken.isEmpty() || uid.isEmpty()) {
+        auto tokens = loadPersistedCalendarTokens();
+        if (refreshToken.isEmpty()) refreshToken = tokens.first;
+        if (uid.isEmpty()) uid = tokens.second;
+    }
+    if (derivedJson.isEmpty()) {
+        QSettings settings(QStringLiteral("proton"), QStringLiteral("sync-tokens"));
+        settings.beginGroup(m_accountId);
+        derivedJson = settings.value(QStringLiteral("derived_passwords")).toString();
+        settings.endGroup();
+        if (derivedJson.isEmpty() && !uid.isEmpty()) {
+            settings.beginGroup(uid);
+            derivedJson = settings.value(QStringLiteral("derived_passwords")).toString();
+            settings.endGroup();
+        }
+        if (derivedJson.isEmpty() && !username.isEmpty()) {
+            settings.beginGroup(username);
+            derivedJson = settings.value(QStringLiteral("derived_passwords")).toString();
+            settings.endGroup();
+        }
+    }
+    if (accessToken.isEmpty() && refreshToken.isEmpty()) {
+        emit error(getProfileName(), QStringLiteral("No auth tokens received"), Buteo::SyncResults::AUTHENTICATION_FAILURE);
+        return;
+    }
+    m_calEngine = proton_calendar_create_engine_with_derived(
+        username.toUtf8().constData(),
+        accessToken.toUtf8().constData(),
+        refreshToken.toUtf8().constData(),
+        uid.toUtf8().constData(),
+        derivedJson.toUtf8().constData());
+    if (!m_calEngine) {
+        emit error(getProfileName(), QStringLiteral("Failed to create calendar engine"), Buteo::SyncResults::INTERNAL_ERROR);
+        return;
+    }
+    m_credentialsReady = true;
+    m_calTimer = new QTimer(this);
+    connect(m_calTimer, &QTimer::timeout, this, &ProtonCalendarPlugin::pollCalendarStatus);
+    if (!startSync()) {
+        emit error(getProfileName(), QStringLiteral("Failed to start calendar sync"), Buteo::SyncResults::INTERNAL_ERROR);
+    }
+}
+void ProtonCalendarPlugin::onCalendarSignOnError(const SignOn::Error &signOnError) {
+    emit error(getProfileName(), QStringLiteral("Authentication failed: ") + signOnError.message(), Buteo::SyncResults::AUTHENTICATION_FAILURE);
+}
 bool ProtonCalendarPlugin::startSync() {
-    proton_log(QStringLiteral("ProtonCalendarPlugin::startSync() for ") + getProfileName() + " - calendar sync via QOrganizer mkcal"));
-    QtOrganizer::QOrganizerManager mgr(QStringLiteral("mkcal"));
-    if (mgr.error() != QtOrganizer::QOrganizerManager::NoError) {
-        proton_log(QStringLiteral("ProtonCalendarPlugin::startSync() mkcal error ") + QString::number(mgr.error()));
-        emit error(getProfileName(), QStringLiteral("Calendar storage not available"), Buteo::SyncResults::INTERNAL_ERROR);
+    if (!m_credentialsReady) {
+        return true;
+    }
+    if (!m_calEngine) {
+        emit error(getProfileName(), QStringLiteral("Calendar engine not initialized"), Buteo::SyncResults::INTERNAL_ERROR);
         return false;
     }
-    QtOrganizer::QOrganizerEvent ev;
-    ev.setDisplayLabel(QStringLiteral("Proton Calendar sync active"));
-    ev.setDescription(QStringLiteral("Proton Calendar stub - VEVENT decrypt to mKCal next"));
-    QDateTime now = QDateTime::currentDateTime();
-    ev.setStartDateTime(now);
-    ev.setEndDateTime(now.addSecs(3600));
-    ev.setCollectionId(mgr.defaultCollectionId());
-    if (!mgr.saveItem(&ev)) {
-        proton_log(QStringLiteral("ProtonCalendarPlugin::startSync() saveItem failed: ") + QString::number(mgr.error()));
-        emit error(getProfileName(), QStringLiteral("Failed to save calendar event"), Buteo::SyncResults::INTERNAL_ERROR);
+    if (!proton_calendar_start_sync(m_calEngine)) {
+        emit error(getProfileName(), QStringLiteral("Failed to start calendar sync"), Buteo::SyncResults::INTERNAL_ERROR);
         return false;
     }
-    proton_log(QStringLiteral("ProtonCalendarPlugin::startSync() saved test event ") + ev.id().toString());
-    emit success(getProfileName(), QStringLiteral("Proton Calendar sync stub - 1 test event written to mkcal"));
+    m_calTimer->start(500);
     return true;
 }
-void ProtonCalendarPlugin::abortSync(Sync::SyncStatus aStatus) { Q_UNUSED(aStatus); }
+void ProtonCalendarPlugin::pollCalendarStatus() {
+    if (!m_calEngine) return;
+    ProtonBridgeStatus status;
+    proton_calendar_get_status(m_calEngine, &status);
+    QString state = QString::fromUtf8(reinterpret_cast<const char*>(status.state),
+                                      strnlen(reinterpret_cast<const char*>(status.state), 16));
+    if (state == QLatin1String("complete")) {
+        m_calTimer->stop();
+        char *rt = proton_calendar_get_refresh_token(m_calEngine);
+        char *uid = proton_calendar_get_uid(m_calEngine);
+        if (rt && uid) {
+            persistCalendarTokens(QString::fromUtf8(rt), QString::fromUtf8(uid));
+        }
+        if (rt) proton_bridge_free_string(rt);
+        if (uid) proton_bridge_free_string(uid);
+        char *keysDbg = proton_calendar_get_keys_debug(m_calEngine);
+        if (keysDbg) {
+            proton_log(QStringLiteral("Calendar keys debug: ") + QString::fromUtf8(keysDbg));
+            proton_bridge_free_string(keysDbg);
+        }
+        char *json = proton_calendar_get_events_json(m_calEngine);
+        if (json) {
+            QByteArray jsonData(json);
+            proton_bridge_free_string(json);
+            if (writeEventsToMkCal(jsonData)) {
+                emit success(getProfileName(), QStringLiteral("Calendar sync completed"));
+            } else {
+                emit error(getProfileName(), QStringLiteral("Failed to write calendar events"), Buteo::SyncResults::INTERNAL_ERROR);
+                sendProtonNotification(QStringLiteral("Proton Calendar sync failed"), QStringLiteral("Failed to write events to phone"));
+            }
+        } else {
+            emit success(getProfileName(), QStringLiteral("Calendar sync completed (no events)"));
+        }
+    } else if (state == QLatin1String("error")) {
+        m_calTimer->stop();
+        QString errMsg = QString::fromUtf8(reinterpret_cast<const char*>(status.error),
+                                           strnlen(reinterpret_cast<const char*>(status.error), 256));
+        proton_log(QStringLiteral("Calendar sync error: ") + errMsg);
+        sendProtonNotification(QStringLiteral("Proton Calendar sync failed"), errMsg);
+        emit error(getProfileName(), errMsg, Buteo::SyncResults::AUTHENTICATION_FAILURE);
+    }
+}
+// Forward: version-independent unix→UTC (defined with the other file-local
+// helpers below; needed by parseCalTime).
+static QDateTime utcFromUnix(qint64 secs);
+QDateTime ProtonCalendarPlugin::parseCalTime(const QString &ical, qint64 unixFallback, const QString &tz) {
+    // Accept UTC (…Z), floating, DATE-only, and TZID-stripped values (parse_ical
+    // already strips params). Fall back to row unix time + timezone.
+    auto parseFormats = [&](const QString &v) -> QDateTime {
+        QString s = v.trimmed();
+        if (s.isEmpty()) return QDateTime();
+        // DATE-only all-day.
+        if (s.length() == 8 && !s.contains('T')) {
+            QDate d = QDate::fromString(s, QStringLiteral("yyyyMMdd"));
+            if (d.isValid()) return QDateTime(d, QTime(0, 0), Qt::UTC);
+        }
+        QStringList fmts = { QStringLiteral("yyyyMMdd'T'HHmmss'Z'"), QStringLiteral("yyyyMMdd'T'HHmmss"), QStringLiteral("yyyy-MM-ddTHH:mm:ss'Z'"), QStringLiteral("yyyy-MM-ddTHH:mm:ss") };
+        for (const QString &f : fmts) {
+            QDateTime dt = QDateTime::fromString(s, f);
+            if (dt.isValid()) {
+                if (s.endsWith('Z')) dt.setTimeSpec(Qt::UTC);
+                return dt;
+            }
+        }
+        return QDateTime();
+    };
+    QDateTime dt = parseFormats(ical);
+    if (dt.isValid()) {
+        // Floating wall-clock + known event timezone (e.g. TZID-stripped
+        // "20260914T200000" + StartTimezone Europe/Rome): attach the zone so
+        // occurrence instants match the server's recurrenceId instants
+        // (T15 exception linkage, verified live 2026-09-06).
+        if (!ical.trimmed().endsWith('Z') && dt.timeSpec() == Qt::LocalTime
+            && !tz.isEmpty() && tz != QStringLiteral("UTC")) {
+            QTimeZone zone(tz.toUtf8());
+            if (zone.isValid()) {
+                QDateTime zoned(dt.date(), dt.time(), zone);
+                if (zoned.isValid()) return zoned;
+            }
+        }
+        return dt;
+    }
+    if (unixFallback > 0) {
+        // Qt 5.6 (Sailfish): no fromSecsSinceEpoch (Qt 5.8+); use the
+        // version-independent UTC construction (see utcFromUnix).
+        return utcFromUnix(unixFallback);
+    }
+    return QDateTime();
+}
+QString ProtonCalendarPlugin::findOrCreateNotebook(mKCal::ExtendedCalendar::Ptr cal,
+                                                       mKCal::ExtendedStorage::Ptr storage,
+                                                       const QString &calId,
+                                                       const QString &calName) {
+    Q_UNUSED(cal);
+    // One notebook per Proton calendar (T20 "porcodio" must be visibly
+    // separate). Legacy single notebook from the first version is cleaned
+    // up by the caller.
+    QString nbUid = QStringLiteral("proton-calendar-%1-%2").arg(m_accountId, calId);
+    mKCal::Notebook::List nbs = storage->notebooks();
+    for (const mKCal::Notebook::Ptr &nb : nbs) {
+        if (nb && nb->uid() == nbUid) {
+            return nbUid;
+        }
+    }
+    mKCal::Notebook::Ptr nb(new mKCal::Notebook());
+    nb->setUid(nbUid);
+    nb->setName(calName.isEmpty() ? QStringLiteral("Proton Calendar (%1)").arg(m_accountId) : calName);
+    nb->setDescription(QStringLiteral("Proton Calendar"));
+    nb->setPluginName(QStringLiteral("proton"));
+    nb->setAccount(m_accountId);
+    nb->setSyncProfile(getProfileName());
+    nb->setIsVisible(true);
+    nb->setIsReadOnly(false);
+    nb->setEventsAllowed(true);
+    nb->setTodosAllowed(false);
+    nb->setJournalsAllowed(false);
+    if (!storage->addNotebook(nb)) {
+        proton_log(QStringLiteral("Failed to create calendar notebook ") + nbUid);
+        return QString();
+    }
+    proton_log(QStringLiteral("Created calendar notebook ") + nbUid);
+    return nbUid;
+}
+
+static QString stripMailto(const QString &s) {
+    QString email = s.trimmed();
+    int mailto = email.toLower().indexOf(QStringLiteral("mailto:"));
+    if (mailto >= 0) {
+        email = email.mid(mailto + 7).split(';').first().trimmed();
+    }
+    return email;
+}
+
+// Unambiguous unix→UTC conversion. QDateTime::fromTime_t + setTimeSpec
+// round-trips through local time on some Qt versions (observed +2h shift on
+// device Qt 5.6: rid 20:00Z became 22:00Z, breaking recursAt linkage, while
+// host Qt kept the instant). Epoch + addSecs is identical everywhere.
+static QDateTime utcFromUnix(qint64 secs) {
+    QDateTime dt(QDate(1970, 1, 1), QTime(0, 0, 0), Qt::UTC);
+    return dt.addSecs(secs);
+}
+
+// Fill a KCalendarCore event from one JSON row (times precomputed by caller).
+// Recurrence linkage (recurrenceId) is handled by the caller: pass 1 adds
+// masters, pass 2 dissociates exceptions from them (T15).
+static void fillEventFromJson(const KCalendarCore::Event::Ptr &ev, const QJsonObject &o,
+                              const QString &uid, const QDateTime &start, const QDateTime &end,
+                              bool fullDay) {
+    ev->setUid(uid);
+    QString summary = o.value(QLatin1String("summary")).toString();
+    ev->setSummary(summary.isEmpty() ? uid : summary);
+    ev->setDescription(o.value(QLatin1String("description")).toString());
+    ev->setLocation(o.value(QLatin1String("location")).toString());
+    ev->setAllDay(fullDay);
+    ev->setDtStart(start);
+    ev->setDtEnd(end);
+    // Recurrence: FREQ + COUNT/UNTIL from the raw RRULE (verified T09–T14).
+    QString rrule = o.value(QLatin1String("rrule")).toString().toUpper();
+    if (rrule.contains(QStringLiteral("FREQ="))) {
+        KCalendarCore::RecurrenceRule::PeriodType period =
+            KCalendarCore::RecurrenceRule::rNone;
+        if (rrule.contains(QStringLiteral("FREQ=DAILY"))) period = KCalendarCore::RecurrenceRule::rDaily;
+        else if (rrule.contains(QStringLiteral("FREQ=WEEKLY"))) period = KCalendarCore::RecurrenceRule::rWeekly;
+        else if (rrule.contains(QStringLiteral("FREQ=MONTHLY"))) period = KCalendarCore::RecurrenceRule::rMonthly;
+        else if (rrule.contains(QStringLiteral("FREQ=YEARLY"))) period = KCalendarCore::RecurrenceRule::rYearly;
+        if (period != KCalendarCore::RecurrenceRule::rNone) {
+            KCalendarCore::RecurrenceRule *rule = new KCalendarCore::RecurrenceRule();
+            rule->setRecurrenceType(period);
+            rule->setFrequency(1);
+            rule->setStartDt(start);
+            for (const QString &part : rrule.split(';')) {
+                if (part.startsWith(QStringLiteral("COUNT="))) {
+                    bool ok = false;
+                    int count = part.mid(6).toInt(&ok);
+                    if (ok && count > 0) rule->setDuration(count);
+                } else if (part.startsWith(QStringLiteral("UNTIL="))) {
+                    QDateTime until = ProtonCalendarPlugin::parseCalTime(part.mid(6), 0, QStringLiteral("UTC"));
+                    if (until.isValid()) rule->setEndDt(until);
+                }
+            }
+            ev->recurrence()->addRRule(rule); // recurrence takes ownership
+        }
+    }
+    // EXDATEs (T14 single-occurrence deletes).
+    QJsonArray exdates = o.value(QLatin1String("exdates")).toArray();
+    for (const QJsonValue &xv : exdates) {
+        QDateTime ex = ProtonCalendarPlugin::parseCalTime(xv.toString(), 0, QStringLiteral("UTC"));
+        if (ex.isValid()) ev->recurrence()->addExDateTime(ex);
+    }
+    // Attendees (mailto: identities from merged fragments, T16).
+    QJsonArray atts = o.value(QLatin1String("attendees")).toArray();
+    for (const QJsonValue &av : atts) {
+        QString email = stripMailto(av.toString());
+        if (email.isEmpty()) continue;
+        ev->addAttendee(KCalendarCore::Attendee(QString(), email));
+    }
+    QString organizer = stripMailto(o.value(QLatin1String("organizer")).toString());
+    if (!organizer.isEmpty()) ev->setOrganizer(organizer);
+    QString status = o.value(QLatin1String("status")).toString().toUpper();
+    if (status == QLatin1String("CONFIRMED")) ev->setStatus(KCalendarCore::Incidence::StatusConfirmed);
+    else if (status == QLatin1String("CANCELLED")) ev->setStatus(KCalendarCore::Incidence::StatusCanceled);
+    else if (status == QLatin1String("TENTATIVE")) ev->setStatus(KCalendarCore::Incidence::StatusTentative);
+    if (o.value(QLatin1String("transp")).toString().compare(QLatin1String("TRANSPARENT"), Qt::CaseInsensitive) == 0) {
+        ev->setTransparency(KCalendarCore::Event::Transparent);
+    }
+    QString color = o.value(QLatin1String("color")).toString();
+    if (!color.isEmpty()) ev->setColor(color);
+}
+
+// Shared start/end computation (unix fallback, full-day exclusive-end fix).
+static bool eventTimes(const QJsonObject &o, QDateTime &start, QDateTime &end, bool &fullDay) {
+    fullDay = o.value(QLatin1String("full_day")).toBool(false);
+    start = ProtonCalendarPlugin::parseCalTime(o.value(QLatin1String("dtstart")).toString(),
+                                               o.value(QLatin1String("start_time")).toVariant().toLongLong(),
+                                               o.value(QLatin1String("start_timezone")).toString());
+    end = ProtonCalendarPlugin::parseCalTime(o.value(QLatin1String("dtend")).toString(),
+                                             o.value(QLatin1String("end_time")).toVariant().toLongLong(),
+                                             o.value(QLatin1String("end_timezone")).toString());
+    if (!start.isValid()) start = QDateTime::currentDateTimeUtc();
+    if (!end.isValid() || end < start) end = start.addSecs(fullDay ? 86400 : 3600);
+    if (fullDay) {
+        // Proton/mKCal all-day DTEND is exclusive but the Calendar app reads it
+        // inclusive: T03 (1 day) showed 2, T04 (3 days) showed 4 (live 2026-09-06).
+        end = end.addDays(-1);
+        if (end < start) end = start;
+    }
+    return true;
+}
+
+bool ProtonCalendarPlugin::writeEventsToMkCal(const QByteArray &json) {
+    QJsonDocument doc = QJsonDocument::fromJson(json);
+    if (!doc.isArray()) {
+        proton_log(QStringLiteral("Expected JSON array of events"));
+        return false;
+    }
+    mKCal::ExtendedCalendar::Ptr cal(
+        new mKCal::ExtendedCalendar(QTimeZone::systemTimeZone()));
+    mKCal::ExtendedStorage::Ptr storage = mKCal::ExtendedCalendar::defaultStorage(cal);
+    if (!storage->open()) {
+        proton_log(QStringLiteral("mKCal storage open failed"));
+        return false;
+    }
+    QJsonArray arr = doc.array();
+    // Group rows by Proton calendar (one notebook each, T20 separation).
+    QMap<QString, QString> calNames;
+    QMap<QString, QList<int>> byCal;
+    for (int i = 0; i < arr.size(); ++i) {
+        QJsonObject o = arr.at(i).toObject();
+        QString cid = o.value(QLatin1String("calendar_id")).toString();
+        if (cid.isEmpty()) cid = QStringLiteral("default");
+        if (!calNames.contains(cid)) {
+            calNames[cid] = o.value(QLatin1String("calendar_name")).toString();
+        }
+        byCal[cid].append(i);
+    }
+    // Migration + full replacement: drop events from ALL our notebooks,
+    // including the legacy single per-account notebook of the first version.
+    QString legacyUid = QStringLiteral("proton-calendar-%1").arg(m_accountId);
+    QString prefix = QStringLiteral("proton-calendar-%1-").arg(m_accountId);
+    mKCal::Notebook::List nbs = storage->notebooks();
+    for (const mKCal::Notebook::Ptr &nb : nbs) {
+        if (!nb) continue;
+        if (nb->uid() != legacyUid && !nb->uid().startsWith(prefix)) continue;
+        if (nb->uid() == legacyUid) {
+            // Retire the v1 notebook entirely (events move to per-cal notebooks).
+            if (storage->deleteNotebook(nb)) {
+                proton_log(QStringLiteral("Retired legacy notebook ") + legacyUid);
+            }
+            continue;
+        }
+        if (!storage->loadNotebookIncidences(nb->uid())) continue;
+        KCalendarCore::Incidence::List existing = cal->incidences(nb->uid());
+        int removed = 0;
+        for (const KCalendarCore::Incidence::Ptr &inc : existing) {
+            KCalendarCore::Event::Ptr ev = inc.dynamicCast<KCalendarCore::Event>();
+            if (ev && cal->deleteEvent(ev)) removed++;
+        }
+        if (removed > 0) {
+            proton_log(QStringLiteral("Removed %1 old events from %2").arg(removed).arg(nb->uid()));
+        }
+    }
+    int saved = 0;
+    auto rowRecurrenceId = [](const QJsonObject &o) {
+        return o.value(QLatin1String("recurrence_id")).toVariant().toLongLong();
+    };
+    for (auto it = byCal.constBegin(); it != byCal.constEnd(); ++it) {
+        QString nbUid = findOrCreateNotebook(cal, storage, it.key(), calNames.value(it.key()));
+        if (nbUid.isEmpty()) continue;
+        if (!storage->loadNotebookIncidences(nbUid)) {
+            proton_log(QStringLiteral("loadNotebookIncidences failed, continuing anyway"));
+        }
+        // Pass 1: masters (no recurrence-id). Pass 2 decomposes exceptions
+        // into master-EXDATE + standalone edited event (T15).
+        for (int pass = 0; pass < 2; ++pass) {
+        for (int idx : it.value()) {
+            QJsonObject o = arr.at(idx).toObject();
+        QString uid = o.value(QLatin1String("uid")).toString();
+        QString summary = o.value(QLatin1String("summary")).toString();
+        if (uid.isEmpty() && summary.isEmpty()) continue;
+        qint64 recurrenceId = rowRecurrenceId(o);
+        bool isException = recurrenceId > 0;
+        if ((pass == 0) == isException) continue;
+        QDateTime start, end;
+        bool fullDay = false;
+        eventTimes(o, start, end, fullDay);
+        if (!isException) {
+            KCalendarCore::Event::Ptr ev(new KCalendarCore::Event());
+            fillEventFromJson(ev, o, uid, start, end, fullDay);
+            if (cal->addEvent(ev, nbUid)) {
+                saved++;
+            } else {
+                proton_log(QStringLiteral("addEvent failed uid=") + uid.left(64));
+            }
+            continue;
+        }
+        // Exception occurrence (T15): mkcal's exception machinery
+        // (dissociate + same-UID save) never persisted the row — the
+        // dissociated object isn't inserted by dissociate, and explicitly
+        // added copies with recurrenceId are silently skipped at save.
+        // Decompose instead, using only proven primitives: EXDATE the
+        // original occurrence on the master + save the edited occurrence
+        // as a plain event with a stable suffixed UID. Display result is
+        // identical; no recurrenceId anywhere.
+        QDateTime rid = utcFromUnix(recurrenceId);
+        KCalendarCore::Event::Ptr master = cal->event(uid);
+        if (master && master->recursAt(rid)) {
+            master->recurrence()->addExDateTime(rid);
+        } else if (master) {
+            proton_log(QStringLiteral("exception rid matches no occurrence, standalone only uid=") + uid.left(64));
+        } else {
+            proton_log(QStringLiteral("exception without master, standalone uid=") + uid.left(64));
+        }
+        KCalendarCore::Event::Ptr solo(new KCalendarCore::Event());
+        QString soloUid = QStringLiteral("%1#%2").arg(uid, QString::number(recurrenceId));
+        fillEventFromJson(solo, o, soloUid, start, end, fullDay);
+        if (cal->addEvent(solo, nbUid)) {
+            saved++;
+        } else {
+            proton_log(QStringLiteral("addEvent exception failed uid=") + uid.left(64));
+        }
+        continue;
+        } // per-event rows of this Proton calendar
+        } // pass 1 masters / pass 2 exceptions
+    } // per Proton calendar notebook
+    if (!storage->save()) {
+        proton_log(QStringLiteral("mKCal storage save failed"));
+        return false;
+    }
+    proton_log(QStringLiteral("Saved %1 calendar events to mkcal").arg(saved));
+    return true;
+}
+void ProtonCalendarPlugin::persistCalendarTokens(const QString &refreshToken, const QString &uid) {
+    QSettings settings(QStringLiteral("proton"), QStringLiteral("sync-tokens"));
+    settings.beginGroup(m_accountId);
+    settings.setValue(QStringLiteral("refresh_token"), refreshToken);
+    settings.setValue(QStringLiteral("uid"), uid);
+    settings.endGroup();
+}
+QPair<QString, QString> ProtonCalendarPlugin::loadPersistedCalendarTokens() {
+    QSettings settings(QStringLiteral("proton"), QStringLiteral("sync-tokens"));
+    settings.beginGroup(m_accountId);
+    QString rt = settings.value(QStringLiteral("refresh_token")).toString();
+    QString uid = settings.value(QStringLiteral("uid")).toString();
+    settings.endGroup();
+    return qMakePair(rt, uid);
+}
+void ProtonCalendarPlugin::abortSync(Sync::SyncStatus aStatus) {
+    Q_UNUSED(aStatus);
+    if (m_calTimer) m_calTimer->stop();
+}
 bool ProtonCalendarPlugin::cleanUp() { return true; }
 Buteo::SyncResults ProtonCalendarPlugin::getSyncResults() const { return Buteo::SyncResults(); }
 void ProtonCalendarPlugin::connectivityStateChanged(Sync::ConnectivityType aType, bool aState) { Q_UNUSED(aType); Q_UNUSED(aState); }

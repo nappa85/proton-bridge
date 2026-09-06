@@ -295,23 +295,28 @@ pub extern "C" fn proton_bridge_get_keys_debug(engine: *mut ProtonSyncEngine) ->
 }
 
 // ---- Calendar engine FFI (single .so, separate engine) ----
+// Mirrors the contacts engine: derived passwords in, events JSON out.
 pub struct ProtonCalendarEngine {
     inner: Arc<Mutex<Option<CalendarSyncEngine>>>,
+    synced_events_json: Arc<Mutex<Option<String>>>,
 }
-#[no_mangle]
-pub extern "C" fn proton_calendar_create_engine(
-    username: *const c_char,
-    access_token: *const c_char,
-    refresh_token: *const c_char,
-    uid: *const c_char,
-) -> *mut ProtonCalendarEngine {
-    let username = unsafe { cstr_to_string(username) };
-    let access_token = unsafe { cstr_to_string(access_token) };
-    let refresh_token = unsafe { cstr_to_string(refresh_token) };
-    let uid = unsafe { cstr_to_string(uid) };
-    let config = SyncConfig {
+
+fn calendar_config_from_parts(
+    username: String,
+    access_token: String,
+    refresh_token: String,
+    uid: String,
+    derived_json: String,
+) -> SyncConfig {
+    let derived_passwords = if derived_json.is_empty() {
+        None
+    } else {
+        serde_json::from_str(&derived_json).ok()
+    };
+    SyncConfig {
         username,
         password: String::new(),
+        derived_passwords,
         access_token: if access_token.is_empty() {
             None
         } else {
@@ -324,10 +329,43 @@ pub extern "C" fn proton_calendar_create_engine(
         },
         uid: if uid.is_empty() { None } else { Some(uid) },
         ..Default::default()
-    };
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn proton_calendar_create_engine(
+    username: *const c_char,
+    access_token: *const c_char,
+    refresh_token: *const c_char,
+    uid: *const c_char,
+) -> *mut ProtonCalendarEngine {
+    proton_calendar_create_engine_with_derived(
+        username,
+        access_token,
+        refresh_token,
+        uid,
+        std::ptr::null(),
+    )
+}
+#[no_mangle]
+pub extern "C" fn proton_calendar_create_engine_with_derived(
+    username: *const c_char,
+    access_token: *const c_char,
+    refresh_token: *const c_char,
+    uid: *const c_char,
+    derived_passwords_json: *const c_char,
+) -> *mut ProtonCalendarEngine {
+    let username = unsafe { cstr_to_string(username) };
+    let access_token = unsafe { cstr_to_string(access_token) };
+    let refresh_token = unsafe { cstr_to_string(refresh_token) };
+    let uid = unsafe { cstr_to_string(uid) };
+    let derived_json = unsafe { cstr_to_string(derived_passwords_json) };
+    let config =
+        calendar_config_from_parts(username, access_token, refresh_token, uid, derived_json);
     let engine = CalendarSyncEngine::new(config);
     Box::into_raw(Box::new(ProtonCalendarEngine {
         inner: Arc::new(Mutex::new(Some(engine))),
+        synced_events_json: Arc::new(Mutex::new(None)),
     }))
 }
 #[no_mangle]
@@ -345,13 +383,15 @@ pub extern "C" fn proton_calendar_start_sync(e: *mut ProtonCalendarEngine) -> bo
     }
     let eref = unsafe { &*e };
     if let Some(mut eng) = eref.inner.lock().unwrap().take() {
-        let cfg = eng.status(); // dummy to keep compiler happy
-        let _ = cfg;
+        let config = eng.config();
+        let json_arc = Arc::clone(&eref.synced_events_json);
         let inner = Arc::clone(&eref.inner);
         std::thread::spawn(move || {
-            // config is already inside eng; use a clone
-            let cfg2 = SyncConfig::default();
-            eng.start_sync(cfg2);
+            eng.start_sync(config);
+            let status = eng.status();
+            if status.state == "complete" {
+                *json_arc.lock().unwrap() = Some(eng.get_events_json());
+            }
             *inner.lock().unwrap() = Some(eng);
         });
         true
@@ -377,5 +417,64 @@ pub extern "C" fn proton_calendar_get_status(
         .unwrap_or_default();
     unsafe {
         *s = ProtonBridgeStatus::from_sync_status(&st);
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn proton_calendar_get_events_json(e: *mut ProtonCalendarEngine) -> *mut c_char {
+    if e.is_null() {
+        return std::ptr::null_mut();
+    }
+    let eref = unsafe { &*e };
+    // Prefer the snapshot taken at completion; fall back to the live engine.
+    if let Some(s) = eref.synced_events_json.lock().unwrap().clone() {
+        return CString::new(s).unwrap().into_raw();
+    }
+    let guard = eref.inner.lock().unwrap();
+    match guard.as_ref() {
+        Some(eng) => CString::new(eng.get_events_json()).unwrap().into_raw(),
+        None => std::ptr::null_mut(),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn proton_calendar_get_keys_debug(e: *mut ProtonCalendarEngine) -> *mut c_char {
+    if e.is_null() {
+        return std::ptr::null_mut();
+    }
+    let eref = unsafe { &*e };
+    let guard = eref.inner.lock().unwrap();
+    match guard.as_ref() {
+        Some(eng) => match eng.get_keys_debug() {
+            Some(s) => CString::new(s).unwrap().into_raw(),
+            None => std::ptr::null_mut(),
+        },
+        None => std::ptr::null_mut(),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn proton_calendar_get_refresh_token(e: *mut ProtonCalendarEngine) -> *mut c_char {
+    if e.is_null() {
+        return std::ptr::null_mut();
+    }
+    let eref = unsafe { &*e };
+    let guard = eref.inner.lock().unwrap();
+    match guard.as_ref().and_then(|eng| eng.get_refresh_token()) {
+        Some(s) => CString::new(s).unwrap().into_raw(),
+        None => std::ptr::null_mut(),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn proton_calendar_get_uid(e: *mut ProtonCalendarEngine) -> *mut c_char {
+    if e.is_null() {
+        return std::ptr::null_mut();
+    }
+    let eref = unsafe { &*e };
+    let guard = eref.inner.lock().unwrap();
+    match guard.as_ref().and_then(|eng| eng.get_uid()) {
+        Some(s) => CString::new(s).unwrap().into_raw(),
+        None => std::ptr::null_mut(),
     }
 }

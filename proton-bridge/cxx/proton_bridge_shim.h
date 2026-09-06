@@ -33,9 +33,14 @@
 #include <QContactUrl>
 #include <QContactGender>
 #include <QContactAnniversary>
-#include <QOrganizerManager>
-#include <QOrganizerEvent>
-#include <QOrganizerItemId>
+#include <extendedcalendar.h>
+#include <extendedstorage.h>
+#include <notebook.h>
+#include <sqlitestorage.h>
+#include <KCalendarCore/Event>
+#include <KCalendarCore/Recurrence>
+#include <KCalendarCore/RecurrenceRule>
+#include <KCalendarCore/Attendee>
 
 #include <Accounts/manager.h>
 #include <Accounts/account.h>
@@ -111,7 +116,29 @@ public:
     Buteo::SyncResults getSyncResults() const override;
 public slots:
     void connectivityStateChanged(Sync::ConnectivityType aType, bool aState) override;
+public:
+    static QDateTime parseCalTime(const QString &ical, qint64 unixFallback, const QString &tz);
+private slots:
+    void pollCalendarStatus();
+    void onCalendarSignOnResponse(const SignOn::SessionData &data);
+    void onCalendarSignOnError(const SignOn::Error &error);
 private:
+    bool requestCalendarCredentials();
+    bool writeEventsToMkCal(const QByteArray &json);
+    QString findOrCreateNotebook(mKCal::ExtendedCalendar::Ptr cal,
+                                 mKCal::ExtendedStorage::Ptr storage,
+                                 const QString &calId,
+                                 const QString &calName);
+    void persistCalendarTokens(const QString &refreshToken, const QString &uid);
+    QPair<QString, QString> loadPersistedCalendarTokens();
+
+    ProtonCalendarEngine *m_calEngine = nullptr;
+    QTimer *m_calTimer = nullptr;
+    QString m_accountId;
+    Accounts::Manager *m_accountManager = nullptr;
+    SignOn::Identity *m_identity = nullptr;
+    SignOn::AuthSession *m_authSession = nullptr;
+    bool m_credentialsReady = false;
     bool m_inited = false;
 };
 

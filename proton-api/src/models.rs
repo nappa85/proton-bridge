@@ -1,7 +1,110 @@
 // proton-api/src/models.rs
 // Proton API uses PascalCase JSON keys; allow non-snake-case field names to match wire format.
 #![allow(non_snake_case)]
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+
+/// Lenient helpers: the live API mixes JSON shapes (Go int-bools 0/1, explicit
+/// nulls, number-or-string IDs). Strict types turned one odd row into a
+/// whole-list parse failure (verified live 2026-09-06: 19 rows dropped).
+fn deserialize_opt_bool<'de, D: Deserializer<'de>>(
+    d: D,
+) -> std::result::Result<Option<bool>, D::Error> {
+    let v = Option::<serde_json::Value>::deserialize(d)?;
+    Ok(match v {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::Bool(b)) => Some(b),
+        Some(serde_json::Value::Number(n)) => Some(n.as_i64().unwrap_or(0) != 0),
+        Some(serde_json::Value::String(s)) => {
+            Some(matches!(s.to_lowercase().as_str(), "1" | "true" | "yes"))
+        }
+        Some(_) => None,
+    })
+}
+
+fn deserialize_vec_i64<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<Vec<i64>, D::Error> {
+    let v = Option::<serde_json::Value>::deserialize(d)?;
+    Ok(match v {
+        None | Some(serde_json::Value::Null) => Vec::new(),
+        Some(serde_json::Value::Array(a)) => a.iter().filter_map(|x| x.as_i64()).collect(),
+        Some(serde_json::Value::Number(n)) => n.as_i64().map_or_else(Vec::new, |x| vec![x]),
+        Some(_) => Vec::new(),
+    })
+}
+
+fn deserialize_opt_string<'de, D: Deserializer<'de>>(
+    d: D,
+) -> std::result::Result<Option<String>, D::Error> {
+    let v = Option::<serde_json::Value>::deserialize(d)?;
+    Ok(match v {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(s)) => Some(s),
+        Some(other) => Some(other.to_string()),
+    })
+}
+
+fn deserialize_opt_value_vec<'de, D: Deserializer<'de>>(
+    d: D,
+) -> std::result::Result<Option<Vec<serde_json::Value>>, D::Error> {
+    let v = Option::<serde_json::Value>::deserialize(d)?;
+    Ok(match v {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::Array(a)) => Some(a),
+        Some(_) => None,
+    })
+}
+
+/// Null- and type-tolerant scalars: explicit nulls must behave like missing
+/// keys (plain #[serde(default)] does NOT accept null), and numeric IDs may
+/// arrive as strings.
+fn deserialize_string_default<'de, D: Deserializer<'de>>(
+    d: D,
+) -> std::result::Result<String, D::Error> {
+    let v = Option::<serde_json::Value>::deserialize(d)?;
+    Ok(match v {
+        None | Some(serde_json::Value::Null) => String::new(),
+        Some(serde_json::Value::String(s)) => s,
+        Some(other) => other.to_string(),
+    })
+}
+
+fn deserialize_i64_default<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<i64, D::Error> {
+    let v = Option::<serde_json::Value>::deserialize(d)?;
+    Ok(match v {
+        None | Some(serde_json::Value::Null) | Some(serde_json::Value::Bool(false)) => 0,
+        Some(serde_json::Value::Bool(true)) => 1,
+        Some(serde_json::Value::Number(n)) => n.as_i64().unwrap_or(0),
+        Some(serde_json::Value::String(s)) => s.parse::<i64>().unwrap_or(0),
+        Some(_) => 0,
+    })
+}
+
+fn deserialize_opt_i64<'de, D: Deserializer<'de>>(
+    d: D,
+) -> std::result::Result<Option<i64>, D::Error> {
+    let v = Option::<serde_json::Value>::deserialize(d)?;
+    Ok(match v {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::Bool(b)) => Some(i64::from(b)),
+        Some(serde_json::Value::Number(n)) => n.as_i64().or(Some(0)),
+        Some(serde_json::Value::String(s)) => s.parse::<i64>().ok(),
+        Some(_) => None,
+    })
+}
+
+/// Null-tolerant vec where one bad element must not kill the whole list.
+fn deserialize_vec_default<'de, D: Deserializer<'de>, T: serde::de::DeserializeOwned>(
+    d: D,
+) -> std::result::Result<Vec<T>, D::Error> {
+    let v = Option::<serde_json::Value>::deserialize(d)?;
+    Ok(match v {
+        None | Some(serde_json::Value::Null) => Vec::new(),
+        Some(serde_json::Value::Array(a)) => a
+            .into_iter()
+            .filter_map(|x| serde_json::from_value(x).ok())
+            .collect(),
+        Some(_) => Vec::new(),
+    })
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthRequest {
@@ -220,7 +323,7 @@ pub struct Calendar {
     pub Description: String,
     #[serde(default)]
     pub Color: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_opt_bool")]
     pub Display: Option<bool>,
     #[serde(default)]
     pub Type: i64,
@@ -228,7 +331,7 @@ pub struct Calendar {
     pub Flags: i64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CalendarKey {
     #[serde(default)]
     pub ID: String,
@@ -242,7 +345,7 @@ pub struct CalendarKey {
     pub Flags: i64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CalendarPassphrase {
     #[serde(default)]
     pub ID: String,
@@ -252,7 +355,7 @@ pub struct CalendarPassphrase {
     pub MemberPassphrases: Vec<MemberPassphrase>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MemberPassphrase {
     #[serde(default)]
     pub MemberID: String,
@@ -262,56 +365,113 @@ pub struct MemberPassphrase {
     pub Signature: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CalendarEvent {
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CalendarMember {
     #[serde(default)]
     pub ID: String,
     #[serde(default)]
-    pub UID: String,
-    #[serde(default)]
     pub CalendarID: String,
     #[serde(default)]
-    pub SharedEventID: String,
+    pub AddressID: String,
     #[serde(default)]
-    pub CreateTime: i64,
+    pub Email: String,
     #[serde(default)]
-    pub LastEditTime: i64,
+    pub Name: String,
     #[serde(default)]
-    pub StartTime: i64,
+    pub Description: String,
     #[serde(default)]
-    pub EndTime: i64,
+    pub Color: String,
     #[serde(default)]
-    pub StartTimezone: String,
+    pub Permissions: i64,
     #[serde(default)]
-    pub EndTimezone: String,
-    #[serde(default)]
-    pub FullDay: Option<bool>,
-    #[serde(default)]
-    pub Author: String,
-    #[serde(default)]
-    pub SharedKeyPacket: String,
-    #[serde(default)]
-    pub CalendarKeyPacket: String,
-    #[serde(default)]
-    pub SharedEvents: Vec<CalendarEventPart>,
-    #[serde(default)]
-    pub CalendarEvents: Vec<CalendarEventPart>,
-    #[serde(default)]
-    pub AttendeesEvents: Vec<CalendarEventPart>,
-    #[serde(default)]
-    pub PersonalEvents: Vec<CalendarEventPart>,
+    pub Flags: i64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CalendarBootstrap {
+    #[serde(default)]
+    pub Members: Vec<CalendarMember>,
+    #[serde(default)]
+    pub Keys: Vec<CalendarKey>,
+    #[serde(default)]
+    pub Passphrase: Option<CalendarPassphrase>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CalendarEventsListResponse {
+    #[serde(default)]
+    pub Events: Vec<CalendarEvent>,
+    #[serde(default)]
+    pub More: i64,
+    #[serde(default)]
+    pub Total: Option<i64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CalendarEvent {
+    #[serde(default, deserialize_with = "deserialize_string_default")]
+    pub ID: String,
+    #[serde(default, deserialize_with = "deserialize_string_default")]
+    pub UID: String,
+    #[serde(default, deserialize_with = "deserialize_string_default")]
+    pub CalendarID: String,
+    #[serde(default, deserialize_with = "deserialize_string_default")]
+    pub SharedEventID: String,
+    #[serde(default, deserialize_with = "deserialize_i64_default")]
+    pub CreateTime: i64,
+    #[serde(default, deserialize_with = "deserialize_i64_default")]
+    pub LastEditTime: i64,
+    #[serde(default, deserialize_with = "deserialize_i64_default")]
+    pub StartTime: i64,
+    #[serde(default, deserialize_with = "deserialize_i64_default")]
+    pub EndTime: i64,
+    #[serde(default, deserialize_with = "deserialize_string_default")]
+    pub StartTimezone: String,
+    #[serde(default, deserialize_with = "deserialize_string_default")]
+    pub EndTimezone: String,
+    #[serde(default, deserialize_with = "deserialize_opt_bool")]
+    pub FullDay: Option<bool>,
+    #[serde(default, deserialize_with = "deserialize_string_default")]
+    pub Author: String,
+    #[serde(default, deserialize_with = "deserialize_string_default")]
+    pub SharedKeyPacket: String,
+    #[serde(default, deserialize_with = "deserialize_string_default")]
+    pub CalendarKeyPacket: String,
+    #[serde(default, deserialize_with = "deserialize_vec_default")]
+    pub SharedEvents: Vec<CalendarEventPart>,
+    #[serde(default, deserialize_with = "deserialize_vec_default")]
+    pub CalendarEvents: Vec<CalendarEventPart>,
+    #[serde(default, deserialize_with = "deserialize_vec_default")]
+    pub AttendeesEvents: Vec<CalendarEventPart>,
+    #[serde(default, deserialize_with = "deserialize_vec_default")]
+    pub PersonalEvents: Vec<CalendarEventPart>,
+    // Plaintext row columns (api.md – no decryption needed)
+    #[serde(default, deserialize_with = "deserialize_opt_string")]
+    pub RRule: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_vec_i64")]
+    pub Exdates: Vec<i64>,
+    #[serde(default, deserialize_with = "deserialize_opt_i64")]
+    pub RecurrenceID: Option<i64>,
+    #[serde(default, deserialize_with = "deserialize_opt_string")]
+    pub Color: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_opt_value_vec")]
+    pub Notifications: Option<Vec<serde_json::Value>>,
+    #[serde(default, deserialize_with = "deserialize_opt_i64")]
+    pub IsOrganizer: Option<i64>,
+    #[serde(default, deserialize_with = "deserialize_opt_i64")]
+    pub Permissions: Option<i64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CalendarEventPart {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_string_default")]
     pub MemberID: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_i64_default")]
     pub Type: i64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_string_default")]
     pub Data: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_string_default")]
     pub Signature: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_string_default")]
     pub Author: String,
 }
