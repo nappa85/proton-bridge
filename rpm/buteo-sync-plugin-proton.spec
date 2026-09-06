@@ -7,6 +7,7 @@ URL:            https://github.com/nappa85/proton-bridge
 Source0:        %{name}-%{version}.tar.bz2
 
 Requires:       buteo-syncfw-qt5 >= 0.11
+Requires:       sailfish-account-proton
 Requires:       qt5-qtpim-contacts
 Requires:       mkcal-qt5
 Requires:       kf5-calendarcore

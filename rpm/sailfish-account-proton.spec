@@ -11,6 +11,8 @@ Source0:        %{name}-%{version}.tar.bz2
 # BuildRequires:  pkgconfig(libsignon-glib)
 Requires:       libaccounts-glib
 Requires:       libsignon-glib
+# Paired engine: toggles and profiles are useless without it.
+Requires:       buteo-sync-plugin-proton
 # sailfish-accounts-ui is virtual; real package is jolla-settings-accounts
 Requires:       jolla-settings-accounts
 
@@ -49,6 +51,10 @@ install -m 0644 ui/proton.qml \
 install -m 0644 ui/proton-settings.qml \
     %{buildroot}%{_datadir}/accounts/ui/proton-settings.qml
 
+# Install QML UI for credentials update (OTP in-page agent)
+install -m 0644 ui/proton-update.qml \
+    %{buildroot}%{_datadir}/accounts/ui/proton-update.qml
+
 # Install icon (to be added)
 # mkdir -p %{buildroot}%{_datadir}/icons/hicolor/86x86/apps
 # install -m 0644 icons/proton.png \
@@ -61,6 +67,7 @@ install -m 0644 ui/proton-settings.qml \
 %{_datadir}/accounts/services/proton-caldav.service
 %{_datadir}/accounts/ui/proton.qml
 %{_datadir}/accounts/ui/proton-settings.qml
+%{_datadir}/accounts/ui/proton-update.qml
 # %{_datadir}/icons/hicolor/*/apps/proton.png
 
 %changelog

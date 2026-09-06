@@ -63,6 +63,15 @@ jobs:
           sed -i "s/^version = .*/version = \"${{ steps.version.outputs.version }}\"/" Cargo.toml
           grep '^version =' Cargo.toml
 
+      - name: Stamp RPM version into spec files
+        # Must run BEFORE the bundle: make-pkg-bundle.sh assembles the
+        # versioned tarballs and refreshes packaging/rpm from these specs.
+        run: |
+          sed -i "s/^Version:.*/Version:       ${{ steps.version.outputs.version }}/" rpm/buteo-sync-plugin-proton.spec
+          sed -i "s/^Version:.*/Version:       ${{ steps.version.outputs.version }}/" rpm/sailfish-account-proton.spec
+          grep '^Version:' rpm/buteo-sync-plugin-proton.spec
+          grep '^Version:' rpm/sailfish-account-proton.spec
+
       - name: Cross-compile Rust crates for aarch64
         run: |
           cargo build --release --target aarch64-unknown-linux-gnu
@@ -72,17 +81,13 @@ jobs:
           chmod +x make-pkg-bundle.sh
           ./make-pkg-bundle.sh --no-deploy
 
-      - name: Stamp RPM version into spec files
-        run: |
-          sed -i "s/^Version:.*/Version:       ${{ steps.version.outputs.version }}/" rpm/buteo-sync-plugin-proton.spec
-          sed -i "s/^Version:.*/Version:       ${{ steps.version.outputs.version }}/" rpm/sailfish-account-proton.spec
-          grep '^Version:' rpm/buteo-sync-plugin-proton.spec
-          grep '^Version:' rpm/sailfish-account-proton.spec
-
       - name: Pull Sailfish Platform SDK
         run: docker pull coderus/sailfishos-platform-sdk-aarch64
 
       - name: Build buteo-sync-plugin-proton RPM
+        # NOTE: mb2 runs rpmbuild --build-in-place --short-circuit, so it
+        # must execute INSIDE the unpacked source tree (not the rpm/ dir) —
+        # no `prepare` step needed or wanted. Verified locally 2026-09-06.
         run: |
           set -euxo pipefail
           docker create --name proton-build coderus/sailfishos-platform-sdk-aarch64 sleep infinity
@@ -93,20 +98,22 @@ jobs:
           docker cp packaging proton-build:/home/mersdk/packaging
           docker exec -u root proton-build chown -R mersdk:mersdk /home/mersdk/packaging
 
-          # Build buteo plugin RPM
-          docker exec -w /home/mersdk/packaging/rpm proton-build \
-            mb2 --target SailfishOS-5.2.0.15-aarch64 -s buteo-sync-plugin-proton.spec build
+          # Build buteo plugin RPM (in-place in the staged source tree)
+          docker exec -w /home/mersdk/packaging/buteo-sync-plugin-proton-${{ steps.version.outputs.version }} proton-build \
+            mb2 --target SailfishOS-5.2.0.15-aarch64 -s ../rpm/buteo-sync-plugin-proton.spec build
 
           mkdir -p packaging/RPMS
+          docker exec proton-build bash -c 'mv /home/mersdk/packaging/*/RPMS/*.rpm /home/mersdk/packaging/RPMS/ 2>/dev/null; true'
           docker cp proton-build:/home/mersdk/packaging/RPMS/. packaging/RPMS/
 
       - name: Build sailfish-account-proton RPM
         run: |
           set -euxo pipefail
           # Reuse the same container
-          docker exec -w /home/mersdk/packaging/rpm proton-build \
-            mb2 --target SailfishOS-5.2.0.15-aarch64 -s sailfish-account-proton.spec build
+          docker exec -w /home/mersdk/packaging/sailfish-account-proton-${{ steps.version.outputs.version }} proton-build \
+            mb2 --target SailfishOS-5.2.0.15-aarch64 -s ../rpm/sailfish-account-proton.spec build
 
+          docker exec proton-build bash -c 'mv /home/mersdk/packaging/*/RPMS/*.rpm /home/mersdk/packaging/RPMS/ 2>/dev/null; true'
           docker cp proton-build:/home/mersdk/packaging/RPMS/. packaging/RPMS/
 
       - name: Sanity-check built RPMs

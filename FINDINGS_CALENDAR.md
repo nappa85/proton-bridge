@@ -472,3 +472,21 @@ Calendar sync:
 Contacts sync (from PLAN.md, still open):
 - [ ] Two-way sync (download-only today), incremental sync (full fetch),
   cross-source dedup, multiple photos (first avatar only).
+
+Packaging/release:
+- [x] Repo URLs (`nappa85/proton-bridge` to match remote, in workspace
+  `Cargo.toml` + both specs).
+- [x] Release integrity (2026-09-06): staged tarballs were stale (missing
+  caldav service, update UI, settings plugin; `.o` junk; deleted
+  `proton-creation.qml`). `make-pkg-bundle.sh` now assembles both tarballs
+  deterministically from the repo (version from Cargo.toml). `release.yml`
+  fixed three ways: `--no-deploy` (was stalling/failing on phone scp),
+  stamp-before-bundle (tarballs + spec copies cohere), and in-place `mb2`
+  invocation (short-circuit skips `%prep`, so the old `-w packaging/rpm`
+  could never unpack). Both RPMs verified built locally with correct
+  contents + deps. Also added the missing `proton-update.qml` to the
+  account spec (was absent from the RPM).
+- [x] Mutual `Requires` (2026-09-06): neither RPM worked alone (engine
+  without provider = dead code; provider without engine = dead toggles).
+  Verified in built RPM metadata both directions. Unversioned (parsers are
+  forward/backward tolerant by design).

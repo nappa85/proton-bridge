@@ -267,6 +267,71 @@ ls -lh /home/mersdk/packaging/settings-plugin/libprotonsettingsplugin.so
 '
 
 echo "========================================="
+echo " Step 2b: Assemble RPM tarballs          "
+echo "========================================="
+
+# Deterministic tarballs from the repo tree (version follows the workspace
+# Cargo.toml, which release stamping updates BEFORE this script runs).
+# The old checked-in/stale tarballs shipped ancient sources (missing
+# proton-caldav.service, proton-update.qml, settings-plugin) and even
+# contained .o junk — never reuse them.
+PKG_VER="$(grep -m1 '^version = ' "$repo_root/Cargo.toml" | cut -d'"' -f2)"
+if [ -z "$PKG_VER" ]; then
+    echo "ERROR: cannot parse version from Cargo.toml"
+    exit 1
+fi
+echo "Packaging version $PKG_VER"
+
+rm -rf "$packaging_dir/buteo-sync-plugin-proton-$PKG_VER" \
+       "$packaging_dir/sailfish-account-proton-$PKG_VER"
+mkdir -p "$packaging_dir/buteo-sync-plugin-proton-$PKG_VER/buteo-plugin" \
+         "$packaging_dir/buteo-sync-plugin-proton-$PKG_VER/buteo-profiles/client" \
+         "$packaging_dir/buteo-sync-plugin-proton-$PKG_VER/buteo-profiles/sync" \
+         "$packaging_dir/buteo-sync-plugin-proton-$PKG_VER/settings-plugin" \
+         "$packaging_dir/sailfish-account-proton-$PKG_VER/ui" \
+         "$packaging_dir/sailfish-account-proton-$PKG_VER/accounts"
+
+# Buteo plugin RPM contents: built .so files + install-time data only
+# (no .o/.a/moc intermediates).
+cp "$packaging_dir/buteo-plugin/libproton-client.so" \
+   "$packaging_dir/buteo-sync-plugin-proton-$PKG_VER/buteo-plugin/"
+cp "$repo_root/proton-bridge/cxx/proton_bridge_shim.h" \
+   "$repo_root/proton-bridge/cxx/proton_bridge_shim.cpp" \
+   "$repo_root/proton-bridge/proton_bridge.h" \
+   "$packaging_dir/buteo-sync-plugin-proton-$PKG_VER/buteo-plugin/"
+cp "$repo_root/buteo-profiles/client/proton-contacts.xml" \
+   "$packaging_dir/buteo-sync-plugin-proton-$PKG_VER/buteo-profiles/client/"
+cp "$repo_root/buteo-profiles/sync/proton.Contacts.xml" \
+   "$repo_root/buteo-profiles/sync/proton.Calendar.xml" \
+   "$packaging_dir/buteo-sync-plugin-proton-$PKG_VER/buteo-profiles/sync/"
+cp "$packaging_dir/settings-plugin/libprotonsettingsplugin.so" \
+   "$packaging_dir/buteo-sync-plugin-proton-$PKG_VER/settings-plugin/"
+cp "$repo_root/proton-bridge/settings/qmldir" \
+   "$packaging_dir/buteo-sync-plugin-proton-$PKG_VER/settings-plugin/"
+cp "$repo_root/rpm/buteo-sync-plugin-proton.spec" \
+   "$packaging_dir/buteo-sync-plugin-proton-$PKG_VER/"
+cp "$repo_root/rpm/buteo-sync-plugin-proton.spec" "$packaging_dir/rpm/"
+
+# Account RPM contents: current UI + provider/services (no deleted files).
+cp "$repo_root/ui/proton.qml" "$repo_root/ui/proton-settings.qml" "$repo_root/ui/proton-update.qml" \
+   "$packaging_dir/sailfish-account-proton-$PKG_VER/ui/"
+cp "$repo_root/packaging/accounts/proton.provider" \
+   "$repo_root/packaging/accounts/proton-carddav.service" \
+   "$repo_root/packaging/accounts/proton-caldav.service" \
+   "$packaging_dir/sailfish-account-proton-$PKG_VER/accounts/"
+cp "$repo_root/rpm/sailfish-account-proton.spec" \
+   "$packaging_dir/sailfish-account-proton-$PKG_VER/"
+cp "$repo_root/rpm/sailfish-account-proton.spec" "$packaging_dir/rpm/"
+
+tar -cjf "$packaging_dir/buteo-sync-plugin-proton-$PKG_VER.tar.bz2" \
+    -C "$packaging_dir" "buteo-sync-plugin-proton-$PKG_VER"
+tar -cjf "$packaging_dir/sailfish-account-proton-$PKG_VER.tar.bz2" \
+    -C "$packaging_dir" "sailfish-account-proton-$PKG_VER"
+echo "Tarballs ready:"
+tar -tf "$packaging_dir/buteo-sync-plugin-proton-$PKG_VER.tar.bz2" | sort | head -20
+tar -tf "$packaging_dir/sailfish-account-proton-$PKG_VER.tar.bz2" | sort
+
+echo "========================================="
 echo " Step 3: Deploy to phone                 "
 echo "========================================="
 

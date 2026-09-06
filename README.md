@@ -1,6 +1,6 @@
 # SailfishOS Proton Contacts & Calendar Integration
 
-Native SailfishOS account provider + Buteo sync plugin for Proton Contacts and Calendar (single `libproton-client.so`, single RPM). Built with Rust core + `mKCal`/`KCalendarCore` bridge.
+Native SailfishOS account provider + Buteo sync plugin for Proton Contacts and Calendar (single `libproton-client.so` covering both, two RPMs: sync plugin + account provider). Built with Rust core + `mKCal`/`KCalendarCore` bridge.
 
 ## Architecture
 
