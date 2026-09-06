@@ -3,7 +3,7 @@ Summary:        Buteo sync plugin for Proton Contacts
 Version:        0.1.0
 Release:        1
 License:        GPL-3.0-or-later
-URL:            https://github.com/nappa85/sailfish-proton
+URL:            https://github.com/nappa85/proton-bridge
 Source0:        %{name}-%{version}.tar.bz2
 
 Requires:       buteo-syncfw-qt5 >= 0.11
@@ -26,6 +26,7 @@ mKCal/KCalendarCore) sync profiles.
 %build
 echo "Verifying pre-built plugin"
 ls -lh buteo-plugin/libproton-client.so
+ls -lh settings-plugin/libprotonsettingsplugin.so settings-plugin/qmldir
 
 %install
 rm -rf %{buildroot}
@@ -44,9 +45,18 @@ install -m 0644 buteo-profiles/sync/proton.Contacts.xml \
 install -m 0644 buteo-profiles/sync/proton.Calendar.xml \
     %{buildroot}%{_sysconfdir}/buteo/profiles/sync/proton.Calendar.xml
 
+# Settings QML extension (ProtonDataPurger for the purge menu item)
+mkdir -p %{buildroot}%{_libdir}/qt5/qml/Proton
+install -m 0755 settings-plugin/libprotonsettingsplugin.so \
+    %{buildroot}%{_libdir}/qt5/qml/Proton/libprotonsettingsplugin.so
+install -m 0644 settings-plugin/qmldir \
+    %{buildroot}%{_libdir}/qt5/qml/Proton/qmldir
+
 %files
 %defattr(-,root,root,-)
 %{_libdir}/buteo-plugins-qt5/oopp/libproton-client.so
+%{_libdir}/qt5/qml/Proton/libprotonsettingsplugin.so
+%{_libdir}/qt5/qml/Proton/qmldir
 %config(noreplace) %{_sysconfdir}/buteo/profiles/client/proton.xml
 %config(noreplace) %{_sysconfdir}/buteo/profiles/sync/proton.Contacts.xml
 %config(noreplace) %{_sysconfdir}/buteo/profiles/sync/proton.Calendar.xml

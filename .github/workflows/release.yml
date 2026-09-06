@@ -70,7 +70,7 @@ jobs:
       - name: Stage package bundle (Rust cdylib + configs)
         run: |
           chmod +x make-pkg-bundle.sh
-          ./make-pkg-bundle.sh
+          ./make-pkg-bundle.sh --no-deploy
 
       - name: Stamp RPM version into spec files
         run: |

@@ -43,6 +43,12 @@ cp "$repo_root/proton-bridge/cxx/proton_bridge_shim.cpp" "$packaging_dir/buteo-p
 cp "$repo_root/proton-bridge/proton_bridge.h" "$packaging_dir/buteo-plugin/"
 cp "$repo_root/target/$target_triple/release/libproton_bridge.a" "$packaging_dir/buteo-plugin/"
 
+# Prepare Settings QML extension sources (purge helper for proton-settings.qml)
+mkdir -p "$packaging_dir/settings-plugin"
+cp "$repo_root/proton-bridge/settings/protonsettingsplugin.h" "$packaging_dir/settings-plugin/"
+cp "$repo_root/proton-bridge/settings/protonsettingsplugin.cpp" "$packaging_dir/settings-plugin/"
+cp "$repo_root/proton-bridge/settings/qmldir" "$packaging_dir/settings-plugin/"
+
 # Prepare SignOn plugin sources
 cp "$repo_root/proton-bridge/signon/proton_signon_plugin.h" "$packaging_dir/signon-plugin/"
 cp "$repo_root/proton-bridge/signon/proton_signon_plugin.cpp" "$packaging_dir/signon-plugin/"
@@ -96,6 +102,8 @@ ln -sf libaccounts-qt5.so.1 $TARGET_ROOT/usr/lib64/libaccounts-qt5.so 2>/dev/nul
 ln -sf libsignon-qt5.so.1 $TARGET_ROOT/usr/lib64/libsignon-qt5.so 2>/dev/null || true
 ln -sf libsignon-plugins-common.so.1 $TARGET_ROOT/usr/lib64/libsignon-plugins-common.so 2>/dev/null || true
 ln -sf libQt5DBus.so.5 $TARGET_ROOT/usr/lib64/libQt5DBus.so 2>/dev/null || true
+ln -sf libQt5Qml.so.5 $TARGET_ROOT/usr/lib64/libQt5Qml.so 2>/dev/null || true
+ln -sf libQt5Quick.so.5 $TARGET_ROOT/usr/lib64/libQt5Quick.so 2>/dev/null || true
 ln -sf libQt5Xml.so.5 $TARGET_ROOT/usr/lib64/libQt5Xml.so 2>/dev/null || true
 ln -sf libQt5Network.so.5 $TARGET_ROOT/usr/lib64/libQt5Network.so 2>/dev/null || true
 
@@ -207,6 +215,55 @@ aarch64-meego-linux-gnu-g++ \
 chown 1000:1000 /home/mersdk/packaging/signon-plugin/libprotonplugin.so
 echo "SignOn plugin built successfully"
 ls -lh /home/mersdk/packaging/signon-plugin/libprotonplugin.so
+
+# === Settings QML extension (purge helper, no Rust linkage) ===
+
+SETTINGS_INC="-I/home/mersdk/packaging/settings-plugin \
+    -I/home/mersdk/packaging/device-headers/mkcal-qt5 \
+    -I/home/mersdk/packaging/device-headers/KF5 \
+    -I/home/mersdk/packaging/device-headers/KF5/KCalendarCore \
+    -I$TARGET_ROOT/usr/include/qt5 \
+    -I$TARGET_ROOT/usr/include/qt5/QtCore \
+    -I$TARGET_ROOT/usr/include/qt5/QtGui \
+    -I$TARGET_ROOT/usr/include/qt5/QtQml \
+    -I$TARGET_ROOT/usr/include/qt5/QtQuick \
+    -I$TARGET_ROOT/usr/include/qt5/QtContacts \
+    -I$TARGET_ROOT/usr/include \
+    -DQT_CORE_LIB"
+
+$MOC $SETTINGS_INC \
+    /home/mersdk/packaging/settings-plugin/protonsettingsplugin.h \
+    -o /home/mersdk/packaging/settings-plugin/moc_protonsettingsplugin.cpp
+
+aarch64-meego-linux-gnu-g++ \
+    -std=c++14 -c -fPIC --sysroot=$TARGET_ROOT \
+    $SETTINGS_INC \
+    -o /home/mersdk/packaging/settings-plugin/settings_plugin.o \
+    /home/mersdk/packaging/settings-plugin/protonsettingsplugin.cpp
+
+aarch64-meego-linux-gnu-g++ \
+    -std=c++14 -c -fPIC --sysroot=$TARGET_ROOT \
+    $SETTINGS_INC \
+    -o /home/mersdk/packaging/settings-plugin/moc_settings_plugin.o \
+    /home/mersdk/packaging/settings-plugin/moc_protonsettingsplugin.cpp
+
+rm -f /home/mersdk/packaging/settings-plugin/libprotonsettingsplugin.so
+aarch64-meego-linux-gnu-g++ \
+    -shared -fPIC --sysroot=$TARGET_ROOT \
+    -o /home/mersdk/packaging/settings-plugin/libprotonsettingsplugin.so \
+    /home/mersdk/packaging/settings-plugin/settings_plugin.o \
+    /home/mersdk/packaging/settings-plugin/moc_settings_plugin.o \
+    -L$TARGET_ROOT/usr/lib64 \
+    -lQt5Core \
+    -lQt5Qml \
+    -lQt5Contacts \
+    -lmkcal-qt5 \
+    -lKF5CalendarCore \
+    -lpthread -ldl -lm
+
+chown 1000:1000 /home/mersdk/packaging/settings-plugin/libprotonsettingsplugin.so
+echo "Settings plugin built successfully"
+ls -lh /home/mersdk/packaging/settings-plugin/libprotonsettingsplugin.so
 '
 
 echo "========================================="
@@ -253,6 +310,8 @@ scp "$repo_root/packaging/accounts/proton-caldav.service" defaultuser@$PHONE_IP:
 scp "$repo_root/ui/proton.qml" defaultuser@$PHONE_IP:/tmp/proton.qml
 scp "$repo_root/ui/proton-settings.qml" defaultuser@$PHONE_IP:/tmp/proton-settings.qml
 scp "$repo_root/ui/proton-update.qml" defaultuser@$PHONE_IP:/tmp/proton-update.qml
+scp "$packaging_dir/settings-plugin/libprotonsettingsplugin.so" defaultuser@$PHONE_IP:/tmp/libprotonsettingsplugin.so
+scp "$repo_root/proton-bridge/settings/qmldir" defaultuser@$PHONE_IP:/tmp/proton-qmldir
 
 ssh defaultuser@$PHONE_IP "
 set -e
@@ -288,6 +347,13 @@ cp /tmp/proton.qml /usr/share/accounts/ui/proton.qml
 cp /tmp/proton-settings.qml /usr/share/accounts/ui/proton-settings.qml
 cp /tmp/proton-update.qml /usr/share/accounts/ui/proton-update.qml
 rm -f /usr/share/accounts/ui/proton-creation.qml
+
+# QML settings extension (ProtonDataPurger for the purge menu item)
+mkdir -p /usr/lib64/qt5/qml/Proton
+cp /tmp/libprotonsettingsplugin.so /usr/lib64/qt5/qml/Proton/libprotonsettingsplugin.so
+chmod 755 /usr/lib64/qt5/qml/Proton/libprotonsettingsplugin.so
+cp /tmp/proton-qmldir /usr/lib64/qt5/qml/Proton/qmldir
+chmod 644 /usr/lib64/qt5/qml/Proton/qmldir
 '
 
 # Restart msyncd

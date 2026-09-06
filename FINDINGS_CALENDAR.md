@@ -425,3 +425,50 @@ TRANSP, SEQUENCE, EXDATE list, reminders/Notifications, Color, DTSTAMP/CREATED.
   account-deletion data cleanup, reminder (Notifications)→VALARM mapping,
   upsync (read-only v1). (Spec already gained mkcal-qt5/kf5-calendarcore
   Requires; organizer dep eliminated with the mKCal rewrite.)
+
+## 10. TODO for Follow-up (consolidated 2026-09-06)
+
+Calendar sync:
+- [x] Settings-toggle→profile wiring (FIXED 2026-09-06, verified end-to-end): labels come from
+  `AccountsUtil.serviceDisplayNameForService` (hardcoded name list, then
+  type map). Our caldav service was typed `carddav` → two "Contacts"
+  toggles, so the user flipped Contacts and the calendar profile stayed
+  disabled. DB row 44 confirmed cached as `carddav`. Deeper: the stock
+  toggle hardcodes a CalDAV discovery page for `serviceType === "caldav"`
+  which reverts on failure — impossible for Proton. Fix applied: custom
+  service type `proton-calendar` (plain switch + own display name per the
+  default branch; msyncd/shim match by NAME). Staged
+  `/tmp/proton-caldav.service`; DB row updated, user flipped ON, profile
+  self-enabled, `startSync` true with no workaround, sync 0/0 (20 saved).
+  Cosmetic remainder: toggle has no description line (default branch).
+- [x] Account-deletion data cleanup: per user feedback, explicit pulley-menu
+  action instead of magic auto-cleanup. Forked `proton-settings.qml`
+  (stock agent has no menu hook) + new `Proton 1.0` QML extension
+  (`proton-bridge/settings/`, `ProtonDataPurger.purgeData`) with remorse.
+  VERIFIED 2026-09-06 end to end: purge deleted collection + both notebooks
+  (`purgeData done ok=1`, UI empty), re-sync restored 1 contact + 20 events.
+- [ ] Reminders (`Notifications` tri-state row field) → VALARM mapping on
+  write; currently parsed and carried in JSON but not stored.
+- [ ] Upsync (currently read-only): local creates/edits/deletes never reach
+  Proton (`PUT .../events/sync` whole-object replace — see api.md pitfalls:
+  re-send Notifications/Color/Attendees verbatim, patch cards in place,
+  reuse session keys, SEQUENCE rules for exceptions).
+- [ ] Recurrence fidelity: only FREQ/COUNT/UNTIL mapped; BYDAY/INTERVAL and
+  complex rules ignored. Moved-across-days exceptions show standalone
+  (correct times) instead of linked.
+- [ ] Attendees/invites: identities stored display-only; no RSVP status
+  sync, no invitation sending.
+- [ ] Tombstone accumulation: soft-deleted rows (e.g. row 59) are never
+  purged — consider `purgeDeletedIncidences` once replacement is proven.
+- [ ] Typed windowed listing anomaly (runs 1–10 notes above): identical
+  typed queries intermittently 200-empty while untyped succeeds; untyped +
+  client filter is primary, typed code retained mock-tested for future work.
+- [ ] Token `Signature` verify skipped (lenient, proton-cal behavior) —
+  consider sequoia detached-verify once author public keys are available.
+- [ ] Debug scaffolding in shipped lib code (`LIVE_TRACE` eprintlns,
+  `fetch_events_raw`/`fetch_events_page_raw` diag helpers, token-prefix
+  logs, parse-skip logs): feature-gate or remove before release hardening.
+
+Contacts sync (from PLAN.md, still open):
+- [ ] Two-way sync (download-only today), incremental sync (full fetch),
+  cross-source dedup, multiple photos (first avatar only).

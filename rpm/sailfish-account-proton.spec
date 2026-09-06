@@ -3,7 +3,7 @@ Summary:        Proton account provider for SailfishOS
 Version:        0.1.0
 Release:        1
 License:        GPL-3.0-or-later
-URL:            https://github.com/nappa85/sailfish-proton
+URL:            https://github.com/nappa85/proton-bridge
 Source0:        %{name}-%{version}.tar.bz2
 
 # Accounts &SSO BuildRequires not needed for file-only packaging; keep minimal for SDK
