@@ -74,6 +74,23 @@ impl AuthClient {
         let two_fa_enabled = Self::is_totp_required(&resp.TwoFA, &resp.TwoFactor);
         let scopes: Vec<String> = resp.Scopes.clone().unwrap_or_default();
 
+        // FIDO2-only accounts (Enabled == 2 without TOTP) get a locked
+        // session that only a WebAuthn ceremony can unlock — and Sailfish
+        // has no WebAuthn client or authenticator path (no platform
+        // authenticator, no CTAP transport, native QML agent without
+        // WebView; even Proton Bridge supports TOTP only). Fail loudly
+        // with guidance instead of proceeding with a locked session that
+        // 403s confusingly downstream. The SignOn plugin surfaces this as
+        // a NotAuthorized error in Settings.
+        if Self::is_fido2_only(&resp.TwoFA, &resp.TwoFactor) {
+            return Err(ProtonError::Auth(
+                "FIDO2 two-factor authentication is required but not supported by this client. \
+                 Please enable TOTP two-factor authentication in your Proton account settings \
+                 (it can be used alongside your security key), then try again."
+                    .into(),
+            ));
+        }
+
         let tokens = AuthTokens {
             access_token: resp.AccessToken.clone(),
             refresh_token: resp.RefreshToken.clone(),
@@ -204,6 +221,19 @@ impl AuthClient {
             // Legacy: Enabled==1 means TOTP.
         }
         false
+    }
+
+    /// True when the account demands FIDO2/WebAuthn with no TOTP available
+    /// (Enabled == 2, TOTP flag unset). See the `login` docs for why this is
+    /// a hard error rather than a locked session.
+    fn is_fido2_only(two_fa: &Option<TwoFAField>, two_factor: &Option<TwoFactorInfo>) -> bool {
+        let modern = two_fa
+            .as_ref()
+            .is_some_and(|f| f.Enabled == 2 && f.TOTP != 1);
+        let legacy = two_factor
+            .as_ref()
+            .is_some_and(|f| f.Enabled.unwrap_or(0) == 2 && f.TOTP.unwrap_or(0) != 1);
+        modern || legacy
     }
 
     fn post_auth(&self, username: &str, proofs: &SrpProofs) -> Result<AuthResponse> {
@@ -736,6 +766,37 @@ mod tests {
         }"#;
         let resp = make_auth_response(json);
         assert!(!AuthClient::is_totp_required(&resp.TwoFA, &resp.TwoFactor));
+        assert!(AuthClient::is_fido2_only(&resp.TwoFA, &resp.TwoFactor));
+    }
+
+    #[test]
+    fn test_fido2_only_excludes_totp_variants() {
+        // TOTP present alongside FIDO2 (Enabled=3) is NOT fido2-only: the
+        // TOTP path handles it.
+        let both = make_auth_response(
+            r#"{"AccessToken":"a","RefreshToken":"r","UID":"u","ExpiresIn":1,"ServerProof":"s",
+                "2FA":{"Enabled":3,"TOTP":1}}"#,
+        );
+        assert!(!AuthClient::is_fido2_only(&both.TwoFA, &both.TwoFactor));
+        assert!(AuthClient::is_totp_required(&both.TwoFA, &both.TwoFactor));
+        // Plain TOTP account is not fido2-only either.
+        let totp = make_auth_response(
+            r#"{"AccessToken":"a","RefreshToken":"r","UID":"u","ExpiresIn":1,"ServerProof":"s",
+                "2FA":{"Enabled":1,"TOTP":1}}"#,
+        );
+        assert!(!AuthClient::is_fido2_only(&totp.TwoFA, &totp.TwoFactor));
+        // No 2FA at all: neither.
+        let none = make_auth_response(
+            r#"{"AccessToken":"a","RefreshToken":"r","UID":"u","ExpiresIn":1,"ServerProof":"s"}"#,
+        );
+        assert!(!AuthClient::is_fido2_only(&none.TwoFA, &none.TwoFactor));
+        assert!(!AuthClient::is_totp_required(&none.TwoFA, &none.TwoFactor));
+        // Legacy shape with FIDO2-only Enabled.
+        let legacy = make_auth_response(
+            r#"{"AccessToken":"a","RefreshToken":"r","UID":"u","ExpiresIn":1,"ServerProof":"s",
+                "TwoFactor":{"Enabled":2}}"#,
+        );
+        assert!(AuthClient::is_fido2_only(&legacy.TwoFA, &legacy.TwoFactor));
     }
 
     #[test]

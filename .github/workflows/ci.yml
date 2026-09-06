@@ -35,6 +35,23 @@ jobs:
       - run: cargo test -p proton-api -p proton-sync --all-features
       - run: cargo check -p proton-bridge
 
+  qml:
+    name: QML lint (qmllint syntax)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Qt QML tools
+        run: sudo apt-get update && sudo apt-get install -y qtdeclarative5-dev-tools
+      - name: qmllint syntax check
+        # Qt 5.15 qmllint is a pure syntax verifier: it parses QML/JS with
+        # QQmlJS and never resolves imports, so the Sailfish-only modules
+        # (Sailfish.Silica, com.jolla.*) cannot cause false positives.
+        # Non-zero exit means a real syntax error. (Verified against
+        # qtdeclarative 5.15 tools/qmllint/main.cpp.)
+        run: |
+          export PATH="$PATH:/usr/lib/qt5/bin:/usr/lib/x86_64-linux-gnu/qt5/bin"
+          command -v qmllint
+          qmllint ui/*.qml
   # Cross-compilation test for aarch64 (host-only, no SDK) — needs aarch64 gcc for ring
   rust-cross:
     name: Rust cross-compile check (aarch64)

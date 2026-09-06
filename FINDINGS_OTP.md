@@ -139,11 +139,69 @@ All 17 tests pass on host.
 
 ---
 
-## 7. TODO for Follow-up
+## 7. TODO for Follow-up (reconciled 2026-09-06 — checked items verified done)
 
-- [ ] Persist `DerivedPasswords` via SignOn blob (`DerivedPasswords` property) instead of only `QSettings` `sync-tokens.conf`, so derived keys survive factory reset of app config.
-- [ ] Add `qmllint` CI step for `ui/*.qml`.
-- [ ] Extend `proton-sync::SyncEngine` to surface `needs_2fa` as distinct `SyncStatus` so Settings can show “OTP required” notification vs generic auth failure.
-- [ ] Consider `FIDO2` (WebAuthn) flow – currently unsupported, will be reported as “FIDO2 required, not implemented”.
-- [ ] Add `cargo test` to `.github/workflows/ci.yml` (already present) and ensure it runs the new mockito tests.
+- [x] Persist `DerivedPasswords` via SignOn blob (`DerivedPasswords` property) instead of only `QSettings` `sync-tokens.conf`, so derived keys survive factory reset of app config. — DONE: `handleAuthOk` stores tokens+`DerivedPasswords` via `store()` *and* `QSettings` fallback; shim + calendar engine read both (verified live, `derived_len=139` with `pw_len=0`).
+- [x] Add `qmllint` CI step for `ui/*.qml`. — DONE 2026-09-06: new `qml`
+  job in `ci.yml` installs `qtdeclarative5-dev-tools` and runs `qmllint
+  ui/*.qml` as a gate. Safe against false positives: Qt 5.15 `qmllint` is
+  a pure syntax verifier (parses with QQmlJS, never resolves imports —
+  verified in `tools/qmllint/main.cpp`), so Sailfish-only modules can't
+  fail it; non-zero exit means a real syntax error.
+- [ ] Extend `proton-sync::SyncEngine` to surface `needs_2fa` as distinct `SyncStatus` so Settings can show “OTP required” notification vs generic auth failure. — HALF DONE: engine already emits `state="needs_2fa"` (`engine.rs` `authenticate`); the Settings-side notification is still missing.
+- [x] Consider `FIDO2` (WebAuthn) flow – currently unsupported, will be reported as “FIDO2 required, not implemented”. — DONE 2026-09-06 as loud failure (see explanation below): `AuthClient::login` detects FIDO2-only accounts (`Enabled==2` without TOTP, both `2FA` and legacy shapes) and returns a guiding error instead of a locked session that 403s downstream; SignOn surfaces it as NotAuthorized. Full ceremony stays out of scope: no WebAuthn client/authenticator path exists on Sailfish (see §8).
+- [x] Add `cargo test` to `.github/workflows/ci.yml` (already present) and ensure it runs the new mockito tests. — DONE: `ci.yml:33-35` runs `fmt --check`, `clippy -D warnings`, and `cargo test -p proton-api -p proton-sync --all-features`, which includes all mockito + calendar tests.
+
+---
+
+## 8. FIDO2 (WebAuthn) — why it fails loudly instead (2026-09-06)
+
+References: Proton `AuthResponse.TwoFactor` bitmask (`1=TOTP`, `2=FIDO2`,
+`3=both`; also `2FA.Enabled`), Proton Bridge (official Go product: TOTP
+only), Yubico WebAuthn guide (ceremony model).
+
+### How TOTP works here (for contrast)
+
+SRP login → server returns a **locked** session (scopes include `twofactor`)
+plus `2FA.Enabled`. Our QML collects the 6-digit code in-page → SignOn
+plugin `POST /auth/v4/2fa {"TwoFactorCode"}` → server upgrades the scopes
+**in place** (no new tokens) → derive + store. Everything is plain HTTPS
+JSON — no special hardware or OS services involved.
+
+### What a FIDO2 second factor would require
+
+After the same SRP login with `Enabled==2`, the client must run a WebAuthn
+**assertion ceremony** instead of sending a code:
+
+1. Obtain a server challenge (Proton's 2FA endpoint family with a FIDO2
+   payload, mirroring the web client's `{"FIDO2": <assertion>}` shape).
+2. A WebAuthn **client** (browser `navigator.credentials.get()` or an OS
+   FIDO API) forwards the challenge plus the relying-party identity
+   (`proton.me` — this origin check is what makes it phishing-resistant).
+3. A FIDO2 **authenticator** — platform (Touch ID / Windows Hello style) or
+   roaming (YubiKey over USB-C/NFC/BLE via CTAP2) — signs the challenge
+   with the credential private key after a user gesture (tap/PIN/biometric).
+4. The assertion POSTs back; the server verifies it against the registered
+   public key and upgrades the session scopes, exactly like the TOTP path.
+
+### Why every link is missing on Sailfish
+
+- **No platform authenticator**: Sailfish has no Touch ID / Windows Hello
+  equivalent and no OS-level FIDO API for native apps.
+- **No CTAP transport path**: nothing connects a USB/NFC/BLE security key
+  to our account flow (no HID/CTAP stack, no browser to borrow one from).
+- **No ceremony host**: our OTP flow deliberately collects the code in
+  native QML (signon-ui's in-process dialog SIGSEGVs on this image); there
+  is no WebView that could run `navigator.credentials`, and embedding one
+  just for WebAuthn would pull in an entire browser security surface.
+- Precedent: even Proton's official Bridge implements TOTP only.
+
+### What we do instead
+
+`AuthClient::login` detects FIDO2-only (`Enabled==2`, TOTP flag unset, both
+modern and legacy shapes) and returns a guiding error — enable TOTP in
+Proton settings (it coexists with the security key, `Enabled==3`, which
+already works through our TOTP path) — instead of proceeding with a locked
+session that 403s confusingly downstream. Covered by
+`test_fido2_only_excludes_totp_variants` + the extended FIDO2-only test.
 
