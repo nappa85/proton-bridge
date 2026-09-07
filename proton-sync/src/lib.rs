@@ -6,6 +6,7 @@ pub mod calendar_full;
 pub mod config;
 pub mod engine;
 pub mod status;
+pub mod upsync;
 
 pub use config::SyncConfig;
 pub use engine::SyncEngine;

@@ -29,4 +29,16 @@ pub struct SyncConfig {
     /// Live fetch always wins when non-empty.
     #[serde(default)]
     pub calendar_defaults: Option<HashMap<String, CalendarDefaults>>,
+    /// Local inventory exported by the shim for the upsync cycle
+    /// (`upsync::LocalItem` JSON). `None` (or empty) = download-only,
+    /// byte-identical behavior to before wiring.
+    #[serde(default)]
+    pub local_inventory: Option<Vec<crate::upsync::LocalItem>>,
+    /// Per-row sync anchors (`upsync::AnchorMap`): Proton row ID →
+    /// server `LastEditTime` at the last successful sync.
+    #[serde(default)]
+    pub anchor_map: Option<HashMap<String, i64>>,
+    /// API base override for tests (mockito). `None` = production.
+    #[serde(default)]
+    pub api_base_url: Option<String>,
 }

@@ -136,9 +136,20 @@ private:
     QPair<QString, QString> loadPersistedCalendarTokens();
     void persistCalendarDefaults(const QString &defaultsJson);
     QString loadCalendarDefaults();
+    void persistUpsyncAnchors(const QString &anchorsJson);
+    QString loadUpsyncAnchors();
+    void persistUpsyncMaps(const QJsonArray &events,
+                           const mKCal::ExtendedCalendar::Ptr &cal);
+    void purgeListedTombstones(const mKCal::ExtendedStorage::Ptr &storage,
+                               const QStringList &notebookUids,
+                               const QSet<QString> &uids);
+    QJsonArray exportLocalInventory();
 
     ProtonCalendarEngine *m_calEngine = nullptr;
     QTimer *m_calTimer = nullptr;
+    // Planner purgeable UIDs from the last `complete` run (unioned with
+    // replacement-phase removals at purge time; cleared on uninit).
+    QSet<QString> m_purgeableUids;
     QString m_accountId;
     Accounts::Manager *m_accountManager = nullptr;
     SignOn::Identity *m_identity = nullptr;

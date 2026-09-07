@@ -877,6 +877,7 @@ bool ProtonCalendarPlugin::init() {
     return requestCalendarCredentials();
 }
 bool ProtonCalendarPlugin::uninit() {
+    m_purgeableUids.clear();
     if (m_calTimer) {
         m_calTimer->stop();
         delete m_calTimer;
@@ -974,13 +975,22 @@ void ProtonCalendarPlugin::onCalendarSignOnResponse(const SignOn::SessionData &d
         emit error(getProfileName(), QStringLiteral("No auth tokens received"), Buteo::SyncResults::AUTHENTICATION_FAILURE);
         return;
     }
-    m_calEngine = proton_calendar_create_engine_with_derived_and_defaults(
+    // Upsync inputs: local inventory (live rows + tombstones) and the
+    // persisted anchor map. Empty inventory = download-only, identical to
+    // the old constructor path (malformed JSON degrades the same way).
+    QJsonArray inventory = exportLocalInventory();
+    QByteArray inventoryJson =
+        QJsonDocument(inventory).toJson(QJsonDocument::Compact);
+    proton_log(QStringLiteral("Calendar inventory: %1 live/tombstone rows").arg(inventory.size()));
+    m_calEngine = proton_calendar_create_engine_with_inventory(
         username.toUtf8().constData(),
         accessToken.toUtf8().constData(),
         refreshToken.toUtf8().constData(),
         uid.toUtf8().constData(),
         derivedJson.toUtf8().constData(),
-        loadCalendarDefaults().toUtf8().constData());
+        loadCalendarDefaults().toUtf8().constData(),
+        inventoryJson.constData(),
+        loadUpsyncAnchors().toUtf8().constData());
     if (!m_calEngine) {
         emit error(getProfileName(), QStringLiteral("Failed to create calendar engine"), Buteo::SyncResults::INTERNAL_ERROR);
         return;
@@ -1034,6 +1044,36 @@ void ProtonCalendarPlugin::pollCalendarStatus() {
         if (defaults) {
             persistCalendarDefaults(QString::fromUtf8(defaults));
             proton_bridge_free_string(defaults);
+        }
+        // Upsync outputs (only meaningful on `complete`, which is where we
+        // are): anchors persist wholesale (null/empty never clobbers — the
+        // getter returns null then), purgeable feeds the selective purge in
+        // writeEventsToMkCal below, conflicts notify server-wins.
+        char *anchors = proton_calendar_get_anchors_json(m_calEngine);
+        if (anchors) {
+            persistUpsyncAnchors(QString::fromUtf8(anchors));
+            proton_bridge_free_string(anchors);
+        }
+        m_purgeableUids.clear();
+        char *purgeable = proton_calendar_get_purgeable_json(m_calEngine);
+        if (purgeable) {
+            QJsonDocument doc = QJsonDocument::fromJson(QByteArray(purgeable));
+            proton_bridge_free_string(purgeable);
+            if (doc.isArray()) {
+                for (const QJsonValue &v : doc.array()) {
+                    if (v.isString()) m_purgeableUids.insert(v.toString());
+                }
+            }
+        }
+        char *conflicts = proton_calendar_get_conflicts_json(m_calEngine);
+        if (conflicts) {
+            QJsonDocument doc = QJsonDocument::fromJson(QByteArray(conflicts));
+            proton_bridge_free_string(conflicts);
+            if (doc.isArray() && !doc.array().isEmpty()) {
+                sendProtonNotification(
+                    QStringLiteral("Proton Calendar sync conflicts"),
+                    QStringLiteral("%1 events changed on both sides; server version kept").arg(doc.array().size()));
+            }
         }
         char *json = proton_calendar_get_events_json(m_calEngine);
         if (json) {
@@ -1229,6 +1269,91 @@ static KCalendarCore::Attendee::Role mapAttendeeRole(const QString &s) {
     return KCalendarCore::Attendee::ReqParticipant;
 }
 
+static QString weekdayCode(int day) {
+    switch (day) {
+    case 1: return QStringLiteral("MO");
+    case 2: return QStringLiteral("TU");
+    case 3: return QStringLiteral("WE");
+    case 4: return QStringLiteral("TH");
+    case 5: return QStringLiteral("FR");
+    case 6: return QStringLiteral("SA");
+    case 7: return QStringLiteral("SU");
+    default: return QString();
+    }
+}
+
+static QString intList(const QList<int> &nums) {
+    QStringList parts;
+    for (int n : nums) parts << QString::number(n);
+    return parts.join(',');
+}
+
+// Serialize a KCalendarCore recurrence rule to an RFC5545 RRULE string for
+// the upsync inventory (common subset only: FREQ D/W/M/Y + INTERVAL +
+// COUNT/UNTIL + BYDAY/BYMONTHDAY/BYMONTH/BYSETPOS + WKST). Anything else
+// (sub-daily FREQ, BYHOUR/MINUTE/SECOND, BYYEARDAY/BYWEEKNO) is
+// unserializable: hasRecurrence=true with an empty rule, so the engine
+// keeps the server rule on update (phone edit reverts on download,
+// documented) and defers creates (never flatten a series silently).
+// RRULE with both COUNT and UNTIL is likewise unserializable (server
+// rejects the combo).
+static QString serializeRrule(KCalendarCore::RecurrenceRule *rule, bool *hasRecurrence) {
+    *hasRecurrence = false;
+    if (!rule || rule->recurrenceType() == KCalendarCore::RecurrenceRule::rNone) {
+        return QString();
+    }
+    *hasRecurrence = true;
+    QString freq;
+    switch (rule->recurrenceType()) {
+    case KCalendarCore::RecurrenceRule::rDaily: freq = QStringLiteral("DAILY"); break;
+    case KCalendarCore::RecurrenceRule::rWeekly: freq = QStringLiteral("WEEKLY"); break;
+    case KCalendarCore::RecurrenceRule::rMonthly: freq = QStringLiteral("MONTHLY"); break;
+    case KCalendarCore::RecurrenceRule::rYearly: freq = QStringLiteral("YEARLY"); break;
+    default: return QString(); // sub-daily: not server-mappable
+    }
+    if (!rule->byHours().isEmpty() || !rule->byMinutes().isEmpty()
+        || !rule->bySeconds().isEmpty() || !rule->byYearDays().isEmpty()
+        || !rule->byWeekNumbers().isEmpty()) {
+        return QString();
+    }
+    QString rrule = QStringLiteral("FREQ=") + freq;
+    if (rule->frequency() > 1) {
+        rrule += QStringLiteral(";INTERVAL=") + QString::number(rule->frequency());
+    }
+    bool hasCount = rule->duration() > 0;
+    bool hasUntil = rule->endDt().isValid();
+    if (hasCount && hasUntil) return QString();
+    if (hasCount) {
+        rrule += QStringLiteral(";COUNT=") + QString::number(rule->duration());
+    } else if (hasUntil) {
+        QDateTime until = rule->endDt().toUTC();
+        rrule += QStringLiteral(";UNTIL=") + until.toString(QStringLiteral("yyyyMMdd'T'HHmmss'Z'"));
+    }
+    if (!rule->byDays().isEmpty()) {
+        QStringList days;
+        for (const KCalendarCore::RecurrenceRule::WDayPos &wp : rule->byDays()) {
+            QString code = weekdayCode(wp.day());
+            if (code.isEmpty()) return QString();
+            days << (wp.pos() == 0 ? code : QString::number(wp.pos()) + code);
+        }
+        rrule += QStringLiteral(";BYDAY=") + days.join(',');
+    }
+    if (!rule->byMonthDays().isEmpty()) {
+        rrule += QStringLiteral(";BYMONTHDAY=") + intList(rule->byMonthDays());
+    }
+    if (!rule->byMonths().isEmpty()) {
+        rrule += QStringLiteral(";BYMONTH=") + intList(rule->byMonths());
+    }
+    if (!rule->bySetPos().isEmpty()) {
+        rrule += QStringLiteral(";BYSETPOS=") + intList(rule->bySetPos());
+    }
+    QString wkst = weekdayCode(rule->weekStart());
+    if (!wkst.isEmpty()) {
+        rrule += QStringLiteral(";WKST=") + wkst;
+    }
+    return rrule;
+}
+
 // Fill a KCalendarCore event from one JSON row (times precomputed by caller).
 // Recurrence linkage (recurrenceId) is handled by the caller: pass 1 adds
 // masters, pass 2 decomposes exceptions into EXDATE + standalone (T15).
@@ -1242,6 +1367,15 @@ static void fillEventFromJson(const KCalendarCore::Event::Ptr &ev, const QJsonOb
                               const QString &uid, const QDateTime &start, const QDateTime &end,
                               bool fullDay) {
     ev->setUid(uid);
+    // Server row ID for future upsync change detection (planner input):
+    // local inventory maps mKCal UID → this ID to build update/delete ops.
+    // Stored for masters and decomposed exception standalones alike (the
+    // exception row carries its OWN id). Read back via
+    // customProperty("PROTON", "EVENT-ID") when exporting deltas.
+    QString protonId = o.value(QLatin1String("id")).toString();
+    if (!protonId.isEmpty()) {
+        ev->setCustomProperty("PROTON", "EVENT-ID", protonId);
+    }
     QString summary = o.value(QLatin1String("summary")).toString();
     ev->setSummary(summary.isEmpty() ? uid : summary);
     ev->setDescription(o.value(QLatin1String("description")).toString());
@@ -1450,6 +1584,10 @@ bool ProtonCalendarPlugin::writeEventsToMkCal(const QByteArray &json) {
     }
     // Migration + full replacement: drop events from ALL our notebooks,
     // including the legacy single per-account notebook of the first version.
+    // Dropped UIDs are tracked: sync artifacts whose tombstones must be
+    // purged even though the planner never saw them (unioned with the
+    // engine purgeable set at purge time).
+    QSet<QString> removedUids;
     QString legacyUid = QStringLiteral("proton-calendar-%1").arg(m_accountId);
     QString prefix = QStringLiteral("proton-calendar-%1-").arg(m_accountId);
     mKCal::Notebook::List nbs = storage->notebooks();
@@ -1468,7 +1606,10 @@ bool ProtonCalendarPlugin::writeEventsToMkCal(const QByteArray &json) {
         int removed = 0;
         for (const KCalendarCore::Incidence::Ptr &inc : existing) {
             KCalendarCore::Event::Ptr ev = inc.dynamicCast<KCalendarCore::Event>();
-            if (ev && cal->deleteEvent(ev)) removed++;
+            if (ev && cal->deleteEvent(ev)) {
+                removedUids.insert(ev->uid());
+                removed++;
+            }
         }
         if (removed > 0) {
             proton_log(QStringLiteral("Removed %1 old events from %2").arg(removed).arg(nb->uid()));
@@ -1548,22 +1689,253 @@ bool ProtonCalendarPlugin::writeEventsToMkCal(const QByteArray &json) {
         return false;
     }
     proton_log(QStringLiteral("Saved %1 calendar events to mkcal").arg(saved));
-    // Purge soft-deleted tombstones in our notebooks (full-replacement leaves
-    // them behind every sync; e.g. superseded exception rows). Scoped to our
-    // notebook uids only. NOTE for future upsync work: purging destroys the
-    // delete-history a server upload would need — upsync must track deletes
-    // by Proton event id instead.
-    for (const QString &purgedNbUid : syncedNotebooks) {
-        KCalendarCore::Incidence::List deleted;
-        if (storage->deletedIncidences(&deleted, QDateTime(), purgedNbUid) && !deleted.isEmpty()) {
-            if (storage->purgeDeletedIncidences(deleted, purgedNbUid)) {
-                proton_log(QStringLiteral("Purged %1 tombstones from %2").arg(deleted.size()).arg(purgedNbUid));
-            } else {
-                proton_log(QStringLiteral("purgeDeletedIncidences failed ") + purgedNbUid);
+    // Upsync bookkeeping (write-only today; consumed at wiring): per-row
+    // Proton IDs, server-mtime anchors and lastModified snapshots so the
+    // planner can map local inventory → server ops and detect dirt.
+    persistUpsyncMaps(arr, cal);
+    // Tombstone purge: selective for our notebooks (planner purgeable set
+    // ∪ replacement-phase removals — the union covers both user deletes
+    // whose server deletes uploaded OK and sync-artifact tombstones from
+    // the replacement above). The retired v1 notebook keeps the legacy
+    // unconditional purge (no live data, only lingering tombstones).
+    // Fail-closed: m_purgeableUids is only populated from a `complete`
+    // engine run whose uploads succeeded; any upload error aborts the
+    // engine before we get here, so un-uploaded user tombstones survive
+    // for the next cycle.
+    {
+        QSet<QString> purgeUids = m_purgeableUids + removedUids;
+        QString legacyUid = QStringLiteral("proton-calendar-%1").arg(m_accountId);
+        for (const QString &purgedNbUid : syncedNotebooks) {
+            if (purgedNbUid == legacyUid) {
+                KCalendarCore::Incidence::List deleted;
+                if (storage->deletedIncidences(&deleted, QDateTime(), purgedNbUid) && !deleted.isEmpty()) {
+                    if (storage->purgeDeletedIncidences(deleted, purgedNbUid)) {
+                        proton_log(QStringLiteral("Purged %1 tombstones from %2").arg(deleted.size()).arg(purgedNbUid));
+                    }
+                }
+                continue;
             }
+            purgeListedTombstones(storage, QStringList() << purgedNbUid, purgeUids);
         }
     }
     return true;
+}
+// Upsync bookkeeping, written after every successful save (phase 4 data).
+// Three JSON blobs under QSettings proton/sync-tokens/<accountId>:
+// - proton_id_map: {stored mKCal UID: Proton row event ID} — tombstone
+//   fallback when a deleted incidence lost its custom property.
+// - proton_anchors: {Proton row ID: server LastEditTime} — planner anchors.
+// - proton_last_modified: {stored mKCal UID: lastModified msecs} — dirt
+//   baseline (missing entry = treat clean, so pre-feature rows never
+//   mass-upload on the first wired sync).
+void ProtonCalendarPlugin::persistUpsyncMaps(const QJsonArray &arr,
+                                             const mKCal::ExtendedCalendar::Ptr &cal) {
+    QVariantMap idMap, anchors, modified;
+    for (int i = 0; i < arr.size(); ++i) {
+        QJsonObject o = arr.at(i).toObject();
+        QString uid = o.value(QLatin1String("uid")).toString();
+        QString summary = o.value(QLatin1String("summary")).toString();
+        if (uid.isEmpty() && summary.isEmpty()) continue; // same skip as save
+        QString protonId = o.value(QLatin1String("id")).toString();
+        if (protonId.isEmpty()) continue;
+        qint64 recurrenceId = o.value(QLatin1String("recurrence_id")).toVariant().toLongLong();
+        QString storedUid = recurrenceId > 0
+            ? namespacedUid(QStringLiteral("%1#%2").arg(uid, QString::number(recurrenceId)))
+            : namespacedUid(uid);
+        idMap.insert(storedUid, protonId);
+        bool mtimeOk = false;
+        qint64 mtime = o.value(QLatin1String("mtime")).toVariant().toLongLong(&mtimeOk);
+        if (mtimeOk) anchors.insert(protonId, mtime);
+        KCalendarCore::Event::Ptr ev = cal->event(storedUid);
+        if (ev && ev->lastModified().isValid()) {
+            modified.insert(storedUid, ev->lastModified().toMSecsSinceEpoch());
+        }
+    }
+    QSettings settings(QStringLiteral("proton"), QStringLiteral("sync-tokens"));
+    settings.beginGroup(m_accountId);
+    settings.setValue(QStringLiteral("proton_id_map"),
+                      QString::fromUtf8(QJsonDocument::fromVariant(idMap).toJson(QJsonDocument::Compact)));
+    settings.setValue(QStringLiteral("proton_anchors"),
+                      QString::fromUtf8(QJsonDocument::fromVariant(anchors).toJson(QJsonDocument::Compact)));
+    settings.setValue(QStringLiteral("proton_last_modified"),
+                      QString::fromUtf8(QJsonDocument::fromVariant(modified).toJson(QJsonDocument::Compact)));
+    settings.endGroup();
+}
+
+// Selective tombstone purge for the wired upsync cycle: purge ONLY the
+// listed UIDs, and only called after their server deletes uploaded OK.
+// (Uncalled until wiring; the unconditional loop above stays until then.)
+void ProtonCalendarPlugin::purgeListedTombstones(const mKCal::ExtendedStorage::Ptr &storage,
+                                                 const QStringList &notebookUids,
+                                                 const QSet<QString> &uids) {
+    if (uids.isEmpty()) return;
+    for (const QString &nbUid : notebookUids) {
+        KCalendarCore::Incidence::List deleted;
+        if (!storage->deletedIncidences(&deleted, QDateTime(), nbUid) || deleted.isEmpty()) {
+            continue;
+        }
+        KCalendarCore::Incidence::List doomed;
+        for (const KCalendarCore::Incidence::Ptr &inc : deleted) {
+            if (inc && uids.contains(inc->uid())) doomed.append(inc);
+        }
+        if (!doomed.isEmpty() && storage->purgeDeletedIncidences(doomed, nbUid)) {
+            proton_log(QStringLiteral("Purged %1 listed tombstones from %2").arg(doomed.size()).arg(nbUid));
+        }
+    }
+}
+
+// Local inventory for the upsync planner (wiring phase): one object per
+// live incidence in our notebooks plus tombstones:
+// {mkcal_uid, proton_id|null, deleted, modified, last_synced_mtime|null}
+// (exact `upsync::LocalItem` contract). proton_id prefers the live
+// X-PROTON-EVENT-ID custom property, falling back to the persisted id map
+// (tombstones may shed custom props — verified live at wiring). dirty =
+// lastModified differs from the stored snapshot (missing snapshot = clean,
+// never mass-upload). last_synced_mtime comes from the persisted anchor
+// map by proton_id.
+QJsonArray ProtonCalendarPlugin::exportLocalInventory() {
+    QJsonArray out;
+    mKCal::ExtendedCalendar::Ptr cal(
+        new mKCal::ExtendedCalendar(QTimeZone::systemTimeZone()));
+    mKCal::ExtendedStorage::Ptr storage = mKCal::ExtendedCalendar::defaultStorage(cal);
+    if (!storage->open()) {
+        proton_log(QStringLiteral("exportLocalInventory: storage open failed"));
+        return out;
+    }
+    QSettings settings(QStringLiteral("proton"), QStringLiteral("sync-tokens"));
+    settings.beginGroup(m_accountId);
+    auto readMap = [&](const QString &key) {
+        QVariantMap map;
+        QJsonDocument doc = QJsonDocument::fromJson(
+            settings.value(key).toString().toUtf8());
+        if (doc.isObject()) map = doc.toVariant().toMap();
+        return map;
+    };
+    QVariantMap idMap = readMap(QStringLiteral("proton_id_map"));
+    QVariantMap anchors = readMap(QStringLiteral("proton_anchors"));
+    QVariantMap lastMod = readMap(QStringLiteral("proton_last_modified"));
+    settings.endGroup();
+
+    QString prefix = QStringLiteral("proton-calendar-%1-").arg(m_accountId);
+    mKCal::Notebook::List nbs = storage->notebooks();
+    for (const mKCal::Notebook::Ptr &nb : nbs) {
+        if (!nb || !nb->uid().startsWith(prefix)) continue;
+        // Proton calendar ID for create routing (no server row to read it
+        // from); empty when the notebook UID has an unexpected shape.
+        QString calId = nb->uid().mid(prefix.length());
+        if (!storage->loadNotebookIncidences(nb->uid())) continue;
+        KCalendarCore::Incidence::List existing = cal->incidences(nb->uid());
+        QSet<QString> liveUids;
+        for (const KCalendarCore::Incidence::Ptr &inc : existing) {
+            if (inc) liveUids.insert(inc->uid());
+        }
+        for (const KCalendarCore::Incidence::Ptr &inc : existing) {
+            KCalendarCore::Event::Ptr ev = inc.dynamicCast<KCalendarCore::Event>();
+            if (!ev) continue;
+            QJsonObject o;
+            o.insert(QStringLiteral("mkcal_uid"), ev->uid());
+            QString protonId = ev->customProperty("PROTON", "EVENT-ID");
+            if (protonId.isEmpty()) protonId = idMap.value(ev->uid()).toString();
+            o.insert(QStringLiteral("proton_id"),
+                     protonId.isEmpty() ? QJsonValue() : QJsonValue(protonId));
+            o.insert(QStringLiteral("deleted"), false);
+            bool dirty = false;
+            if (ev->lastModified().isValid() && lastMod.contains(ev->uid())) {
+                dirty = lastMod.value(ev->uid()).toLongLong() != ev->lastModified().toMSecsSinceEpoch();
+            }
+            o.insert(QStringLiteral("modified"), dirty);
+            // Contract key is last_synced_mtime (see upsync::LocalItem).
+            if (!protonId.isEmpty() && anchors.contains(protonId)) {
+                o.insert(QStringLiteral("last_synced_mtime"),
+                         QJsonValue(anchors.value(protonId).toLongLong()));
+            } else {
+                o.insert(QStringLiteral("last_synced_mtime"), QJsonValue());
+            }
+            o.insert(QStringLiteral("calendar_id"),
+                     calId.isEmpty() ? QJsonValue() : QJsonValue(calId));
+            // Local field snapshot for rows the planner may upload (dirty
+            // edits + never-synced creates). Clean rows omit it (None).
+            if (!calId.isEmpty() && (dirty || protonId.isEmpty())
+                && ev->dtStart().isValid() && ev->dtEnd().isValid()) {
+                QJsonObject fields;
+                fields.insert(QStringLiteral("summary"), ev->summary());
+                fields.insert(QStringLiteral("description"), ev->description());
+                fields.insert(QStringLiteral("location"), ev->location());
+                fields.insert(QStringLiteral("start_unix"),
+                              QJsonValue(ev->dtStart().toMSecsSinceEpoch() / 1000));
+                fields.insert(QStringLiteral("end_unix"),
+                              QJsonValue(ev->dtEnd().toMSecsSinceEpoch() / 1000));
+                fields.insert(QStringLiteral("all_day"), ev->allDay());
+                bool hasRecurrence = false;
+                QString rrule;
+                if (ev->recurrence() && ev->recurrence()->recurs()) {
+                    KCalendarCore::RecurrenceRule::List rules = ev->recurrence()->rRules();
+                    KCalendarCore::RecurrenceRule *first =
+                        rules.isEmpty() ? nullptr : rules.first();
+                    rrule = serializeRrule(first, &hasRecurrence);
+                }
+                // rrule/absent contract (see LocalFields): no rule at all
+                // omits the key (keep on update); unserializable rule sends
+                // explicit null (update keeps server rule, create defers).
+                if (!hasRecurrence && rrule.isEmpty()) {
+                    fields.insert(QStringLiteral("has_recurrence"), false);
+                } else if (hasRecurrence && !rrule.isEmpty()) {
+                    fields.insert(QStringLiteral("has_recurrence"), false);
+                    fields.insert(QStringLiteral("rrule"), rrule);
+                } else {
+                    fields.insert(QStringLiteral("has_recurrence"), true);
+                    fields.insert(QStringLiteral("rrule"), QJsonValue());
+                }
+                o.insert(QStringLiteral("fields"), fields);
+            }
+            out.append(o);
+        }
+        KCalendarCore::Incidence::List deleted;
+        if (!storage->deletedIncidences(&deleted, QDateTime(), nb->uid())) continue;
+        for (const KCalendarCore::Incidence::Ptr &inc : deleted) {
+            if (!inc) continue;
+            // Stale tombstone shadowing a live row (replacement artifact
+            // from a crashed cycle): the live row wins, drop the tombstone
+            // instead of uploading a spurious server delete.
+            if (liveUids.contains(inc->uid())) continue;
+            QJsonObject o;
+            o.insert(QStringLiteral("mkcal_uid"), inc->uid());
+            QString protonId = inc->customProperty("PROTON", "EVENT-ID");
+            if (protonId.isEmpty()) protonId = idMap.value(inc->uid()).toString();
+            o.insert(QStringLiteral("proton_id"),
+                     protonId.isEmpty() ? QJsonValue() : QJsonValue(protonId));
+            o.insert(QStringLiteral("deleted"), true);
+            o.insert(QStringLiteral("modified"), false);
+            if (!protonId.isEmpty() && anchors.contains(protonId)) {
+                o.insert(QStringLiteral("last_synced_mtime"),
+                         QJsonValue(anchors.value(protonId).toLongLong()));
+            } else {
+                o.insert(QStringLiteral("last_synced_mtime"), QJsonValue());
+            }
+            out.append(o);
+        }
+    }
+    return out;
+}
+
+// Upsync anchor map ({Proton row ID: server LastEditTime}). Persisted
+// wholesale after every `complete` run; empty input never clobbers (the
+// engine getter returns null then, and this is only called with non-null).
+void ProtonCalendarPlugin::persistUpsyncAnchors(const QString &anchorsJson) {
+    if (anchorsJson.isEmpty()) {
+        return;
+    }
+    QSettings settings(QStringLiteral("proton"), QStringLiteral("sync-tokens"));
+    settings.beginGroup(m_accountId);
+    settings.setValue(QStringLiteral("proton_anchors"), anchorsJson);
+    settings.endGroup();
+}
+QString ProtonCalendarPlugin::loadUpsyncAnchors() {
+    QSettings settings(QStringLiteral("proton"), QStringLiteral("sync-tokens"));
+    settings.beginGroup(m_accountId);
+    QString a = settings.value(QStringLiteral("proton_anchors")).toString();
+    settings.endGroup();
+    return a;
 }
 void ProtonCalendarPlugin::persistCalendarTokens(const QString &refreshToken, const QString &uid) {
     QSettings settings(QStringLiteral("proton"), QStringLiteral("sync-tokens"));

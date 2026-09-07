@@ -39,7 +39,6 @@ impl CalendarClient {
         }
     }
 
-    #[cfg(test)]
     pub fn new_with_base_url(base_url: String, access_token: String, uid: String) -> Self {
         Self {
             client: Client::builder()
@@ -401,6 +400,31 @@ impl CalendarClient {
         }
         dedupe_events(&mut out);
         Ok(out)
+    }
+
+    /// Batch create/update/delete via the sync write path (api.md — the
+    /// ONLY event write route; no standalone POST exists). The caller builds
+    /// the batch with `calendar_write` (sealed bodies); this only transports
+    /// it. HTTP errors surface as `Err`; per-op failures live in the
+    /// response (`first_error`). Untested live — covered by mockito tests.
+    pub fn put_sync(
+        &self,
+        cal_id: &str,
+        batch: &crate::calendar_write::SyncBatchRequest,
+    ) -> Result<crate::calendar_write::SyncBatchResponse> {
+        let resp = self
+            .client
+            .put(format!(
+                "{}/calendar/v1/{}/events/sync",
+                self.base_url, cal_id
+            ))
+            .header("Authorization", self.auth_header())
+            .header("x-pm-uid", &self.uid)
+            .header("x-pm-appversion", APP_VERSION)
+            .json(batch)
+            .send()?
+            .error_for_status()?;
+        Ok(resp.json()?)
     }
 
     pub fn get_event(&self, cal_id: &str, event_id: &str) -> Result<CalendarEvent> {

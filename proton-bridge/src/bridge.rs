@@ -301,6 +301,8 @@ pub struct ProtonCalendarEngine {
     synced_events_json: Arc<Mutex<Option<String>>>,
 }
 
+/// FFI boundary unpacking: one String per C pointer by construction.
+#[allow(clippy::too_many_arguments)]
 fn calendar_config_from_parts(
     username: String,
     access_token: String,
@@ -308,6 +310,8 @@ fn calendar_config_from_parts(
     uid: String,
     derived_json: String,
     defaults_json: String,
+    inventory_json: String,
+    anchors_json: String,
 ) -> SyncConfig {
     let derived_passwords = if derived_json.is_empty() {
         None
@@ -318,6 +322,18 @@ fn calendar_config_from_parts(
         None
     } else {
         serde_json::from_str(&defaults_json).ok()
+    };
+    // Malformed inventory/anchors degrade to download-only (None), never
+    // to a half-fed plan: a corrupt inventory must not drive uploads.
+    let local_inventory = if inventory_json.is_empty() {
+        None
+    } else {
+        serde_json::from_str(&inventory_json).ok()
+    };
+    let anchor_map = if anchors_json.is_empty() {
+        None
+    } else {
+        serde_json::from_str(&anchors_json).ok()
     };
     SyncConfig {
         username,
@@ -335,6 +351,8 @@ fn calendar_config_from_parts(
         },
         uid: if uid.is_empty() { None } else { Some(uid) },
         calendar_defaults,
+        local_inventory,
+        anchor_map,
         ..Default::default()
     }
 }
@@ -374,6 +392,8 @@ pub extern "C" fn proton_calendar_create_engine_with_derived(
         uid,
         derived_json,
         String::new(),
+        String::new(),
+        String::new(),
     );
     let engine = CalendarSyncEngine::new(config);
     Box::into_raw(Box::new(ProtonCalendarEngine {
@@ -403,6 +423,46 @@ pub extern "C" fn proton_calendar_create_engine_with_derived_and_defaults(
         uid,
         derived_json,
         defaults_json,
+        String::new(),
+        String::new(),
+    );
+    let engine = CalendarSyncEngine::new(config);
+    Box::into_raw(Box::new(ProtonCalendarEngine {
+        inner: Arc::new(Mutex::new(Some(engine))),
+        synced_events_json: Arc::new(Mutex::new(None)),
+    }))
+}
+/// Full constructor for the wired upsync cycle: inventory (shim
+/// `exportLocalInventory` JSON array) + anchors (persisted map JSON) feed
+/// the planner; empty/invalid strings safely degrade to download-only.
+#[no_mangle]
+pub extern "C" fn proton_calendar_create_engine_with_inventory(
+    username: *const c_char,
+    access_token: *const c_char,
+    refresh_token: *const c_char,
+    uid: *const c_char,
+    derived_passwords_json: *const c_char,
+    defaults_json: *const c_char,
+    inventory_json: *const c_char,
+    anchors_json: *const c_char,
+) -> *mut ProtonCalendarEngine {
+    let username = unsafe { cstr_to_string(username) };
+    let access_token = unsafe { cstr_to_string(access_token) };
+    let refresh_token = unsafe { cstr_to_string(refresh_token) };
+    let uid = unsafe { cstr_to_string(uid) };
+    let derived_json = unsafe { cstr_to_string(derived_passwords_json) };
+    let defaults_json = unsafe { cstr_to_string(defaults_json) };
+    let inventory_json = unsafe { cstr_to_string(inventory_json) };
+    let anchors_json = unsafe { cstr_to_string(anchors_json) };
+    let config = calendar_config_from_parts(
+        username,
+        access_token,
+        refresh_token,
+        uid,
+        derived_json,
+        defaults_json,
+        inventory_json,
+        anchors_json,
     );
     let engine = CalendarSyncEngine::new(config);
     Box::into_raw(Box::new(ProtonCalendarEngine {
@@ -543,6 +603,60 @@ pub extern "C" fn proton_calendar_get_defaults_json(e: *mut ProtonCalendarEngine
     }
 }
 
+/// Upsync cycle outputs (valid after `complete`; `[]`/`{}`-shaped JSON, or
+/// null when the engine is gone — never null-on-empty, so the shim can
+/// distinguish "no data" from "engine missing").
+fn calendar_engine_json(
+    e: *mut ProtonCalendarEngine,
+    pick: fn(&CalendarSyncEngine) -> String,
+) -> *mut c_char {
+    if e.is_null() {
+        return std::ptr::null_mut();
+    }
+    let eref = unsafe { &*e };
+    let guard = eref.inner.lock().unwrap();
+    match guard.as_ref() {
+        Some(eng) => CString::new(pick(eng)).unwrap().into_raw(),
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// mKCal UIDs whose tombstones may be purged (purge ONLY after their
+/// deletes uploaded OK — the engine returns Err otherwise and this stays
+/// stale from a previous run; the shim must only consume it on `complete`).
+#[no_mangle]
+pub extern "C" fn proton_calendar_get_purgeable_json(e: *mut ProtonCalendarEngine) -> *mut c_char {
+    calendar_engine_json(e, CalendarSyncEngine::purgeable_json)
+}
+
+/// Server-wins conflicts this run (shim notifies; download overwrote them).
+#[no_mangle]
+pub extern "C" fn proton_calendar_get_conflicts_json(e: *mut ProtonCalendarEngine) -> *mut c_char {
+    calendar_engine_json(e, CalendarSyncEngine::conflicts_json)
+}
+
+/// Merged anchor map, or null when nothing known (caller must not
+/// overwrite a good cache with that — mirrors defaults_json).
+#[no_mangle]
+pub extern "C" fn proton_calendar_get_anchors_json(e: *mut ProtonCalendarEngine) -> *mut c_char {
+    if e.is_null() {
+        return std::ptr::null_mut();
+    }
+    let eref = unsafe { &*e };
+    let guard = eref.inner.lock().unwrap();
+    match guard.as_ref() {
+        Some(eng) => {
+            let s = eng.anchors_json();
+            if s.is_empty() {
+                std::ptr::null_mut()
+            } else {
+                CString::new(s).unwrap().into_raw()
+            }
+        }
+        None => std::ptr::null_mut(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -589,5 +703,40 @@ mod tests {
         let bridge = ProtonBridgeStatus::from_sync_status(&sync);
         assert_eq!(decode_state(&bridge), "error");
         assert!(decode_error(&bridge).contains("bad password"));
+    }
+
+    #[test]
+    fn test_inventory_config_parses_and_degrades() {
+        // Valid inventory + anchors feed the planner; malformed JSON
+        // degrades to download-only (None) instead of a half-fed plan.
+        let good = calendar_config_from_parts(
+            "u".into(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            r#"[{"mkcal_uid":"n1","proton_id":"e1","deleted":false,"modified":false,"last_synced_mtime":100}]"#.into(),
+            r#"{"e1":100}"#.into(),
+        );
+        let inv = good.local_inventory.expect("inventory parsed");
+        assert_eq!(inv.len(), 1);
+        assert_eq!(inv[0].mkcal_uid, "n1");
+        assert_eq!(
+            good.anchor_map.expect("anchors parsed").get("e1"),
+            Some(&100)
+        );
+        let bad = calendar_config_from_parts(
+            "u".into(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            "not-json".into(),
+            "also-not-json".into(),
+        );
+        assert!(bad.local_inventory.is_none());
+        assert!(bad.anchor_map.is_none());
     }
 }

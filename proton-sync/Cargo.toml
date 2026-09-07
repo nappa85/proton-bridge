@@ -21,3 +21,7 @@ base64 = "0.22"
 
 [features]
 default = []
+
+[dev-dependencies]
+mockito = "1"
+sequoia-openpgp = { workspace = true }

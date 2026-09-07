@@ -97,6 +97,16 @@ Sync (buteo OOPP, proton_bridge_shim.cpp, NoUserInteractionPolicy):
 - **Contact dedup**: No duplicate detection across Proton + local contacts
 - **Multiple photos**: People app only supports one avatar; only first photo is used
 - **Password never persisted** (intentional): raw 20-char login password is transient `Password` param only for `derive_all_passwords` at `Verify`; `signon-secrets.db` `CREDENTIALS.password` stays dummy `"x"`, `handleAuthOk` never returns `Secret`. New `KeySalt` after manual Proton key rotation will need one more **Update credentials → OTP** to re-derive and re-store `DerivedPasswords`.
+- [ ] **Debug-log cleanup / opt-in flag** (filed 2026-09-07): today every
+  sync appends verbosely to `/tmp/proton-sync-debug.log` (shim `proton_log`
+  on every run incl. full row JSON, `diag` bodies, Rust `eprintln` traces)
+  with no size cap, no rotation, no off switch — always-on logging on a
+  user device. Direction: gate verbose output behind an opt-in flag
+  (QSettings `proton/debug` or env, default errors-only), keep the
+  fail-closed error lines + `keys_debug` summary always, cap total size
+  (truncate/rotate), keep existing secret scrubbing (`diag.rs`). Note:
+  the log file itself is already world-readable (`-rw-r--r--`), so remote
+  diagnosis over SSH works as-is; only the calendar DB still needs root.
 - [ ] **UI i18n** (DEFERRED 2026-09-07 by user decision — do after settings
   UI strings stabilize; they changed twice in two days and each change
   invalidates translations): audit 2026-09-07 found all static strings in

@@ -463,18 +463,23 @@ Calendar sync:
   `/tmp/libproton-client.so` (18:25) with both halves.
 - [x] Reminder live-fire (2026-09-06): user created an event 20 min out
   with a 15-min reminder; sync stored 21 events.
-- [ ] Verify VALARM rows (`Alarm` table count is 0 despite 21 events):
-  bootstrap v2 carries NO `CalendarSettings` and all rows are
-  `Notifications: null` — defaults live only on the v1 `/settings` route
-  (verified: 15-min timed / 15-hour full-day). `get_bootstrap` now fills
-  the gap (+ mock tests). Staged `/tmp/libproton-client.so` (18:44).
+- [x] Verify VALARM rows (CLOSED 2026-09-06 21:22 — root cause was the
+  `MakesUserBusy` SILENT PARSE KILLER below, not the v2/v1 gap; `Alarm
+  COUNT(*) = 21` verified live, re-verified 21 on 2026-09-07): bootstrap
+  v2 carries NO `CalendarSettings` and all rows are `Notifications: null`
+  — defaults live only on the v1 `/settings` route (verified: 15-min timed
+  / 15-hour full-day). `get_bootstrap` now fills the gap (+ mock tests).
+  Staged `/tmp/libproton-client.so` (18:44).
 - [x] UID clash across re-created accounts (ROOT-CAUSED + FIXED
   2026-09-06, user spotted it): stored mKCal UIDs were the RAW Proton/ical
   UIDs while mKCal enforces storage-wide uniqueness → orphan 104 rows made
   every 105 batch INSERT fail the whole `save()`. Fix `namespacedUid()`
   (`proton-cal-<id>-<raw>`) at all three UID sites. VERIFIED 21:03:
   `Saved 21`, and full-replacement correctly `Removed 20+1` then re-saved.
-- [ ] Reminder defaults (RESOLVED as server-null 2026-09-06 21:03): the
+- [x] Reminder defaults (CLOSED — the "server-null" theory below was WRONG;
+  superseded by the SILENT PARSE KILLER entry: live envelope DID carry real
+  defaults, `MakesUserBusy: 1` killed the parse. First recorded as RESOLVED
+  as server-null 2026-09-06 21:03): the
   verbose shape line shows `http200 keys=[CalendarSettings,Code]
   inner=[...DefaultFullDayNotifications,DefaultPartDayNotifications...]`
   yet parsed empty — struct field names match, so the server sends the
@@ -513,7 +518,10 @@ Calendar sync:
   session), so the defaults cache cannot self-seed from the phone —
   seeding via host live tool + direct QSettings write is the fallback
   plan (needs fresh OTP).
-- [ ] Scope probe results (host, OTP 20:4x): refresh does NOT narrow
+- [x] Scope probe results (CLOSED — conclusion was "emptiness is NOT
+  scope-related at all", and the true root cause was found later as the
+  `MakesUserBusy` parse killer; no action left. Host, OTP 20:4x): refresh
+  does NOT narrow
   scopes — `Scope=full self payments keys parent user loggedin
   nondelinquent mail calendar drive pass verified settings wallet meet`
   (note: NO `locked` in the list, yet salts work) — and salts_ok both
@@ -527,7 +535,10 @@ Calendar sync:
   keys=[..] inner=[..]` per cal. (Probe artifact noted: the probe's own
   refresh rotates the server token, 401ing the subsequent engine run —
   probe now exits early.)
-- [ ] Cache calendar defaults for restored sessions (in progress
+- [x] Cache calendar defaults for restored sessions (CLOSED — fully
+  implemented engine `last_defaults` → `proton_calendar_get_defaults_json`
+  → shim QSettings persist/feedback; live "Persisted calendar defaults for
+  account 105" 2026-09-06, re-persisted 2026-09-07. Was in progress
   2026-09-06): on restored logins the v1 `/settings` ALSO returns `{}`
   (`settings_empty` on all three cals, verified 19:05) — so there is
   nothing to inherit and `Alarm COUNT(*)` stays 1 (custom-only event).
@@ -549,10 +560,12 @@ Calendar sync:
   reminders (Type 0) are server-sent — no longer stored (display only).
   Process note: verify deploys by sha256, not timestamps (phone/host
   clocks disagree by minutes).
-- [ ] Verify VALARM rows (`Alarm` table count is 0 despite 21 events):
-  either bootstrap carries no defaults (parse gap?) or rows are all null
-  and defaults resolution isn't triggering. Added `LIVE_CALSET` diag
-  (bootstrap Settings dump + per-row raw Notifications).
+- [x] Verify VALARM rows (CLOSED — duplicate of the entry above; same
+  `MakesUserBusy` root cause, `Alarm COUNT(*) = 21` verified 2026-09-06 and
+  2026-09-07): either bootstrap carries no defaults (parse gap?) or rows
+  are all null and defaults resolution isn't triggering. Added
+  `LIVE_CALSET` diag (bootstrap Settings dump + per-row raw
+  Notifications).
 - [ ] Upsync (currently read-only): local creates/edits/deletes never reach
   Proton (`PUT .../events/sync` whole-object replace — see api.md pitfalls:
   re-send Notifications/Color/Attendees verbatim, patch cards in place,
@@ -738,3 +751,168 @@ came from the v1 settings route and were re-persisted
 calendars were (re)created per-calendar as designed. Remaining: user visual
 check in the Calendar app (T09–T15 recurrence series, T14 EXDATE skip, T15
 master+standalone exception, T16 organizer/attendees, T20 notebook).
+
+## 12. Upsync write-path design – 2026-09-07 (local only, no live calls)
+
+Per user instruction: research docs + reference implementations first,
+offline tests before any device/live run. No OTP / root / ssh used. The
+Upsync checkbox in §10 stays `[ ]` — this session built the offline-tested
+design layer only; nothing uploads yet.
+
+### Contract (sources)
+
+- proton-cal `docs/api.md` "The sync endpoint (write path)" + "Recurring
+  events" (verified live June 2026, best reference) and `pkg/event/
+  {wire,write}.go` + `pkg/ical/patch.go` + `pkg/ical/text.go` +
+  `pkg/calcolor` (all fetched 2026-09-07).
+- ProtonMail/WebClients `packages/shared/lib/api/calendars.ts`
+  (`syncMultipleEvents`, personal-part route).
+
+### Rules that drive the design
+
+- ONE write route: `PUT /calendar/v1/{calID}/events/sync`, batch
+  `{MemberID, IsImport?, Events[]}`. No standalone POST. Response top-level
+  `1001` = batch accepted (`1000` single-op cases); per-op `{Index,
+  Response: {Code: 1000, Error, Event?}}`; deletes return top-level only.
+- Shapes: create `{Overwrite: 0, Event}` WITH fresh key packets (+
+  `IsImport: 0`); update `{ID, Event}` with NO key packets (server keeps
+  originals — caller must reuse stored session keys); delete `{ID}`.
+- Update = whole-object REPLACE: omitted `Notifications`/`Color`/
+  `Attendees` reset server-side. Re-send existing values verbatim unless
+  explicitly changing them. `Notifications` tri-state (`null` inherit /
+  `[]` none / array custom — mirrors our read-side `resolve_notifications`
+  exactly); `Color: null` on update is IGNORED (revert = set the calendar's
+  own color explicitly); content arrays `[]` never `null`.
+- Cards patched IN PLACE (never rebuilt from fields — rebuild drops
+  `X-PM-CONFERENCE-*`, ORGANIZER, attendees card, third-party `X-` props):
+  signed card owns structural props (DTSTART/DTEND/RRULE/EXDATE/SEQUENCE),
+  encrypted card owns text (SUMMARY/DESCRIPTION/LOCATION), attendees card
+  verbatim. Update re-encrypts with the SAME session keys (decrypted from
+  stored packets with the calendar key); events without an encrypted
+  calendar card (web-app creates) have no `CalendarKeyPacket` — skip it.
+- SEQUENCE (server-enforced, code 2001): bump ONLY on significant
+  (date/time/recurrence) changes per RFC 5546 — field edits keep it, or a
+  master edit leapfrogs its exceptions; exceptions need `SEQUENCE >=
+  master`. Master time/rule change invalidates exceptions (clean up
+  explicitly). Series delete = master + all same-UID rows in ONE batch (no
+  server cascade — orphans otherwise).
+- RRULE server limits (mirror web `getIsRruleSupported`): FREQ in
+  {DAILY,WEEKLY,MONTHLY,YEARLY}, `COUNT <= 49`, `UNTIL <= 2037-12-31`,
+  COUNT/UNTIL exclusive.
+- Palette: 20 fixed accent hexes (code 2011 otherwise); vendored in
+  `calendar_write.rs` from `pkg/calcolor`.
+
+### Implemented this session (`proton-api/src/calendar_write.rs`, new)
+
+- Wire types with exact PascalCase + presence semantics
+  (`SyncEventBody`/`SyncEventOp`/`SyncBatchRequest` with
+  `skip_serializing_if`; minimal `SyncContentPart` so `MemberID`/`Author`
+  never leak onto the wire) + `SyncBatchResponse::first_error` /
+  `first_event` (1000/1001).
+- `marshal_notifications` tri-state, `marshal_color`, `marshal_attendees`
+  clear rows (`Token`/`Status`/`Comment`), 20-color palette +
+  `resolve_color`/`valid_color`/`color_name`.
+- `CardPatch` + `patch_card` mirroring `PatchCard` (unfold → Delete, Set
+  replaces in place incl. multi-occurrence collapse, missing Sets appended
+  name-sorted, Append dedupes, VALARM blocks + wrapper verbatim, 75/74-octet
+  folding, no trailing CRLF). One deliberate divergence: server-sent
+  `VERSION`/`PRODID` lines are kept verbatim (proton-cal strips; keeping
+  bytes the server produced is safer for a whole-object replace).
+- `escape_ical_text` mirroring `escapeText` (bare CR dropped).
+- `next_sequence` / `exception_sequence_ok`, `delete_batch` builder,
+  `CalendarClient::put_sync` transport.
+- 15 offline tests (tri-state, palette, wire shapes incl. key-packet
+  absence on update, response interpretation incl. 2001 SEQUENCE error,
+  patch set/delete/append/nested/fold/round-trip-via-`parse_ical`,
+  sequence rules, 2 mockito PUT tests). Workspace: 62+2+12 = 76 passed,
+  fmt + `clippy -D warnings` clean. Zero live calls (mockito only).
+
+### Next steps
+
+1. [~] Engine wiring (delete path LIVE-VERIFIED 2026-09-07, creates/updates
+   deferred): build `47b3dc6c` deployed, two live syncs confirm the design:
+   run 1 (no baseline: rows saved by the old build lack IDs) →
+   `upsync_deferred creates=21 updates=0`, NOTHING uploaded (fail-safe);
+   `proton_id_map/anchors/last_modified` persisted; run 2 → no deferred
+   line at all (all 21 resolve), zero `upsync_deleted`, zero conflicts —
+   safe steady state.    `Calendar inventory: 21 live/tombstone rows` both
+   runs; `Saved 21` each time.
+   FIRST REAL UPLOAD 2026-09-07 11:50 (user deleted one phone event):
+   `upsync_deleted cal=RfXFIcmY n=1` → `Saved 20`; follow-up sync stable
+   at inventory 20 / Saved 20 — no resurrection, no further deletes,
+   tombstone purged via the selective path. USER-CONFIRMED: event gone
+   from Proton web. Calendar delete path verified end-to-end.
+   UPDATES/CREATES 2026-09-07 (local only, live gate pending):
+   `build_update_body` (GET-fresh → patch text/times/RRULE in place →
+   reseal same keys; defers attendee/personal rows, undecryptable rows) +
+   `build_create_body` (4-part shape, fresh keys, UID passed in, DTSTAMP
+   now, all-day exclusive-end + month-rollover tested) with decrypt-back
+   tests on generated keys; engine executes creates → updates → deletes
+   per cal with re-list reconciliation (deletes filter locally); per-op
+   defer (log + skip), transport errors fail closed; unserializable phone
+   rules keep the server rule on update / defer creates (never flatten a
+   series); fresh-UID collisions on re-list-failure retry documented.
+   Shim exports `fields` (dirty/never-synced rows only) + `calendar_id`
+   + common-subset RRULE serializer. Engine mockito test with REAL
+   generated keys (unencrypted + empty salts + password unlock path).
+   Workspace 75+3+37 = 115 green. Known v1 gaps (documented in code):
+   attendee/RSVP/reminder/color phone edits stay download-wins; out-of-
+   window deletes can't upload; re-list failure after a create may retry
+   into a duplicate (same-content updates/deletes are retry-safe).
+   `SyncConfig.local_inventory/anchor_map/api_base_url` (all `#[serde(default)]`,
+   `None` = byte-identical download-only); `run_upload_phase` (plan → per-cal
+   delete batches → fail-closed abort → filter uploaded from `fetched` →
+   purgeable/conflicts/anchors getters); FFI
+   `..._create_engine_with_inventory` + `..._get_{purgeable,conflicts,anchors}_json`
+   (malformed JSON degrades to `None`, never half-fed); shim feeds
+   `exportLocalInventory` + anchors, persists anchors wholesale, selective
+   purge = planner set ∪ replacement removals (legacy notebook stays
+   unconditional), conflict notification, tombstone-vs-live filter in export.
+   `KeysClient`/`CalendarClient` base-url overrides (ungated) for mockito.
+   Cycle tests (mock server, zero live calls): tombstone → exact PUT wire
+   shape → filtered download + getters; no-inventory run asserts `expect(0)`
+   PUTs. `CalEventJson.mtime` feeds anchors. Workspace 68+3+36 = 107 green.
+   Creates/updates are PLANNED but not executed (no sealed bodies without
+   inventory field data — needs shim field export + engine seal step next).
+2. [x] Crypto seal/reseal (DONE 2026-09-07, `proton-api/src/calendar_seal.rs`,
+   all offline with generated keys — pure-Rust backend, no fixtures):
+   `extract_session_key` (bare PKESK via `PacketPile`, any pair),
+   `encrypt_with_session_key` (`Encryptor2::with_session_key`, no recipients
+   → SEIP-only bytes, exactly the split model), `fresh_key_packet`
+   (`PKESK3::for_recipient`, tries every pair — the primary is usually
+   sign-only EdDSA), `detached_sign` (armored, `Signer::detached`), plus
+   `seal_card` (create: fresh SK) / `reseal_card` (update: same SK, no new
+   packet). 6 tests incl. the killer checks: sealed output decrypts through
+   the EXISTING `decrypt_calendar_part` split branch; original-kp + new-data
+   decrypts (update invariant); detached sig verifies via
+   `DetachedVerifierBuilder` (stronger than our lenient read path);
+   wrong-key extraction fails; fresh seals differ. Two API traps recorded:
+   `Cert::armored()` is public-only (secrets need `as_tsk()`), and
+   `finalize()` cascades (call once on the outermost filter). Workspace:
+   68+2+12 = 82 passed, fmt + `clippy -D warnings` clean.
+2. [~] Change detection (planning + persist DONE 2026-09-07, wiring pending):
+   `proton-sync/src/upsync.rs` — `LocalItem` inventory (mkcal UID,
+   optional Proton ID, tombstone/dirty flags, per-row `LastEditTime`
+   anchor; serde JSON = exact shim↔engine contract, tested), `plan_sync`
+   (creates → updates → deletes order, both-edited → server-wins
+   `conflicts`, server-deleted → `apply_server_deletes`, tombstones-with-ID
+   → delete ops + `purgeable_tombstones`, orphans counted),
+   `AnchorMap::merge_anchors` (upsert, prune only gone-everywhere — never
+   merely-unlisted, window != delete), `assemble_delete_batch` (series
+   expansion via `ids_for_uid`, unknown IDs pass through),
+   `assemble_update_batch`, closure-driven `execute_uploads` (fail-closed,
+   no network in tests), fixed `SyncCycle::ORDER`. 21 offline tests.
+   Shim: `X-PROTON-EVENT-ID` stamping (previous session) + now
+   `persistUpsyncMaps` (id map + anchors + lastModified snapshots, written
+   live after every save — harmless until consumed), `exportLocalInventory`
+   (live rows + tombstones, custom-prop with id-map fallback, missing
+   snapshot = clean so pre-feature rows never mass-upload),
+   `purgeListedTombstones` (selective; UNCALLED — unconditional purge stays
+   until wiring). `CalEventJson` gained `mtime` (anchor feed). SDK `moc` +
+   `g++ -c` OK. Workspace 68+2+33 = 103 green. Still wiring-phase: FFI
+   inventory/anchors in-out, engine cycle execution, call-site switch of
+   the purge, tombstone custom-prop survival check live.
+3. [ ] Personal-part route (`PUT .../events/{id}/personal`) for
+   reminder-only edits (cheaper than full reseal) + invite/RSVP flows.
+4. [ ] Live gate: fresh OTP session + a scratch test event (create → edit →
+   exception → series-delete) before wiring into the sync engine.

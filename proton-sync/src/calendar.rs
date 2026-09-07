@@ -4,7 +4,7 @@ use proton_api::{
     calendar as cal_api, CalendarClient, CalendarEvent, KeysClient, TokenManager, UnlockedKey,
 };
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 /// JSON shape consumed by the C++ mKCal shim.
@@ -51,6 +51,10 @@ pub struct CalEventJson {
     pub recurrence_id_ical: String,
     #[serde(default)]
     pub recurrence_id_range: String,
+    /// Server row `LastEditTime` (unix): per-row sync anchor for upsync
+    /// conflict detection (`upsync::merge_anchors`). Not displayed.
+    #[serde(default)]
+    pub mtime: i64,
 }
 
 use serde::Deserialize;
@@ -65,6 +69,12 @@ pub struct CalendarSyncEngine {
     // shim persists them via get_defaults_json so restored sessions (whose
     // live settings come back empty) can seed the same fallbacks.
     last_defaults: Arc<Mutex<HashMap<String, crate::config::CalendarDefaults>>>,
+    // Upsync cycle outputs (this run): tombstone UIDs safe to purge (only
+    // after their deletes uploaded OK), server-wins conflicts, and the
+    // merged anchor map. Read by the shim via *_json getters.
+    last_purgeable: Arc<Mutex<Vec<String>>>,
+    last_conflicts: Arc<Mutex<Vec<crate::upsync::SyncConflict>>>,
+    last_anchors: Arc<Mutex<HashMap<String, i64>>>,
 }
 
 impl CalendarSyncEngine {
@@ -90,6 +100,9 @@ impl CalendarSyncEngine {
             events_json: Arc::new(Mutex::new(None)),
             keys_debug: Arc::new(Mutex::new(None)),
             last_defaults: Arc::new(Mutex::new(HashMap::new())),
+            last_purgeable: Arc::new(Mutex::new(Vec::new())),
+            last_conflicts: Arc::new(Mutex::new(Vec::new())),
+            last_anchors: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -101,6 +114,37 @@ impl CalendarSyncEngine {
             return String::new();
         }
         serde_json::to_string(&*map).unwrap_or_default()
+    }
+
+    /// mKCal UIDs whose tombstones may be purged (`[]` when none — the shim
+    /// unions these with its replacement-phase removals for selective
+    /// purge; ONLY valid after a `complete` status).
+    pub fn purgeable_json(&self) -> String {
+        serde_json::to_string(&*self.last_purgeable.lock().unwrap()).unwrap_or_default()
+    }
+
+    /// Server-wins conflicts this run (`[]` when none — the shim notifies).
+    pub fn conflicts_json(&self) -> String {
+        serde_json::to_string(&*self.last_conflicts.lock().unwrap()).unwrap_or_default()
+    }
+
+    /// Merged anchor map (`{}` when nothing known — caller must not
+    /// overwrite a good cache with it).
+    pub fn anchors_json(&self) -> String {
+        let map = self.last_anchors.lock().unwrap();
+        if map.is_empty() {
+            return String::new();
+        }
+        serde_json::to_string(&*map).unwrap_or_default()
+    }
+
+    fn calendar_client(config: &SyncConfig, access_token: &str, uid: &str) -> CalendarClient {
+        match &config.api_base_url {
+            Some(base) if !base.is_empty() => {
+                CalendarClient::new_with_base_url(base.clone(), access_token.into(), uid.into())
+            }
+            _ => CalendarClient::new(access_token.into(), uid.into()),
+        }
     }
 
     pub fn config(&self) -> SyncConfig {
@@ -171,7 +215,7 @@ impl CalendarSyncEngine {
         // get_user/get_key_salts/get_addresses/bootstrap, and null Events
         // afterwards — same token, same params. Cause unknown (server-side
         // read-state); ordering around it is the reliable path.
-        let cal_client = CalendarClient::new(access_token.clone(), uid.clone());
+        let cal_client = Self::calendar_client(config, &access_token, &uid);
         let cals = cal_client.list_calendars().unwrap_or_default();
         let mut out = Vec::new();
         let mut query_errors: Vec<String> = Vec::new();
@@ -186,6 +230,10 @@ impl CalendarSyncEngine {
         }
         // Unlock user + address keys (same Token-aware logic as contacts engine).
         let mut address_keys = self.unlock_address_keys(&access_token, &uid, config)?;
+        // Upsync phase 1 (uploads) before the download/decrypt loop below.
+        // Fail-closed: Err aborts before any download/apply (start_sync
+        // reports it; local state untouched; uploads retry next cycle).
+        self.run_upload_phase(config, &cal_client, &mut address_keys, &uid, &mut fetched)?;
         for (cal, events) in &fetched {
             // Bootstrap: members + keys + passphrase in one call (v2, fallback v1).
             let mut bootstrap =
@@ -260,31 +308,8 @@ impl CalendarSyncEngine {
                     }
                 });
             let member_id = pick_member_id(&bootstrap.Members, &config.username);
-            let mut cal_keys: Vec<UnlockedKey> = Vec::new();
-            if let (Some(pp), Some(mid)) = (bootstrap.Passphrase.as_ref(), member_id.as_ref()) {
-                if let Ok(uks) =
-                    cal_api::decrypt_calendar_keys(&bootstrap.Keys, pp, &mut address_keys, mid)
-                {
-                    cal_keys = uks;
-                }
-            }
-            // Fallback: try passphrase entries for any member when our pick fails
-            // (shared calendars, email mismatch).
-            if cal_keys.is_empty() {
-                if let Some(pp) = bootstrap.Passphrase.as_ref() {
-                    for mp in &pp.MemberPassphrases {
-                        if let Ok(uks) = cal_api::decrypt_calendar_keys(
-                            &bootstrap.Keys,
-                            pp,
-                            &mut address_keys,
-                            &mp.MemberID,
-                        ) {
-                            cal_keys = uks;
-                            break;
-                        }
-                    }
-                }
-            }
+            let mut cal_keys =
+                Self::unlock_calendar_keys(&bootstrap, &member_id, &mut address_keys);
             self.set_debug(format!(
                 "cal={} members={} calkeys={} addrkeys={} settings={}",
                 &cal.ID[..8.min(cal.ID.len())],
@@ -338,6 +363,320 @@ impl CalendarSyncEngine {
             });
         }
         Ok(out)
+    }
+
+    /// Unlock calendar keys for one bootstrap: picked member first, then
+    /// any-member fallback (shared calendars, email mismatch).
+    fn unlock_calendar_keys(
+        bootstrap: &proton_api::CalendarBootstrap,
+        member_id: &Option<String>,
+        address_keys: &mut [UnlockedKey],
+    ) -> Vec<UnlockedKey> {
+        let mut cal_keys: Vec<UnlockedKey> = Vec::new();
+        if let (Some(pp), Some(mid)) = (bootstrap.Passphrase.as_ref(), member_id.as_ref()) {
+            if let Ok(uks) = cal_api::decrypt_calendar_keys(&bootstrap.Keys, pp, address_keys, mid)
+            {
+                cal_keys = uks;
+            }
+        }
+        if cal_keys.is_empty() {
+            if let Some(pp) = bootstrap.Passphrase.as_ref() {
+                for mp in &pp.MemberPassphrases {
+                    if let Ok(uks) = cal_api::decrypt_calendar_keys(
+                        &bootstrap.Keys,
+                        pp,
+                        address_keys,
+                        &mp.MemberID,
+                    ) {
+                        cal_keys = uks;
+                        break;
+                    }
+                }
+            }
+        }
+        cal_keys
+    }
+
+    /// Upsync upload phase (phase 1 of `SyncCycle::ORDER`). Plans from the
+    /// shim-fed inventory + listed rows, executes create/update/delete
+    /// batches per calendar (fail-closed), refreshes `fetched` for affected
+    /// calendars (deletes filter locally; creates/updates re-list to pick
+    /// up server echoes), and records purgeable/conflicts/anchors for the
+    /// shim getters. Unsealable rows defer (log + skip, never fail the
+    /// phase). Without a fed inventory the plan is empty and this is a
+    /// no-op.
+    /// PUT one batch, mapping transport + per-op failures to a fail-closed
+    /// engine error (the caller aborts before any download/apply).
+    fn put_batch(
+        &self,
+        cal_client: &CalendarClient,
+        cal_id: &str,
+        batch: &proton_api::SyncBatchRequest,
+        what: &str,
+    ) -> Result<(), proton_api::ProtonError> {
+        let resp =
+            cal_client
+                .put_sync(cal_id, batch)
+                .map_err(|e| proton_api::ProtonError::Api {
+                    code: 0,
+                    message: format!("upsync {what} upload failed: {e}"),
+                })?;
+        if let Some(err) = resp.first_error() {
+            return Err(proton_api::ProtonError::Api {
+                code: 0,
+                message: format!("upsync {what} upload failed: {err}"),
+            });
+        }
+        Ok(())
+    }
+
+    fn run_upload_phase(
+        &self,
+        config: &SyncConfig,
+        cal_client: &CalendarClient,
+        address_keys: &mut [UnlockedKey],
+        uid: &str,
+        fetched: &mut [(proton_api::Calendar, Vec<CalendarEvent>)],
+    ) -> Result<(), proton_api::ProtonError> {
+        let inventory = config.local_inventory.clone().unwrap_or_default();
+        let all_rows: Vec<CalendarEvent> = fetched
+            .iter()
+            .flat_map(|(_, evs)| evs.iter().cloned())
+            .collect();
+        let local_ids: HashSet<String> = inventory
+            .iter()
+            .filter_map(|item| item.proton_id.clone())
+            .collect();
+        *self.last_anchors.lock().unwrap() = crate::upsync::merge_anchors(
+            config.anchor_map.as_ref().unwrap_or(&HashMap::new()),
+            &all_rows,
+            &local_ids,
+        );
+        if inventory.is_empty() {
+            return Ok(());
+        }
+        let plan = crate::upsync::plan_sync(&all_rows, &inventory);
+        *self.last_purgeable.lock().unwrap() = plan.purgeable_tombstones.clone();
+        *self.last_conflicts.lock().unwrap() = plan.conflicts.clone();
+        if plan.uploads.is_empty() {
+            return Ok(());
+        }
+        let items: HashMap<&str, &crate::upsync::LocalItem> = inventory
+            .iter()
+            .map(|item| (item.mkcal_uid.as_str(), item))
+            .collect();
+        let row_cal: HashMap<&str, &str> = all_rows
+            .iter()
+            .map(|row| (row.ID.as_str(), row.CalendarID.as_str()))
+            .collect();
+        let mut uploaded: HashSet<String> = HashSet::new();
+        let mut relist: HashSet<String> = HashSet::new();
+        let mut deferred = 0u32;
+        // Per-calendar batches (endpoint is per-calID). One extra bootstrap
+        // per affected calendar for member ID + calendar keys (the decrypt
+        // loop below re-bootstraps; accepted duplicate on this rare path).
+        for (cal, events) in fetched.iter() {
+            let ops: Vec<&crate::upsync::UploadOp> = plan
+                .uploads
+                .iter()
+                .filter(|op| match op {
+                    crate::upsync::UploadOp::Delete { proton_id } => {
+                        events.iter().any(|e| &e.ID == proton_id)
+                    }
+                    crate::upsync::UploadOp::Update { proton_id, .. } => {
+                        row_cal.get(proton_id.as_str()) == Some(&cal.ID.as_str())
+                    }
+                    crate::upsync::UploadOp::Create { mkcal_uid } => items
+                        .get(mkcal_uid.as_str())
+                        .is_some_and(|item| item.calendar_id.as_deref() == Some(cal.ID.as_str())),
+                })
+                .collect();
+            if ops.is_empty() {
+                continue;
+            }
+            let bootstrap =
+                cal_client
+                    .get_bootstrap(&cal.ID)
+                    .unwrap_or(proton_api::CalendarBootstrap {
+                        Members: Vec::new(),
+                        Keys: Vec::new(),
+                        Passphrase: None,
+                        Settings: None,
+                    });
+            let Some(member_id) = pick_member_id(&bootstrap.Members, &config.username) else {
+                self.set_debug(format!(
+                    "upsync_skip cal={} no-member",
+                    &cal.ID[..8.min(cal.ID.len())]
+                ));
+                continue;
+            };
+            let mut cal_keys =
+                Self::unlock_calendar_keys(&bootstrap, &Some(member_id.clone()), address_keys);
+            // Creates: seal fresh bodies (missing fields/calendar or
+            // unserializable recurrence defers with a log line).
+            let mut created = Vec::new();
+            for op in ops.iter().filter_map(|op| match op {
+                crate::upsync::UploadOp::Create { mkcal_uid } => Some(mkcal_uid),
+                _ => None,
+            }) {
+                let item = items.get(op.as_str());
+                let fields = item.and_then(|item| item.fields.as_ref());
+                match fields {
+                    Some(fields) => {
+                        let safe_uid: String = uid
+                            .chars()
+                            .filter(|c| c.is_ascii_alphanumeric())
+                            .take(16)
+                            .collect();
+                        let nanos = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_nanos())
+                            .unwrap_or(0);
+                        let fresh_uid = format!("proton-sync-{safe_uid}-{nanos}");
+                        match proton_api::calendar_seal::build_create_body(
+                            fields,
+                            &fresh_uid,
+                            &mut cal_keys,
+                            address_keys,
+                        ) {
+                            Ok(Some(body)) => created.push(body),
+                            Ok(None) => {
+                                deferred += 1;
+                                self.set_debug(format!("upsync_deferred create {op} unsealable"));
+                            }
+                            Err(e) => {
+                                deferred += 1;
+                                self.set_debug(format!("upsync_deferred create {op}: {e}"));
+                            }
+                        }
+                    }
+                    None => {
+                        deferred += 1;
+                        self.set_debug(format!("upsync_deferred create {op} no-fields"));
+                    }
+                }
+            }
+            if !created.is_empty() {
+                let batch = proton_api::SyncBatchRequest {
+                    MemberID: member_id.clone(),
+                    IsImport: Some(0),
+                    Events: created
+                        .into_iter()
+                        .map(proton_api::SyncEventOp::create)
+                        .collect(),
+                };
+                self.put_batch(cal_client, &cal.ID, &batch, "create")?;
+                relist.insert(cal.ID.clone());
+                self.set_debug(format!(
+                    "upsync_created cal={} n={}",
+                    &cal.ID[..8.min(cal.ID.len())],
+                    batch.Events.len()
+                ));
+            }
+            // Updates: GET-fresh row → patch → reseal (per-op defer on
+            // unsealable rows; never fail the phase for one bad row).
+            let mut sealed = Vec::new();
+            for (proton_id, mkcal_uid) in ops.iter().filter_map(|op| match op {
+                crate::upsync::UploadOp::Update {
+                    proton_id,
+                    mkcal_uid,
+                } => Some((proton_id, mkcal_uid)),
+                _ => None,
+            }) {
+                let fields = items
+                    .get(mkcal_uid.as_str())
+                    .and_then(|item| item.fields.as_ref());
+                let Some(fields) = fields else {
+                    deferred += 1;
+                    self.set_debug(format!("upsync_deferred update {proton_id} no-fields"));
+                    continue;
+                };
+                let fresh = match cal_client.get_event(&cal.ID, proton_id) {
+                    Ok(row) => row,
+                    Err(e) => {
+                        deferred += 1;
+                        self.set_debug(format!("upsync_deferred update {proton_id} refetch: {e}"));
+                        continue;
+                    }
+                };
+                match proton_api::calendar_seal::build_update_body(
+                    &fresh,
+                    fields,
+                    &mut cal_keys,
+                    address_keys,
+                ) {
+                    Ok(Some(body)) => sealed.push((proton_id.clone(), body)),
+                    Ok(None) => {
+                        deferred += 1;
+                        self.set_debug(format!("upsync_deferred update {proton_id} unsealable"));
+                    }
+                    Err(e) => {
+                        deferred += 1;
+                        self.set_debug(format!("upsync_deferred update {proton_id}: {e}"));
+                    }
+                }
+            }
+            if let Some(batch) = crate::upsync::assemble_update_batch(&member_id, sealed) {
+                let n = batch.Events.len();
+                self.put_batch(cal_client, &cal.ID, &batch, "update")?;
+                relist.insert(cal.ID.clone());
+                self.set_debug(format!(
+                    "upsync_updated cal={} n={n}",
+                    &cal.ID[..8.min(cal.ID.len())]
+                ));
+            }
+            // Deletes (unchanged path).
+            let cal_plan = crate::upsync::SyncPlan {
+                uploads: ops
+                    .iter()
+                    .filter(|op| matches!(op, crate::upsync::UploadOp::Delete { .. }))
+                    .map(|op| (*op).clone())
+                    .collect(),
+                ..Default::default()
+            };
+            if cal_plan.uploads.is_empty() {
+                continue;
+            }
+            let Some(batch) = crate::upsync::assemble_delete_batch(&member_id, &cal_plan, events)
+            else {
+                continue;
+            };
+            let n = batch.Events.len();
+            self.put_batch(cal_client, &cal.ID, &batch, "delete")?;
+            for op in &cal_plan.uploads {
+                if let crate::upsync::UploadOp::Delete { proton_id } = op {
+                    uploaded.insert(proton_id.clone());
+                }
+            }
+            self.set_debug(format!(
+                "upsync_deleted cal={} n={n}",
+                &cal.ID[..8.min(cal.ID.len())]
+            ));
+        }
+        if deferred > 0 {
+            self.set_debug(format!("upsync_deferred total={deferred}"));
+        }
+        // Reconcile `fetched` with the uploads: drop deleted rows locally
+        // (no resurrection), re-list calendars with creates/updates (fresh
+        // server truth incl. new IDs; fail-closed on error).
+        if !uploaded.is_empty() {
+            for (_, events) in fetched.iter_mut() {
+                events.retain(|e| !uploaded.contains(&e.ID));
+            }
+        }
+        for cal_id in &relist {
+            let fresh =
+                cal_client
+                    .list_all_events(cal_id)
+                    .map_err(|e| proton_api::ProtonError::Api {
+                        code: 0,
+                        message: format!("upsync re-list failed: {e}"),
+                    })?;
+            if let Some(entry) = fetched.iter_mut().find(|(cal, _)| &cal.ID == cal_id) {
+                entry.1 = fresh;
+            }
+        }
+        Ok(())
     }
 
     fn process_event(
@@ -436,6 +775,7 @@ impl CalendarSyncEngine {
             attendees_full: parsed.attendee_details.clone(),
             recurrence_id_ical: parsed.recurrence_id.clone(),
             recurrence_id_range: parsed.recurrence_id_range.clone(),
+            mtime: ev.LastEditTime,
         })
     }
 
@@ -501,7 +841,14 @@ impl CalendarSyncEngine {
         uid: &str,
         config: &SyncConfig,
     ) -> Result<Vec<UnlockedKey>, proton_api::ProtonError> {
-        let keys_client = KeysClient::new(access_token.to_string(), uid.to_string());
+        let keys_client = match &config.api_base_url {
+            Some(base) if !base.is_empty() => KeysClient::new_with_base_url(
+                base.clone(),
+                access_token.to_string(),
+                uid.to_string(),
+            ),
+            _ => KeysClient::new(access_token.to_string(), uid.to_string()),
+        };
         let user = keys_client.get_user()?;
         // Best-effort: restored sessions lack the elevated ("locked") scope
         // for /keys/salts (403/9101, verified live). Derived passwords and
@@ -936,5 +1283,431 @@ mod tests {
                 .unwrap();
         assert!(old[0].attendees_full.is_empty());
         assert!(old[0].organizer_name.is_empty());
+    }
+
+    #[test]
+    fn test_upload_delete_cycle_end_to_end_mock() {
+        // Full offline cycle (mockito, no live server): inventory tombstone
+        // for a listed row → plan → PUT delete batch (exact wire shape) →
+        // 1001 → filtered download (e9 gone from output) + purgeable +
+        // anchors getters.
+        let mut server = mockito::Server::new();
+        // In-window unix times (the untyped listing filters by overlap
+        // with [now-1y, now+1y]; 1970-era constants would drop).
+        let now = chrono::Utc::now().timestamp();
+        let row = |id: &str, uid: &str, mtime: i64| {
+            format!(
+                r#"{{"ID":"{id}","UID":"{uid}","StartTime":{now},"EndTime":{end},"LastEditTime":{mtime},"FullDay":0,
+                "SharedEvents":[{{"Type":2,"Data":"BEGIN:VEVENT\nUID:{uid}\nSUMMARY:Keep {id}\nEND:VEVENT","Signature":"s"}}]}}"#,
+                end = now + 3600,
+            )
+        };
+        // Mock guards must stay alive for the whole test.
+        let mut guards = Vec::new();
+        macro_rules! mock_get {
+            ($re:expr, $code:expr, $body:expr) => {
+                guards.push(
+                    server
+                        .mock("GET", mockito::Matcher::Regex($re.into()))
+                        .with_status($code)
+                        .with_header("content-type", "application/json")
+                        .with_body($body)
+                        .create(),
+                );
+            };
+        }
+        mock_get!(
+            r"/core/v4/users.*",
+            200,
+            r#"{"User":{"ID":"u","Name":"t","Keys":[]}}"#
+        );
+        mock_get!(r"/core/v4/keys/salts.*", 200, r#"{"KeySalts":[]}"#);
+        mock_get!(r"/core/v4/addresses.*", 200, r#"{"Addresses":[]}"#);
+        mock_get!(
+            r"/calendar/v1$",
+            200,
+            r#"{"Code":1000,"Calendars":[{"ID":"cal1","Name":"C"}]}"#
+        );
+        guards.push(
+            server
+                .mock(
+                    "GET",
+                    mockito::Matcher::Regex(r"/calendar/v1/cal1/events.*".into()),
+                )
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                .with_body(format!(
+                    "{{\"Code\":1000,\"Events\":[{},{}],\"More\":0}}",
+                    row("e1", "u1", 100),
+                    row("e9", "u9", 50)
+                ))
+                .create(),
+        );
+        mock_get!(r"/calendar/v2/cal1/bootstrap.*", 404, "{}");
+        mock_get!(
+            r"/calendar/v1/cal1/members.*",
+            200,
+            r#"{"Members":[{"ID":"m1","Email":"t@x","Name":"T"}]}"#
+        );
+        mock_get!(r"/calendar/v1/cal1/keys.*", 200, r#"{"Keys":[]}"#);
+        mock_get!(
+            r"/calendar/v1/cal1/passphrase.*",
+            200,
+            r#"{"Passphrase":null}"#
+        );
+        mock_get!(
+            r"/calendar/v1/cal1/settings.*",
+            200,
+            r#"{"Code":1000,"CalendarSettings":{}}"#
+        );
+        let put = server
+            .mock(
+                "PUT",
+                mockito::Matcher::Regex(r"/calendar/v1/cal1/events/sync.*".into()),
+            )
+            .match_body(mockito::Matcher::JsonString(
+                r#"{"MemberID":"m1","Events":[{"ID":"e9"}]}"#.into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"Code":1001,"Responses":[]}"#)
+            .create();
+
+        let mut c = cfg();
+        c.refresh_token = Some("rt".into());
+        c.uid = Some("uid".into());
+        c.access_token = Some("at".into());
+        c.api_base_url = Some(server.url());
+        c.local_inventory = Some(vec![
+            crate::upsync::LocalItem {
+                mkcal_uid: "n1".into(),
+                proton_id: Some("e1".into()),
+                deleted: false,
+                modified: false,
+                last_synced_mtime: Some(100),
+                fields: None,
+                calendar_id: None,
+            },
+            crate::upsync::LocalItem {
+                mkcal_uid: "n9".into(),
+                proton_id: Some("e9".into()),
+                deleted: true,
+                modified: false,
+                last_synced_mtime: Some(50),
+                fields: None,
+                calendar_id: None,
+            },
+        ]);
+        let mut anchors = std::collections::HashMap::new();
+        anchors.insert("e1".to_string(), 100);
+        anchors.insert("e9".to_string(), 50);
+        c.anchor_map = Some(anchors);
+
+        let mut engine = CalendarSyncEngine::new(c.clone());
+        engine.start_sync(c);
+        assert_eq!(engine.status().state, "complete");
+        put.assert(); // the delete batch really went out
+                      // Download filtered: e9 uploaded away, e1 kept with its mtime.
+        let events: Vec<CalEventJson> = serde_json::from_str(&engine.get_events_json()).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].id, "e1");
+        assert_eq!(events[0].mtime, 100);
+        // Shim outputs: purgeable tombstone, no conflicts, merged anchors.
+        let purgeable: Vec<String> = serde_json::from_str(&engine.purgeable_json()).unwrap();
+        assert_eq!(purgeable, vec!["n9".to_string()]);
+        let conflicts: Vec<crate::upsync::SyncConflict> =
+            serde_json::from_str(&engine.conflicts_json()).unwrap();
+        assert!(conflicts.is_empty());
+        let out_anchors: std::collections::HashMap<String, i64> =
+            serde_json::from_str(&engine.anchors_json()).unwrap();
+        assert_eq!(out_anchors.get("e1"), Some(&100));
+    }
+
+    /// Fresh unlocked test identity as armored TSK JSON-escaped for mocks.
+    /// Keys are unencrypted, so `from_armored` unlocks with any passphrase
+    /// input — paired with empty-salt `KeySalt` entries the engine's
+    /// password path unlocks them exactly like production derived keys.
+    fn armored_tsk() -> String {
+        use sequoia_openpgp::{cert::CertBuilder, serialize::Serialize};
+        let (cert, _) = CertBuilder::new()
+            .add_signing_subkey()
+            .add_transport_encryption_subkey()
+            .generate()
+            .expect("test key generation");
+        let mut buf = Vec::new();
+        cert.as_tsk()
+            .armored()
+            .export(&mut buf)
+            .expect("test cert armor");
+        String::from_utf8(buf).unwrap().replace('\n', "\\n")
+    }
+
+    #[test]
+    fn test_update_text_edit_uploads_mock() {
+        // Update path with REAL keys (generated, unencrypted + empty salts
+        // + password): modified row with fields → GET-fresh → patch →
+        // reseal → PUT update batch (op ID asserted; body blobs are
+        // randomized signatures/ciphertext — content proven decrypt-back in
+        // proton-api seal tests). Tombstone e9 still deletes in the same
+        // cycle (update-before-delete order preserved across batches).
+        let user_armored = armored_tsk();
+        let addr_armored = armored_tsk();
+        let mut server = mockito::Server::new();
+        let mut guards = Vec::new();
+        macro_rules! mock_get {
+            ($re:expr, $code:expr, $body:expr) => {
+                guards.push(
+                    server
+                        .mock("GET", mockito::Matcher::Regex($re.into()))
+                        .with_status($code)
+                        .with_header("content-type", "application/json")
+                        .with_body($body)
+                        .create(),
+                );
+            };
+        }
+        mock_get!(
+            r"/core/v4/users.*",
+            200,
+            format!(
+                r#"{{"User":{{"ID":"u","Name":"t","Keys":[{{"ID":"k1","PrivateKey":"{user_armored}","Token":"","Signature":""}}]}}}}"#
+            )
+        );
+        mock_get!(
+            r"/core/v4/keys/salts.*",
+            200,
+            r#"{"KeySalts":[{"ID":"k1","KeySalt":""},{"ID":"ak1","KeySalt":""}]}"#
+        );
+        mock_get!(
+            r"/core/v4/addresses.*",
+            200,
+            format!(
+                r#"{{"Addresses":[{{"ID":"a1","Email":"t@x","Keys":[{{"ID":"ak1","PrivateKey":"{addr_armored}","Token":"","Signature":""}}]}}]}}"#
+            )
+        );
+        mock_get!(
+            r"/calendar/v1$",
+            200,
+            r#"{"Code":1000,"Calendars":[{"ID":"cal1","Name":"C"}]}"#
+        );
+        let now = chrono::Utc::now().timestamp();
+        let row_e1 = format!(
+            r#"{{"ID":"e1","UID":"u1","CalendarID":"cal1","StartTime":{now},"EndTime":{end},"LastEditTime":100,"FullDay":0,
+            "SharedEvents":[{{"Type":2,"Data":"BEGIN:VEVENT\nUID:u1\nSUMMARY:Old\nSEQUENCE:2\nEND:VEVENT","Signature":"s"}}]}}"#,
+            end = now + 3600,
+        );
+        let row_e9 = format!(
+            r#"{{"ID":"e9","UID":"u9","CalendarID":"cal1","StartTime":{now},"EndTime":{end},"LastEditTime":50,"FullDay":0,
+            "SharedEvents":[{{"Type":2,"Data":"BEGIN:VEVENT\nUID:u9\nSUMMARY:Gone\nEND:VEVENT","Signature":"s"}}]}}"#,
+            end = now + 3600,
+        );
+        guards.push(
+            server
+                .mock(
+                    "GET",
+                    mockito::Matcher::Regex(r"/calendar/v1/cal1/events.*".into()),
+                )
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                .with_body(format!(
+                    "{{\"Code\":1000,\"Events\":[{row_e1},{row_e9}],\"More\":0}}"
+                ))
+                .create(),
+        );
+        // Fresh GET for the update row (engine refetches to avoid TOCTOU).
+        guards.push(
+            server
+                .mock(
+                    "GET",
+                    mockito::Matcher::Regex(r"/calendar/v1/cal1/events/e1.*".into()),
+                )
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                .with_body(format!("{{\"Event\":{row_e1}}}"))
+                .create(),
+        );
+        mock_get!(r"/calendar/v2/cal1/bootstrap.*", 404, "{}");
+        mock_get!(
+            r"/calendar/v1/cal1/members.*",
+            200,
+            r#"{"Members":[{"ID":"m1","Email":"t@x","Name":"T"}]}"#
+        );
+        mock_get!(r"/calendar/v1/cal1/keys.*", 200, r#"{"Keys":[]}"#);
+        mock_get!(
+            r"/calendar/v1/cal1/passphrase.*",
+            200,
+            r#"{"Passphrase":null}"#
+        );
+        mock_get!(
+            r"/calendar/v1/cal1/settings.*",
+            200,
+            r#"{"Code":1000,"CalendarSettings":{}}"#
+        );
+        // Update batch carries the e1 op (body blobs randomized — match ID).
+        let put_update = server
+            .mock(
+                "PUT",
+                mockito::Matcher::Regex(r"/calendar/v1/cal1/events/sync.*".into()),
+            )
+            .match_body(mockito::Matcher::Regex(r#""ID":"e1""#.into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"Code":1001,"Responses":[]}"#)
+            .create();
+        // Delete batch carries the e9 ID-only op (exact shape).
+        let put_delete = server
+            .mock(
+                "PUT",
+                mockito::Matcher::Regex(r"/calendar/v1/cal1/events/sync.*".into()),
+            )
+            .match_body(mockito::Matcher::JsonString(
+                r#"{"MemberID":"m1","Events":[{"ID":"e9"}]}"#.into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"Code":1001,"Responses":[]}"#)
+            .create();
+
+        let mut c = cfg();
+        c.refresh_token = Some("rt".into());
+        c.uid = Some("uid".into());
+        c.access_token = Some("at".into());
+        c.password = "testpw".into();
+        c.api_base_url = Some(server.url());
+        c.local_inventory = Some(vec![
+            crate::upsync::LocalItem {
+                mkcal_uid: "n1".into(),
+                proton_id: Some("e1".into()),
+                deleted: false,
+                modified: true,
+                last_synced_mtime: Some(100),
+                fields: Some(proton_api::LocalFields {
+                    summary: Some("Edited".into()),
+                    ..Default::default()
+                }),
+                calendar_id: Some("cal1".into()),
+            },
+            crate::upsync::LocalItem {
+                mkcal_uid: "n9".into(),
+                proton_id: Some("e9".into()),
+                deleted: true,
+                modified: false,
+                last_synced_mtime: Some(50),
+                fields: None,
+                calendar_id: Some("cal1".into()),
+            },
+        ]);
+        let mut anchors = std::collections::HashMap::new();
+        anchors.insert("e1".to_string(), 100);
+        anchors.insert("e9".to_string(), 50);
+        c.anchor_map = Some(anchors);
+
+        let mut engine = CalendarSyncEngine::new(c.clone());
+        engine.start_sync(c);
+        assert_eq!(engine.status().state, "complete");
+        put_update.assert();
+        put_delete.assert();
+        // e1 present. (The static mock re-list returns pre-delete rows,
+        // so e9 reappears in the download here — delete-filtering itself
+        // is proven by the delete-cycle test, which has no re-list to
+        // resurrect it. Live, the re-list would no longer contain e9.)
+        let events: Vec<CalEventJson> = serde_json::from_str(&engine.get_events_json()).unwrap();
+        assert!(events.iter().any(|e| e.id == "e1"));
+        let purgeable: Vec<String> = serde_json::from_str(&engine.purgeable_json()).unwrap();
+        assert_eq!(purgeable, vec!["n9".to_string()]);
+        let purgeable: Vec<String> = serde_json::from_str(&engine.purgeable_json()).unwrap();
+        assert_eq!(purgeable, vec!["n9".to_string()]);
+        let _held = guards;
+    }
+
+    #[test]
+    fn test_no_inventory_stays_download_only() {
+        // Without a fed inventory the upload phase is a no-op: the SAME
+        // mocks as above must complete with both rows present and zero PUTs
+        // (today's behavior, byte-identical downloads).
+        let mut server = mockito::Server::new();
+        let mut guards = Vec::new();
+        macro_rules! mock_get {
+            ($re:expr, $code:expr, $body:expr) => {
+                guards.push(
+                    server
+                        .mock("GET", mockito::Matcher::Regex($re.into()))
+                        .with_status($code)
+                        .with_header("content-type", "application/json")
+                        .with_body($body)
+                        .create(),
+                );
+            };
+        }
+        mock_get!(
+            r"/core/v4/users.*",
+            200,
+            r#"{"User":{"ID":"u","Name":"t","Keys":[]}}"#
+        );
+        mock_get!(r"/core/v4/keys/salts.*", 200, r#"{"KeySalts":[]}"#);
+        mock_get!(r"/core/v4/addresses.*", 200, r#"{"Addresses":[]}"#);
+        mock_get!(
+            r"/calendar/v1$",
+            200,
+            r#"{"Code":1000,"Calendars":[{"ID":"cal1","Name":"C"}]}"#
+        );
+        let now = chrono::Utc::now().timestamp();
+        guards.push(
+            server
+                .mock(
+                    "GET",
+                    mockito::Matcher::Regex(r"/calendar/v1/cal1/events.*".into()),
+                )
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                .with_body(format!(
+                    "{{\"Code\":1000,\"Events\":[{{\"ID\":\"e1\",\"UID\":\"u1\",\"StartTime\":{now},\"EndTime\":{},\"LastEditTime\":100,\"FullDay\":0,\"SharedEvents\":[{{\"Type\":2,\"Data\":\"BEGIN:VEVENT\\nUID:u1\\nSUMMARY:Keep\\nEND:VEVENT\",\"Signature\":\"s\"}}]}}],\"More\":0}}",
+                    now + 3600
+                ))
+                .create(),
+        );
+        mock_get!(r"/calendar/v2/cal1/bootstrap.*", 404, "{}");
+        mock_get!(
+            r"/calendar/v1/cal1/members.*",
+            200,
+            r#"{"Members":[{"ID":"m1","Email":"t@x","Name":"T"}]}"#
+        );
+        mock_get!(r"/calendar/v1/cal1/keys.*", 200, r#"{"Keys":[]}"#);
+        mock_get!(
+            r"/calendar/v1/cal1/passphrase.*",
+            200,
+            r#"{"Passphrase":null}"#
+        );
+        mock_get!(
+            r"/calendar/v1/cal1/settings.*",
+            200,
+            r#"{"Code":1000,"CalendarSettings":{}}"#
+        );
+        // Any PUT would 501 (no mock) and fail the phase — plus assert zero.
+        let put = server
+            .mock(
+                "PUT",
+                mockito::Matcher::Regex(r"/calendar/v1/cal1/events/sync.*".into()),
+            )
+            .expect(0)
+            .create();
+        guards.push(put);
+
+        let mut c = cfg();
+        c.refresh_token = Some("rt".into());
+        c.uid = Some("uid".into());
+        c.access_token = Some("at".into());
+        c.api_base_url = Some(server.url());
+        assert!(c.local_inventory.is_none());
+
+        let mut engine = CalendarSyncEngine::new(c.clone());
+        engine.start_sync(c);
+        assert_eq!(engine.status().state, "complete");
+        let events: Vec<CalEventJson> = serde_json::from_str(&engine.get_events_json()).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].id, "e1");
+        let purgeable: Vec<String> = serde_json::from_str(&engine.purgeable_json()).unwrap();
+        assert!(purgeable.is_empty());
+        let _held = guards;
     }
 }
