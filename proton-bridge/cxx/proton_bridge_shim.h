@@ -41,6 +41,7 @@
 #include <KCalendarCore/Recurrence>
 #include <KCalendarCore/RecurrenceRule>
 #include <KCalendarCore/Attendee>
+#include <KCalendarCore/Person>
 #include <KCalendarCore/Alarm>
 
 #include <Accounts/manager.h>

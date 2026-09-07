@@ -8,6 +8,13 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 /// JSON shape consumed by the C++ mKCal shim.
+///
+/// New fields are `#[serde(default)]` so old phone builds ignore them and
+/// new builds accept old cached JSON: `organizer` stays the bare email,
+/// `organizer_name` carries CN; `attendees` stays the legacy email list,
+/// `attendees_full` carries CN/RSVP/PARTSTAT/ROLE; `recurrence_id_ical`
+/// is the in-fragment RECURRENCE-ID value (row `recurrence_id` unix stays
+/// authoritative for exception linkage).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(non_snake_case)]
 pub struct CalEventJson {
@@ -36,6 +43,14 @@ pub struct CalEventJson {
     pub color: Option<String>,
     pub recurrence_id: Option<i64>,
     pub notifications: Vec<proton_api::CalNotification>,
+    #[serde(default)]
+    pub organizer_name: String,
+    #[serde(default)]
+    pub attendees_full: Vec<proton_api::CalAttendee>,
+    #[serde(default)]
+    pub recurrence_id_ical: String,
+    #[serde(default)]
+    pub recurrence_id_range: String,
 }
 
 use serde::Deserialize;
@@ -417,6 +432,10 @@ impl CalendarSyncEngine {
             color: ev.Color.clone(),
             recurrence_id: ev.RecurrenceID,
             notifications: Self::resolve_notifications(ev, settings, cached),
+            organizer_name: parsed.organizer_name.clone(),
+            attendees_full: parsed.attendee_details.clone(),
+            recurrence_id_ical: parsed.recurrence_id.clone(),
+            recurrence_id_range: parsed.recurrence_id_range.clone(),
         })
     }
 
@@ -873,5 +892,49 @@ mod tests {
         assert_eq!(e.get_uid(), Some("uid".into()));
         assert_eq!(e.get_refresh_token(), Some("rt".into()));
         assert_eq!(e.get_events_json(), "[]");
+    }
+
+    #[test]
+    fn test_process_event_carries_attendee_details_and_rrule() {
+        let ev = CalendarEvent {
+            ID: "e9".into(),
+            UID: "uid-9".into(),
+            CalendarID: "c1".into(),
+            StartTime: 100,
+            EndTime: 200,
+            StartTimezone: "Europe/Rome".into(),
+            EndTimezone: "Europe/Rome".into(),
+            FullDay: Some(false),
+            SharedEvents: vec![proton_api::CalendarEventPart {
+                MemberID: String::new(),
+                Type: 2,
+                Data: "BEGIN:VEVENT\nUID:uid-9\nSUMMARY:Sync\nORGANIZER;CN=Boss:mailto:boss@example.com\nATTENDEE;CN=Alice;RSVP=TRUE;PARTSTAT=ACCEPTED:mailto:alice@example.com\nRRULE:FREQ=WEEKLY;INTERVAL=2;BYDAY=TU,TH\nRECURRENCE-ID:20260915T200000Z\nEND:VEVENT"
+                    .into(),
+                Signature: "sig".into(),
+                Author: String::new(),
+            }],
+            ..Default::default()
+        };
+        let got =
+            CalendarSyncEngine::process_event(&ev, "c1", "Work", &mut [], &mut [], None, None)
+                .expect("signed-only event processes");
+        assert_eq!(got.organizer, "boss@example.com");
+        assert_eq!(got.organizer_name, "Boss");
+        assert_eq!(got.attendees_full.len(), 1);
+        assert_eq!(got.attendees_full[0].email, "alice@example.com");
+        assert!(got.attendees_full[0].rsvp);
+        assert_eq!(got.attendees_full[0].partstat, "ACCEPTED");
+        assert_eq!(got.rrule, "FREQ=WEEKLY;INTERVAL=2;BYDAY=TU,TH");
+        assert_eq!(got.recurrence_id_ical, "20260915T200000Z");
+        // JSON round-trips the new fields (shim contract) and stays
+        // backward compatible with old JSON missing them.
+        let json = serde_json::to_string(&vec![got]).unwrap();
+        assert!(json.contains("attendees_full"));
+        assert!(json.contains("organizer_name"));
+        let old: Vec<CalEventJson> =
+            serde_json::from_str(r#"[{"id":"x","uid":"u","calendar_id":"c","calendar_name":"n","summary":"s","description":"","location":"","dtstart":"","dtend":"","dtstamp":"","rrule":"","exdates":[],"sequence":"","status":"","transp":"","organizer":"a@b","attendees":[],"start_time":0,"end_time":0,"start_timezone":"","end_timezone":"","full_day":false,"color":null,"recurrence_id":null,"notifications":[]}]"#)
+                .unwrap();
+        assert!(old[0].attendees_full.is_empty());
+        assert!(old[0].organizer_name.is_empty());
     }
 }

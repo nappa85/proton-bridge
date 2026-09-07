@@ -97,6 +97,29 @@ Sync (buteo OOPP, proton_bridge_shim.cpp, NoUserInteractionPolicy):
 - **Contact dedup**: No duplicate detection across Proton + local contacts
 - **Multiple photos**: People app only supports one avatar; only first photo is used
 - **Password never persisted** (intentional): raw 20-char login password is transient `Password` param only for `derive_all_passwords` at `Verify`; `signon-secrets.db` `CREDENTIALS.password` stays dummy `"x"`, `handleAuthOk` never returns `Secret`. New `KeySalt` after manual Proton key rotation will need one more **Update credentials → OTP** to re-derive and re-store `DerivedPasswords`.
+- [ ] **UI i18n** (DEFERRED 2026-09-07 by user decision — do after settings
+  UI strings stabilize; they changed twice in two days and each change
+  invalidates translations): audit 2026-09-07 found all static strings in
+  `ui/proton.qml` / `ui/proton-update.qml` already use `qsTr` + `//%` (plus
+  3 stock `qsTrId`s from Jolla's catalog), and `ui/proton-settings.qml`
+  purge strings were converted to `qsTr` + `//%`. But there is NO
+  translation pipeline (no `.ts`, no `lupdate`/`lrelease` in CI/specs), so
+  custom strings render English everywhere. Reference
+  `sailfish-account-nextcloud` ships zero custom strings — no Jolla
+  precedent to copy. Design (researched 2026-09-07): our QML runs in the
+  Settings app process, so per-app auto-loading does NOT apply — load via
+  our `Proton 1.0` C++ extension (`QQmlExtensionPlugin::initializeEngine`
+  → `installTranslator`, `.qm` from `/usr/share/proton/translations/`;
+  needs a real non-English-locale device test, host-process assumptions
+  have bitten before). Steps: (1) seed `translations/proton-<lang>.ts` via
+  `lupdate`; (2) `lrelease` → `.qm` at bundle time + account spec `%files`;
+  (3) `initializeEngine` translator install with graceful fallback;
+  (4) CI gate keeping `.ts` in sync; (5) keep `qsTr` (free English
+  fallback — custom `qsTrId` without shipped `.qm` renders empty). Also in
+  scope: `proton.provider` name/description (XML, not QML). Out of scope:
+  dynamic server/plugin error messages (`_errorMessage`, English by
+  nature). Cheap first step when revived: commit English-source `.ts`
+  template only.
 
 ## Key Technical Details
 

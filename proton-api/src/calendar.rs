@@ -670,6 +670,9 @@ pub fn merge_ical_fragments(fragments: &[String]) -> Result<ParsedCalendarEvent>
         first_wins!(status);
         first_wins!(transp);
         first_wins!(organizer);
+        first_wins!(organizer_name);
+        first_wins!(recurrence_id);
+        first_wins!(recurrence_id_range);
         let _ = &seen_structural;
         // Multi-valued: union.
         for x in parsed.exdates {
@@ -680,6 +683,11 @@ pub fn merge_ical_fragments(fragments: &[String]) -> Result<ParsedCalendarEvent>
         for a in parsed.attendees {
             if !out.attendees.contains(&a) {
                 out.attendees.push(a);
+            }
+        }
+        for d in parsed.attendee_details {
+            if !d.email.is_empty() && !out.attendee_details.iter().any(|e| e.email == d.email) {
+                out.attendee_details.push(d);
             }
         }
         if out.created.is_empty() && !parsed.created.is_empty() {
@@ -733,12 +741,262 @@ fn unfold_ical(s: &str) -> Vec<String> {
 }
 
 /// Split `NAME;PARAM=...:value` into (name, value), upper-cased name.
+#[allow(dead_code)]
 fn split_ical_line(line: &str) -> Option<(String, String)> {
-    let colon = line.find(':')?;
+    split_ical_line_full(line).map(|(n, _, v)| (n, v))
+}
+
+/// Split `NAME;PARAM=...:value` into (upper-cased name, raw params section,
+/// value). The params section excludes the leading `;` ("" when absent).
+/// The colon is the first `:` outside a double-quoted param value, so
+/// `ATTENDEE;CN="a:b":mailto:x` splits correctly.
+fn split_ical_line_full(line: &str) -> Option<(String, String, String)> {
+    let bytes = line.as_bytes();
+    let mut in_quotes = false;
+    let mut colon_at: Option<usize> = None;
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b'"' {
+            in_quotes = !in_quotes;
+        } else if b == b':' && !in_quotes {
+            colon_at = Some(i);
+            break;
+        }
+    }
+    let colon = colon_at?;
     let (left, value) = line.split_at(colon);
     let value = value[1..].to_string();
-    let name = left.split(';').next().unwrap_or(left).trim().to_uppercase();
-    Some((name, value))
+    let mut parts = left.splitn(2, ';');
+    let name = parts.next().unwrap_or(left).trim().to_uppercase();
+    let params = parts.next().unwrap_or("").to_string();
+    Some((name, params, value))
+}
+
+/// Parse an RFC5545 params section (`CN=Alice;RSVP=TRUE`) into an
+/// upper-cased key → raw value map. Quoted values keep inner content
+/// (`CN="Doe, John"` → `Doe, John`); `;` inside quotes does not split.
+/// Unknown params are kept (caller ignores what it doesn't need).
+fn parse_ical_params(params: &str) -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    if params.trim().is_empty() {
+        return out;
+    }
+    // Split on ';' outside quotes.
+    let mut parts: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut in_quotes = false;
+    for c in params.chars() {
+        if c == '"' {
+            in_quotes = !in_quotes;
+            cur.push(c);
+        } else if c == ';' && !in_quotes {
+            parts.push(std::mem::take(&mut cur));
+        } else {
+            cur.push(c);
+        }
+    }
+    parts.push(cur);
+    for p in parts {
+        let p = p.trim();
+        if p.is_empty() {
+            continue;
+        }
+        let (k, v) = match p.find('=') {
+            Some(i) => (p[..i].trim().to_uppercase(), p[i + 1..].trim().to_string()),
+            None => continue,
+        };
+        let v = v.strip_prefix('"').map_or_else(
+            || v.clone(),
+            |rest| rest.strip_suffix('"').unwrap_or(rest).to_string(),
+        );
+        out.insert(k, v);
+    }
+    out
+}
+
+/// Bare email from an ATTENDEE/ORGANIZER value (`mailto:a@b` → `a@b`,
+/// extra `;` suffixes stripped, whitespace trimmed).
+fn parse_mailto_email(value: &str) -> String {
+    let v = value.trim();
+    if let Some(idx) = v.to_lowercase().find("mailto:") {
+        v[idx + 7..]
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string()
+    } else {
+        v.split(';').next().unwrap_or("").trim().to_string()
+    }
+}
+
+/// Structured ATTENDEE identity from one content line's params + value.
+fn parse_attendee_identity(params: &str, value: &str) -> CalAttendee {
+    let map = parse_ical_params(params);
+    CalAttendee {
+        email: parse_mailto_email(value),
+        name: unescape_ical_text(map.get("CN").map_or("", String::as_str)),
+        rsvp: map
+            .get("RSVP")
+            .is_some_and(|v| v.eq_ignore_ascii_case("TRUE")),
+        partstat: map
+            .get("PARTSTAT")
+            .cloned()
+            .unwrap_or_default()
+            .to_uppercase(),
+        role: map.get("ROLE").cloned().unwrap_or_default().to_uppercase(),
+        cutype: map
+            .get("CUTYPE")
+            .cloned()
+            .unwrap_or_default()
+            .to_uppercase(),
+    }
+}
+
+/// Structured ORGANIZER identity from one content line's params + value.
+fn parse_organizer_identity(params: &str, value: &str) -> (String, String) {
+    let map = parse_ical_params(params);
+    (
+        parse_mailto_email(value),
+        unescape_ical_text(map.get("CN").map_or("", String::as_str)),
+    )
+}
+
+/// Parse an RRULE value into a [`RecurrenceSpec`] (lenient: invalid parts
+/// are skipped; INTERVAL defaults to 1; FREQ upper-cased).
+///
+/// Reference: RFC5545 §3.3.10 + icalendar.org examples
+/// (`FREQ=WEEKLY;COUNT=10;BYDAY=TU,TH`, `BYDAY=1FR`, `BYMONTHDAY=2,15`,
+/// `INTERVAL=2`, `WKST=SU`, `UNTIL=...`, `BYSETPOS`, `BYMONTH`, ...).
+pub fn parse_rrule(rrule: &str) -> RecurrenceSpec {
+    let mut spec = RecurrenceSpec {
+        interval: 1,
+        ..Default::default()
+    };
+    for part in rrule.split(';') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let (k, v) = match part.find('=') {
+            Some(i) => (
+                part[..i].trim().to_uppercase(),
+                part[i + 1..].trim().to_string(),
+            ),
+            None => continue,
+        };
+        match k.as_str() {
+            "FREQ" => spec.freq = v.to_uppercase(),
+            "INTERVAL" => {
+                if let Ok(n) = v.parse::<u32>() {
+                    if n >= 1 {
+                        spec.interval = n;
+                    }
+                }
+            }
+            "COUNT" => {
+                if let Ok(n) = v.parse::<u32>() {
+                    if n >= 1 {
+                        spec.count = Some(n);
+                    }
+                }
+            }
+            "UNTIL" if !v.is_empty() => {
+                spec.until = Some(v);
+            }
+            "UNTIL" => {}
+            "BYDAY" => {
+                for entry in v.split(',') {
+                    let e = entry.trim().to_uppercase();
+                    if e.is_empty() {
+                        continue;
+                    }
+                    // Optional signed numeric prefix + 2-letter weekday
+                    // (e.g. MO, 1FR, -1SU). A non-numeric prefix is garbage.
+                    let (num, day) = e.split_at(e.len().saturating_sub(2));
+                    if !matches!(day, "MO" | "TU" | "WE" | "TH" | "FR" | "SA" | "SU") {
+                        continue;
+                    }
+                    let pos = if num.is_empty() {
+                        0
+                    } else if let Ok(n) = num.parse::<i32>() {
+                        n
+                    } else {
+                        continue;
+                    };
+                    // Dedupe identical entries.
+                    if !spec.byday.iter().any(|d| d.pos == pos && d.weekday == day) {
+                        spec.byday.push(RruleByDay {
+                            pos,
+                            weekday: day.to_string(),
+                        });
+                    }
+                }
+            }
+            "BYMONTHDAY" => {
+                for entry in v.split(',') {
+                    if let Ok(n) = entry.trim().parse::<i32>() {
+                        if ((1..=31).contains(&n) || (-31..=-1).contains(&n))
+                            && !spec.bymonthday.contains(&n)
+                        {
+                            spec.bymonthday.push(n);
+                        }
+                    }
+                }
+            }
+            "BYMONTH" => {
+                for entry in v.split(',') {
+                    if let Ok(n) = entry.trim().parse::<i32>() {
+                        if (1..=12).contains(&n) && !spec.bymonth.contains(&n) {
+                            spec.bymonth.push(n);
+                        }
+                    }
+                }
+            }
+            "BYYEARDAY" => {
+                for entry in v.split(',') {
+                    if let Ok(n) = entry.trim().parse::<i32>() {
+                        if ((1..=366).contains(&n) || (-366..=-1).contains(&n))
+                            && !spec.byyearday.contains(&n)
+                        {
+                            spec.byyearday.push(n);
+                        }
+                    }
+                }
+            }
+            "BYWEEKNO" => {
+                for entry in v.split(',') {
+                    if let Ok(n) = entry.trim().parse::<i32>() {
+                        if ((1..=53).contains(&n) || (-53..=-1).contains(&n))
+                            && !spec.byweekno.contains(&n)
+                        {
+                            spec.byweekno.push(n);
+                        }
+                    }
+                }
+            }
+            "BYSETPOS" => {
+                for entry in v.split(',') {
+                    if let Ok(n) = entry.trim().parse::<i32>() {
+                        if ((1..=366).contains(&n) || (-366..=-1).contains(&n))
+                            && !spec.bysetpos.contains(&n)
+                        {
+                            spec.bysetpos.push(n);
+                        }
+                    }
+                }
+            }
+            "WKST" => {
+                let w = v.to_uppercase();
+                if matches!(w.as_str(), "MO" | "TU" | "WE" | "TH" | "FR" | "SA" | "SU") {
+                    spec.wkst = w;
+                }
+            }
+            // BYHOUR/BYMINUTE/BYSECOND: time comes from DTSTART, nothing to
+            // store for mKCal (documented, ignored by design).
+            _ => {}
+        }
+    }
+    spec
 }
 
 pub fn parse_ical(ical_str: &str) -> Result<ParsedCalendarEvent> {
@@ -757,7 +1015,7 @@ pub fn parse_ical(ical_str: &str) -> Result<ParsedCalendarEvent> {
         {
             continue;
         }
-        let Some((name, raw_value)) = split_ical_line(l) else {
+        let Some((name, params, raw_value)) = split_ical_line_full(l) else {
             continue;
         };
         let value = unescape_ical_text(raw_value.trim());
@@ -774,7 +1032,17 @@ pub fn parse_ical(ical_str: &str) -> Result<ParsedCalendarEvent> {
             "SEQUENCE" if out.sequence.is_empty() => out.sequence = value,
             "STATUS" if out.status.is_empty() => out.status = value,
             "TRANSP" if out.transp.is_empty() => out.transp = value,
-            "ORGANIZER" if out.organizer.is_empty() => out.organizer = value,
+            "ORGANIZER" if out.organizer.is_empty() => {
+                let (email, cn) = parse_organizer_identity(&params, &value);
+                out.organizer = email;
+                out.organizer_name = cn;
+            }
+            "RECURRENCE-ID" if out.recurrence_id.is_empty() => {
+                out.recurrence_id = value;
+                let map = parse_ical_params(&params);
+                out.recurrence_id_range =
+                    map.get("RANGE").cloned().unwrap_or_default().to_uppercase();
+            }
             "EXDATE" => {
                 for part in value.split(',') {
                     let p = part.trim().to_string();
@@ -783,8 +1051,16 @@ pub fn parse_ical(ical_str: &str) -> Result<ParsedCalendarEvent> {
                     }
                 }
             }
-            "ATTENDEE" if !out.attendees.contains(&value) => {
-                out.attendees.push(value);
+            "ATTENDEE" => {
+                if !out.attendees.contains(&value) {
+                    out.attendees.push(value.clone());
+                }
+                let detail = parse_attendee_identity(&params, &value);
+                if !detail.email.is_empty()
+                    && !out.attendee_details.iter().any(|d| d.email == detail.email)
+                {
+                    out.attendee_details.push(detail);
+                }
             }
             _ => {}
         }
@@ -851,6 +1127,70 @@ fn parse_duration_part(s: &str, units: &[(char, i64)]) -> Option<i64> {
     }
 }
 
+/// One attendee/organizer identity with RFC5545 params preserved.
+///
+/// `email` is the bare address (`mailto:` stripped); `name` is CN ("" when
+/// absent). `rsvp` tracks RSVP=TRUE; `partstat`/`role`/`cutype` keep the raw
+/// upper-cased param values ("" when absent) so the C++ shim can map them to
+/// `KCalendarCore::Attendee` without re-parsing iCal params.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CalAttendee {
+    #[serde(default)]
+    pub email: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub rsvp: bool,
+    #[serde(default)]
+    pub partstat: String,
+    #[serde(default)]
+    pub role: String,
+    #[serde(default)]
+    pub cutype: String,
+}
+
+/// One BYDAY entry: `pos` is the optional numeric prefix (0 = none;
+/// only meaningful for MONTHLY/YEARLY per RFC5545 §3.3.10), `weekday` is
+/// the two-letter upper-cased code (MO..SU).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RruleByDay {
+    #[serde(default)]
+    pub pos: i32,
+    #[serde(default)]
+    pub weekday: String,
+}
+
+/// Structured RRULE view (RFC5545 §3.3.10) for the subset `mKCal`/
+/// `KCalendarCore::RecurrenceRule` can store. Parsing is lenient: unknown
+/// or out-of-range parts are skipped, never failing the event. `freq` is
+/// upper-cased ("" when absent); `interval` defaults to 1 when unset or
+/// invalid; `count`/`until` are None when absent.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RecurrenceSpec {
+    #[serde(default)]
+    pub freq: String,
+    #[serde(default)]
+    pub interval: u32,
+    #[serde(default)]
+    pub count: Option<u32>,
+    #[serde(default)]
+    pub until: Option<String>,
+    #[serde(default)]
+    pub byday: Vec<RruleByDay>,
+    #[serde(default)]
+    pub bymonthday: Vec<i32>,
+    #[serde(default)]
+    pub bymonth: Vec<i32>,
+    #[serde(default)]
+    pub byyearday: Vec<i32>,
+    #[serde(default)]
+    pub byweekno: Vec<i32>,
+    #[serde(default)]
+    pub bysetpos: Vec<i32>,
+    #[serde(default)]
+    pub wkst: String,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ParsedCalendarEvent {
     pub uid: String,
@@ -877,6 +1217,21 @@ pub struct ParsedCalendarEvent {
     pub organizer: String,
     #[serde(default)]
     pub attendees: Vec<String>,
+    /// ORGANIZER CN param ("" when absent). `organizer` keeps the bare email
+    /// for backward compatibility with the C++ shim.
+    #[serde(default)]
+    pub organizer_name: String,
+    /// Structured attendee identities (parallel to `attendees` email list).
+    #[serde(default)]
+    pub attendee_details: Vec<CalAttendee>,
+    /// RECURRENCE-ID property value ("" for masters). The server row
+    /// `RecurrenceID` (unix) stays authoritative for exception linkage;
+    /// this is the in-fragment value for completeness / future upsync.
+    #[serde(default)]
+    pub recurrence_id: String,
+    /// RECURRENCE-ID RANGE param ("" or "THISANDFUTURE").
+    #[serde(default)]
+    pub recurrence_id_range: String,
 }
 
 #[cfg(test)]
@@ -924,8 +1279,12 @@ mod tests {
         assert_eq!(p.sequence, "3");
         assert_eq!(p.status, "CONFIRMED");
         assert_eq!(p.transp, "OPAQUE");
-        assert_eq!(p.organizer, "mailto:boss@example.com");
+        assert_eq!(p.organizer, "boss@example.com");
+        assert_eq!(p.organizer_name, "Boss");
         assert_eq!(p.attendees.len(), 2);
+        assert_eq!(p.attendee_details.len(), 2);
+        assert_eq!(p.attendee_details[0].email, "alice@example.com");
+        assert_eq!(p.attendee_details[0].name, "Alice");
     }
 
     #[test]
@@ -1241,5 +1600,143 @@ mod tests {
         let c = CalendarClient::new_with_base_url(server.url(), "at".into(), "uid".into());
         let b = c.get_bootstrap("cal1").unwrap();
         assert_eq!(b.Members[0].ID, "m9");
+    }
+
+    #[test]
+    fn test_parse_rrule_weekly_byday_interval() {
+        // RFC5545 example: every other week TU+TH, 8 occurrences.
+        let s = parse_rrule("FREQ=WEEKLY;INTERVAL=2;COUNT=8;WKST=SU;BYDAY=TU,TH");
+        assert_eq!(s.freq, "WEEKLY");
+        assert_eq!(s.interval, 2);
+        assert_eq!(s.count, Some(8));
+        assert_eq!(s.wkst, "SU");
+        assert_eq!(s.byday.len(), 2);
+        assert!(s.byday.iter().any(|d| d.weekday == "TU" && d.pos == 0));
+        assert!(s.byday.iter().any(|d| d.weekday == "TH" && d.pos == 0));
+    }
+
+    #[test]
+    fn test_parse_rrule_monthly_numeric_byday_and_monthday() {
+        // Monthly first-Friday + month-day list (RFC5545 §3.8.5.3 examples).
+        let s = parse_rrule("FREQ=MONTHLY;COUNT=10;BYDAY=1FR");
+        assert_eq!(s.freq, "MONTHLY");
+        assert_eq!(s.byday.len(), 1);
+        assert_eq!(s.byday[0].weekday, "FR");
+        assert_eq!(s.byday[0].pos, 1);
+        let t = parse_rrule("FREQ=MONTHLY;COUNT=10;BYMONTHDAY=2,15");
+        assert_eq!(t.bymonthday, vec![2, 15]);
+        let u = parse_rrule("FREQ=MONTHLY;INTERVAL=18;COUNT=10;BYMONTHDAY=10,11,12,13,14,15");
+        assert_eq!(u.interval, 18);
+        assert_eq!(u.bymonthday.len(), 6);
+    }
+
+    #[test]
+    fn test_parse_rrule_yearly_bymonth_until_and_bysetpos() {
+        let s = parse_rrule("FREQ=YEARLY;BYMONTH=3;BYDAY=TH");
+        assert_eq!(s.freq, "YEARLY");
+        assert_eq!(s.bymonth, vec![3]);
+        assert_eq!(s.byday.len(), 1);
+        let t = parse_rrule("FREQ=YEARLY;UNTIL=20000131T140000Z;BYMONTH=1;BYDAY=SU");
+        assert_eq!(t.until, Some("20000131T140000Z".into()));
+        assert_eq!(t.bymonth, vec![1]);
+        let u = parse_rrule("FREQ=MONTHLY;BYDAY=MO,TU,WE,TH,FR;BYSETPOS=-1");
+        assert_eq!(u.bysetpos, vec![-1]);
+        assert_eq!(u.byday.len(), 5);
+    }
+
+    #[test]
+    fn test_parse_rrule_lenient_skips_garbage() {
+        // Invalid INTERVAL/COUNT fall back to defaults; bad BYDAY/BYMONTHDAY
+        // entries are skipped without failing the whole rule.
+        let s = parse_rrule(
+            "FREQ=DAILY;INTERVAL=0;COUNT=xx;BYDAY=XX,MO;BYMONTHDAY=99,15;BYMONTH=13,6;WKST=XX",
+        );
+        assert_eq!(s.freq, "DAILY");
+        assert_eq!(s.interval, 1);
+        assert_eq!(s.count, None);
+        assert_eq!(s.byday.len(), 1);
+        assert_eq!(s.byday[0].weekday, "MO");
+        assert_eq!(s.bymonthday, vec![15]);
+        assert_eq!(s.bymonth, vec![6]);
+        assert!(s.wkst.is_empty());
+        // Empty rule: freq empty, interval default.
+        let e = parse_rrule("");
+        assert!(e.freq.is_empty());
+        assert_eq!(e.interval, 1);
+    }
+
+    #[test]
+    fn test_parse_ical_attendee_params_rsvp_partstat_role() {
+        let frag = "BEGIN:VEVENT\nUID:x\nORGANIZER;CN=Big Boss:mailto:boss@example.com\nATTENDEE;CN=Alice;RSVP=TRUE;PARTSTAT=ACCEPTED;ROLE=REQ-PARTICIPANT:mailto:alice@example.com\nATTENDEE;CN=Bob;PARTSTAT=TENTATIVE;ROLE=OPT-PARTICIPANT;CUTYPE=INDIVIDUAL:mailto:bob@example.com\nATTENDEE:mailto:plain@example.com\nEND:VEVENT";
+        let p = parse_ical(frag).unwrap();
+        assert_eq!(p.organizer, "boss@example.com");
+        assert_eq!(p.organizer_name, "Big Boss");
+        assert_eq!(p.attendees.len(), 3);
+        assert_eq!(p.attendee_details.len(), 3);
+        let a = &p.attendee_details[0];
+        assert_eq!(a.email, "alice@example.com");
+        assert_eq!(a.name, "Alice");
+        assert!(a.rsvp);
+        assert_eq!(a.partstat, "ACCEPTED");
+        assert_eq!(a.role, "REQ-PARTICIPANT");
+        let b = &p.attendee_details[1];
+        assert_eq!(b.name, "Bob");
+        assert!(!b.rsvp);
+        assert_eq!(b.partstat, "TENTATIVE");
+        assert_eq!(b.role, "OPT-PARTICIPANT");
+        assert_eq!(b.cutype, "INDIVIDUAL");
+        assert_eq!(p.attendee_details[2].email, "plain@example.com");
+    }
+
+    #[test]
+    fn test_parse_ical_attendee_quoted_cn_with_comma() {
+        // CN may be quoted and contain commas/semicolons (RFC5545 params).
+        let frag =
+            "BEGIN:VEVENT\nUID:x\nATTENDEE;CN=\"Doe, John\":mailto:john@example.com\nEND:VEVENT";
+        let p = parse_ical(frag).unwrap();
+        assert_eq!(p.attendee_details.len(), 1);
+        assert_eq!(p.attendee_details[0].name, "Doe, John");
+        assert_eq!(p.attendee_details[0].email, "john@example.com");
+    }
+
+    #[test]
+    fn test_parse_ical_recurrence_id_and_range() {
+        let master =
+            "BEGIN:VEVENT\nUID:u1\nDTSTART:20260914T200000Z\nRRULE:FREQ=DAILY;COUNT=5\nEND:VEVENT";
+        let m = parse_ical(master).unwrap();
+        assert!(m.recurrence_id.is_empty());
+        let exc = "BEGIN:VEVENT\nUID:u1\nRECURRENCE-ID:20260915T200000Z\nDTSTART:20260915T223000Z\nEND:VEVENT";
+        let e = parse_ical(exc).unwrap();
+        assert_eq!(e.recurrence_id, "20260915T200000Z");
+        assert!(e.recurrence_id_range.is_empty());
+        let exc2 =
+            "BEGIN:VEVENT\nUID:u1\nRECURRENCE-ID;RANGE=THISANDFUTURE:20260915T200000Z\nEND:VEVENT";
+        let f = parse_ical(exc2).unwrap();
+        assert_eq!(f.recurrence_id_range, "THISANDFUTURE");
+    }
+
+    #[test]
+    fn test_parse_ical_exdate_tzid_and_merge_union() {
+        // EXDATE with TZID strips params but keeps floating values; merge
+        // unions multi-valued EXDATE/ATTENDEE across fragments.
+        let a = "BEGIN:VEVENT\nUID:u1\nEXDATE:20260909T090000Z,20260916T090000Z\nEND:VEVENT"
+            .to_string();
+        let b = "BEGIN:VEVENT\nUID:u1\nEXDATE;TZID=Europe/Rome:20260923T090000\nATTENDEE;CN=Alice:mailto:alice@example.com\nEND:VEVENT".to_string();
+        let m = merge_ical_fragments(&[a, b]).unwrap();
+        assert_eq!(m.exdates.len(), 3);
+        assert!(m.exdates.contains(&"20260923T090000".to_string()));
+        assert_eq!(m.attendee_details.len(), 1);
+        assert_eq!(m.attendee_details[0].email, "alice@example.com");
+    }
+
+    #[test]
+    fn test_split_full_handles_colon_in_quoted_param() {
+        let (name, params, value) =
+            split_ical_line_full("ATTENDEE;CN=\"a:b\":mailto:x@example.com").unwrap();
+        assert_eq!(name, "ATTENDEE");
+        assert!(params.contains("CN="));
+        assert_eq!(value, "mailto:x@example.com");
+        let map = parse_ical_params(&params);
+        assert_eq!(map.get("CN").map(String::as_str), Some("a:b"));
     }
 }

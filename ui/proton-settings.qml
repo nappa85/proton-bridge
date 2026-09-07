@@ -2,11 +2,16 @@
 //
 // Fork of the stock OnlineSyncAccountSettingsAgent
 // (/usr/share/accounts/ui/OnlineSyncAccountSettingsAgent.qml): identical
-// structure and behavior, plus one pulley-menu item that explicitly purges
-// synced data (contacts collection + mKCal notebooks) for this account via
-// the Proton 1.0 QML extension. A fork is needed because the stock agent
-// offers no hook for extra menu items, and our calendar service must not
-// use stock CalDAV discovery flows.
+// structure and behavior, with two deliberate deviations:
+//  - one extra pulley-menu item that explicitly purges synced data
+//    (contacts collection + mKCal notebooks) for this account via the
+//    Proton 1.0 QML extension (a fork is needed because the stock agent
+//    offers no hook for extra menu items, and our calendar service must
+//    not use stock CalDAV discovery flows);
+//  - the stock "Advanced settings" item is dropped: it edits server paths
+//    (server address, address book / calendar / WebDAV paths — see
+//    docs.sailfishos.org Settings UI), none of which exist for Proton
+//    (endpoint is hardcoded to https://mail.proton.me).
 
 import QtQuick 2.6
 import Sailfish.Silica 1.0
@@ -58,23 +63,16 @@ AccountSettingsAgent {
                 }
 
                 MenuItem {
-                    //% "Advanced settings"
-                    text: qsTrId("components_accounts-la-advanced_settings")
-
-                    onClicked: {
-                        pageStack.animatorPush(advancedSettingsDialogComponent, {"title": text})
-                    }
-                }
-
-                MenuItem {
                     // Explicit, user-confirmed purge of everything this
                     // account synced to the phone. The account itself and
                     // its server-side data are untouched; the next sync
                     // re-downloads everything.
-                    text: "Delete synced data from phone"
+                    //% "Delete synced data from phone"
+                    text: qsTr("Delete synced data from phone")
                     onClicked: {
                         purgeRemorse.execute(
-                            "Deleting synced data",
+                            //% "Deleting synced data"
+                            qsTr("Deleting synced data"),
                             function() {
                                 if (!purger.purgeData(root.accountId)) {
                                     console.log("Proton: purge reported failure, see /tmp/proton-sync-debug.log")
@@ -118,22 +116,6 @@ AccountSettingsAgent {
 
         AccountCredentialsUpdater {
             id: credentialsUpdater
-        }
-    }
-
-    Component {
-        id: advancedSettingsDialogComponent
-
-        OnlineSyncAccountAdvancedSettingsDialog {
-            account: settingsDisplay.account
-            services: root.services
-
-            onSettingsChanged: {
-                settingsDisplay.saveAccount(true)
-
-                // Reload the account settings from the saved values.
-                settingsDisplay.reload(settingsDisplay.account.identifier)
-            }
         }
     }
 }

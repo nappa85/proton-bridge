@@ -557,11 +557,31 @@ Calendar sync:
   Proton (`PUT .../events/sync` whole-object replace — see api.md pitfalls:
   re-send Notifications/Color/Attendees verbatim, patch cards in place,
   reuse session keys, SEQUENCE rules for exceptions).
-- [ ] Recurrence fidelity: only FREQ/COUNT/UNTIL mapped; BYDAY/INTERVAL and
-  complex rules ignored. Moved-across-days exceptions show standalone
-  (correct times) instead of linked.
-- [ ] Attendees/invites: identities stored display-only; no RSVP status
-  sync, no invitation sending.
+- [x] Recurrence fidelity (2026-09-07, local only — needs live T09–T15
+  re-sync to verify on device): INTERVAL/BYDAY/BYMONTHDAY/BYMONTH/BYYEARDAY/
+  BYWEEKNO/BYSETPOS/WKST now parsed (Rust `parse_rrule` + 4 offline tests)
+  and mapped to `KCalendarCore::RecurrenceRule` (`setFrequency/setByDays/
+  setByMonthDays/setByMonths/setByYearDays/setByWeekNumbers/setBySetPos/
+  setWeekStart`; HOURLY/MINUTELY/SECONDLY added; COUNT wins over UNTIL;
+  BYHOUR/BYMINUTE/BYSECOND ignored by design — time comes from DTSTART).
+  EXDATEs now interpret floating values in the event timezone (was hardcoded
+  UTC → 2h shift for zoned events). RECURRENCE-ID (+RANGE) parsed into
+  `recurrence_id_ical` for completeness; row `RecurrenceID` unix stays
+  authoritative for the decomposed-exception path. Moved-across-days
+  exceptions still show standalone (correct times) instead of linked — the
+  mkcal exception machinery never persisted dissociated rows (see §9 T15).
+  Workspace green (47+2+12), clippy/fmt clean, SDK `moc` + `g++ -c` OK.
+  See §11 for details. Remaining: visual re-check of T09–T15 after deploy.
+- [x] Attendees/invites identities (2026-09-07, local only): ORGANIZER CN
+  and ATTENDEE CN/RSVP/PARTSTAT/ROLE/CUTYPE now parsed (quoted-CN and
+  colon-in-CN safe) into `CalAttendee` + `organizer_name`, plumbed through
+  `CalEventJson.attendees_full` (backward compatible: legacy `attendees`
+  email list + `organizer` bare email kept), and stored as
+  `KCalendarCore::Attendee(name,email,rsvp,status,role)` + `Person(name,
+  email)` organizer with legacy fallback. Covered by 5 Rust offline tests
+  + 1 engine passthrough test. Remaining (still open): RSVP status sync
+  back to server, invitation sending, CUTYPE display — all need the upsync
+  write path (`PUT .../events/sync`).
 - [x] Tombstone accumulation: purge soft-deleted rows scoped to our
   notebooks after each successful save (`deletedIncidences` +
   `purgeDeletedIncidences`; upsync caveat noted in code). Staged
@@ -602,3 +622,119 @@ Packaging/release:
   without provider = dead code; provider without engine = dead toggles).
   Verified in built RPM metadata both directions. Unversioned (parsers are
   forward/backward tolerant by design).
+
+## 11. Recurrence + attendee fidelity – 2026-09-07 (local only, no device)
+
+Per user instruction: research docs + reference implementations first, local
+tests before any device run. No OTP / root / ssh used in this session.
+Phone (defaultuser@192.168.1.124) and SDK container reserved for the deploy
+step below. Baseline before changes: `cargo test` 38+2+11 green,
+`cargo fmt --check` clean, `clippy -D warnings` clean.
+
+### References consulted (no device needed)
+
+- RFC5545 §3.3.10 (recur rule parts: FREQ/UNTIL/COUNT/INTERVAL/BYDAY/
+  BYMONTHDAY/BYYEARDAY/BYWEEKNO/BYMONTH/BYSETPOS/WKST + BYDAY numeric-prefix
+  rules + Limit/Expand table) via icalendar.org (FREQ required, INTERVAL
+  default 1, BYDAY `+1MO`/`-1SU` only valid MONTHLY/YEARLY, COUNT/UNTIL
+  mutually exclusive, missing BYxxx falls back to DTSTART).
+- `KCalendarCore::RecurrenceRule` (device -devel headers vendored in
+  `proton-bridge/device-headers/`): `setFrequency/setByDays(WDayPos)/
+  setByMonthDays/setByYearDays/setByWeekNumbers/setByMonths/setBySetPos/
+  setWeekStart`, `WDayPos(pos, day)` day 1=MO..7=SU pos 0=all, `setRRule`
+  is store-only (not evaluated), `setDuration(COUNT)` vs `setEndDt(UNTIL)`.
+- `KCalendarCore::Attendee` (`Attendee(name,email,rsvp,status,role)`,
+  `PartStat` NEEDS-ACTION/ACCEPTED/DECLINED/TENTATIVE/DELEGATED/COMPLETED/
+  IN-PROCESS, `Role` CHAIR/REQ-/OPT-/NON-PARTICIPANT, `setCuType(QString)`)
+  + `KCalendarCore::Person(name,email)` + `setOrganizer(Person)` (device
+  headers; `setOrganizer(QString)` email-only path kept as fallback).
+- Prior art in repo: `buteo-sync-plugin-caldav` `NotebookSyncAgent`
+  (per-account notebooks + GUID mapping pattern we already mirror);
+  proton-cal `ical.MergeFragments` (shared-signed wins structural,
+  multi-valued union — extended here to attendee_details by email).
+
+### What changed (all offline-testable, backward compatible)
+
+- `proton-api/src/calendar.rs`:
+  - `split_ical_line_full` (colon outside quoted params) + `parse_ical_params`
+    (quote-aware `;` split, DQUOTE strip) + `parse_mailto_email` + structured
+    `parse_attendee_identity` / `parse_organizer_identity`.
+  - `ParsedCalendarEvent` gains `organizer_name`, `attendee_details:
+    Vec<CalAttendee>`, `recurrence_id`, `recurrence_id_range` (all
+    `#[serde(default)]`); `organizer` is now the BARE email (was the raw
+    `mailto:` URI — the shim's `stripMailto` makes this compatible both ways);
+    `attendees` legacy email list kept alongside `attendee_details`.
+  - `parse_rrule` → `RecurrenceSpec` (lenient: bad parts skipped, INTERVAL
+    defaults 1, numeric BYDAY prefix validated via plain `parse::<i32>`,
+    lists deduped + range-clamped, WKST validated, BYHOUR/MINUTE/SECOND
+    ignored by design).
+  - `merge_ical_fragments` merges the new fields (first-wins structural +
+    attendee union by email).
+  - 10 new offline tests: weekly BYDAY+INTERVAL, monthly numeric BYDAY +
+    BYMONTHDAY, yearly BYMONTH+UNTIL+BYSETPOS, lenient-garbage, attendee
+    RSVP/PARTSTAT/ROLE/CUTYPE, quoted-CN comma, RECURRENCE-ID+RANGE,
+    EXDATE-TZID merge union, quoted-colon split. Existing
+    `test_parse_ical_unfolds_and_strips_params` updated for bare-email
+    organizer + new detail assertions.
+- `proton-api/src/lib.rs`: re-export `CalAttendee/RecurrenceSpec/RruleByDay/
+  parse_rrule` for the sync engine.
+- `proton-sync/src/calendar.rs`: `CalEventJson` gains `organizer_name`,
+  `attendees_full`, `recurrence_id_ical`, `recurrence_id_range` (all
+  `#[serde(default)]` — old phone builds ignore them, new builds accept old
+  JSON); `process_event` populates them; new passthrough test incl. old-JSON
+  compat check.
+- `proton-bridge/cxx/proton_bridge_shim.{h,cpp}`: `Person` include;
+  `fillEventFromJson` now maps INTERVAL/BYDAY (numeric-prefix aware)/
+  BYMONTHDAY/BYMONTH/BYYEARDAY/BYWEEKNO/BYSETPOS/WKST (+HOURLY/MINUTELY/
+  SECONDLY FREQ; COUNT-wins-over-UNTIL; raw RRULE also stored via
+  `setRRule` for reference), interprets EXDATEs in the event timezone
+  (was hardcoded UTC), prefers `attendees_full` objects (CN/RSVP/PARTSTAT/
+  ROLE/CUTYPE → `Attendee`/`setCuType`) with legacy string-list fallback,
+  and sets organizer as `Person(name,email)` with email-only fallback.
+
+### Verification (local only)
+
+- `cargo fmt --all` + `cargo fmt --check --all` clean.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` clean
+  (fixed 6 pedantic lints: dead_code wrapper, collapsible-match/if, simpler
+  BYDAY numeric parse).
+- `cargo test --workspace --all-features`: 47 + 2 + 12 = 61 passed, 0 failed
+  (was 38+2+11 = 51; +10 new).
+- SDK container `moc` + `aarch64-meego-linux-gnu-g++ -c` of
+  `proton_bridge_shim.{h,cpp}`: both OK (only pre-existing
+  `incidences(notebook)` deprecation warning).
+
+### Deploy checklist (DO NOT RUN YET — needs user)
+
+- Staging + full link + device deploy still pending for these changes:
+  `./make-pkg-bundle.sh` (needs Docker `proton-build-env` + SDK container),
+  then `scp /tmp/libproton-client.so` + on-phone (root, `devel-su` fails over
+  SSH — user runs on phone terminal): `cp/chmod`, `pkill signond`,
+  `systemctl --user restart msyncd`, `dbus-send startSync proton-caldav-<id>`.
+- Live re-check matrix: T09 (DAILY COUNT), T10 (WEEKLY COUNT — now with real
+  BYDAY if Proton emits it), T11 (MONTHLY), T12 (YEARLY birthday), T13
+  (UNTIL), T14 (EXDATE delete), T15 (master+exception), T16 (organizer + 2
+  attendees with CN/RSVP), plus a new BYDAY INTERVAL event if the test
+  account has none (e.g. `FREQ=WEEKLY;INTERVAL=2;BYDAY=TU,TH`).
+- Still open (future): upsync write path (`PUT .../events/sync`), RSVP sync
+  back + invitation sending, CUTYPE display, complex-rule visual diffs for
+  moved-across-days exceptions (standalone by design — see §9 T15).
+
+### Live verification 2026-09-07 (device, account 105)
+
+Deployed `libproton-client.so` sha256
+`3279c70051d800cbd06c41271bcd22a6e02e244c1e30d2e46368b92943b331a2`
+(Rust recurrence + attendee work + shim mapping). Sync result:
+`Saved 1 contacts`, `Saved 21 calendar events to mkcal`, `Alarm COUNT(*) =
+21` (one Display row per event — confirms the single-relative-offset model,
+not per-occurrence expansion). Keys: `derived_keys=2`,
+`u_…_derived` + `a_…_tok_ok`, `calkeys=1 addrkeys=2 settings=1` on both
+calendars; `salts_unavailable` 403 as expected on restored sessions
+(non-blocking, derived+Token path). Account-level `/settings/calendar`
+returns view prefs only (`PrimaryTimezone: Africa/Abidjan` — matches the
+mixed Rome/Abidjan/UTC account timezones seen in §9); per-calendar defaults
+came from the v1 settings route and were re-persisted
+(`Persisted calendar defaults for account 105`). Notebooks for both Proton
+calendars were (re)created per-calendar as designed. Remaining: user visual
+check in the Calendar app (T09–T15 recurrence series, T14 EXDATE skip, T15
+master+standalone exception, T16 organizer/attendees, T20 notebook).

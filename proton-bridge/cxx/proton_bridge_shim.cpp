@@ -1166,9 +1166,78 @@ static QDateTime utcFromUnix(qint64 secs) {
     return dt.addSecs(secs);
 }
 
+// RFC5545 weekday → KCalendarCore day number (WDayPos: 1=Monday..7=Sunday).
+static int weekdayNumber(const QString &day) {
+    if (day == QLatin1String("MO")) return 1;
+    if (day == QLatin1String("TU")) return 2;
+    if (day == QLatin1String("WE")) return 3;
+    if (day == QLatin1String("TH")) return 4;
+    if (day == QLatin1String("FR")) return 5;
+    if (day == QLatin1String("SA")) return 6;
+    if (day == QLatin1String("SU")) return 7;
+    return 0;
+}
+
+// Parse one BYDAY entry ("MO", "1FR", "-1SU", "+2TU") into WDayPos parts.
+// Returns false for garbage (unknown weekday, non-numeric prefix).
+static bool parseByDayEntry(const QString &entry, int &posOut, int &dayOut) {
+    QString e = entry.trimmed().toUpper();
+    if (e.length() < 2) return false;
+    QString day = e.right(2);
+    int dayNum = weekdayNumber(day);
+    if (dayNum == 0) return false;
+    QString num = e.left(e.length() - 2);
+    if (num.isEmpty()) {
+        posOut = 0;
+        dayOut = dayNum;
+        return true;
+    }
+    bool ok = false;
+    int pos = num.toInt(&ok);
+    if (!ok) return false;
+    posOut = pos;
+    dayOut = dayNum;
+    return true;
+}
+
+// Comma-separated integer list clamped to [lo,hi], deduped, order-kept.
+static QList<int> parseIntList(const QString &value, int lo, int hi) {
+    QList<int> out;
+    for (const QString &entry : value.split(',')) {
+        bool ok = false;
+        int n = entry.trimmed().toInt(&ok);
+        if (ok && n >= lo && n <= hi && !out.contains(n)) out.append(n);
+    }
+    return out;
+}
+
+static KCalendarCore::Attendee::PartStat mapPartStat(const QString &s) {
+    if (s == QLatin1String("ACCEPTED")) return KCalendarCore::Attendee::Accepted;
+    if (s == QLatin1String("DECLINED")) return KCalendarCore::Attendee::Declined;
+    if (s == QLatin1String("TENTATIVE")) return KCalendarCore::Attendee::Tentative;
+    if (s == QLatin1String("DELEGATED")) return KCalendarCore::Attendee::Delegated;
+    if (s == QLatin1String("COMPLETED")) return KCalendarCore::Attendee::Completed;
+    if (s == QLatin1String("IN-PROCESS")) return KCalendarCore::Attendee::InProcess;
+    if (s == QLatin1String("NEEDS-ACTION")) return KCalendarCore::Attendee::NeedsAction;
+    return KCalendarCore::Attendee::None;
+}
+
+static KCalendarCore::Attendee::Role mapAttendeeRole(const QString &s) {
+    if (s == QLatin1String("CHAIR")) return KCalendarCore::Attendee::Chair;
+    if (s == QLatin1String("OPT-PARTICIPANT")) return KCalendarCore::Attendee::OptParticipant;
+    if (s == QLatin1String("NON-PARTICIPANT")) return KCalendarCore::Attendee::NonParticipant;
+    return KCalendarCore::Attendee::ReqParticipant;
+}
+
 // Fill a KCalendarCore event from one JSON row (times precomputed by caller).
 // Recurrence linkage (recurrenceId) is handled by the caller: pass 1 adds
-// masters, pass 2 dissociates exceptions from them (T15).
+// masters, pass 2 decomposes exceptions into EXDATE + standalone (T15).
+//
+// Recurrence (RFC5545 §3.3.10, verified T09–T14 plus BYDAY/INTERVAL matrix):
+// FREQ + INTERVAL + COUNT/UNTIL + BYDAY/BYMONTHDAY/BYMONTH/BYYEARDAY/
+// BYWEEKNO/BYSETPOS/WKST. BYHOUR/BYMINUTE/BYSECOND are intentionally ignored
+// (time comes from DTSTART). Invalid parts are skipped, never failing the
+// event. COUNT wins over UNTIL when both appear (RFC forbids the combo).
 static void fillEventFromJson(const KCalendarCore::Event::Ptr &ev, const QJsonObject &o,
                               const QString &uid, const QDateTime &start, const QDateTime &end,
                               bool fullDay) {
@@ -1180,7 +1249,8 @@ static void fillEventFromJson(const KCalendarCore::Event::Ptr &ev, const QJsonOb
     ev->setAllDay(fullDay);
     ev->setDtStart(start);
     ev->setDtEnd(end);
-    // Recurrence: FREQ + COUNT/UNTIL from the raw RRULE (verified T09–T14).
+    QString startTz = o.value(QLatin1String("start_timezone")).toString();
+    if (startTz.isEmpty()) startTz = QStringLiteral("UTC");
     QString rrule = o.value(QLatin1String("rrule")).toString().toUpper();
     if (rrule.contains(QStringLiteral("FREQ="))) {
         KCalendarCore::RecurrenceRule::PeriodType period =
@@ -1189,39 +1259,121 @@ static void fillEventFromJson(const KCalendarCore::Event::Ptr &ev, const QJsonOb
         else if (rrule.contains(QStringLiteral("FREQ=WEEKLY"))) period = KCalendarCore::RecurrenceRule::rWeekly;
         else if (rrule.contains(QStringLiteral("FREQ=MONTHLY"))) period = KCalendarCore::RecurrenceRule::rMonthly;
         else if (rrule.contains(QStringLiteral("FREQ=YEARLY"))) period = KCalendarCore::RecurrenceRule::rYearly;
+        else if (rrule.contains(QStringLiteral("FREQ=HOURLY"))) period = KCalendarCore::RecurrenceRule::rHourly;
+        else if (rrule.contains(QStringLiteral("FREQ=MINUTELY"))) period = KCalendarCore::RecurrenceRule::rMinutely;
+        else if (rrule.contains(QStringLiteral("FREQ=SECONDLY"))) period = KCalendarCore::RecurrenceRule::rSecondly;
         if (period != KCalendarCore::RecurrenceRule::rNone) {
             KCalendarCore::RecurrenceRule *rule = new KCalendarCore::RecurrenceRule();
             rule->setRecurrenceType(period);
             rule->setFrequency(1);
             rule->setStartDt(start);
+            rule->setRRule(rrule); // stored for reference only (see header)
+            int count = 0;
+            QDateTime until;
+            QList<KCalendarCore::RecurrenceRule::WDayPos> byDays;
+            QList<int> byMonthDays, byMonths, byYearDays, byWeekNos, bySetPos;
+            short wkst = 0;
             for (const QString &part : rrule.split(';')) {
                 if (part.startsWith(QStringLiteral("COUNT="))) {
                     bool ok = false;
-                    int count = part.mid(6).toInt(&ok);
-                    if (ok && count > 0) rule->setDuration(count);
+                    int n = part.mid(6).toInt(&ok);
+                    if (ok && n > 0) count = n;
                 } else if (part.startsWith(QStringLiteral("UNTIL="))) {
-                    QDateTime until = ProtonCalendarPlugin::parseCalTime(part.mid(6), 0, QStringLiteral("UTC"));
-                    if (until.isValid()) rule->setEndDt(until);
+                    QDateTime u = ProtonCalendarPlugin::parseCalTime(part.mid(6), 0, startTz);
+                    if (u.isValid()) until = u;
+                } else if (part.startsWith(QStringLiteral("INTERVAL="))) {
+                    bool ok = false;
+                    int n = part.mid(9).toInt(&ok);
+                    if (ok && n >= 1) rule->setFrequency(n);
+                } else if (part.startsWith(QStringLiteral("BYDAY="))) {
+                    for (const QString &entry : part.mid(6).split(',')) {
+                        int pos = 0, day = 0;
+                        if (!parseByDayEntry(entry, pos, day)) continue;
+                        KCalendarCore::RecurrenceRule::WDayPos wp(pos, static_cast<short>(day));
+                        if (!byDays.contains(wp)) byDays.append(wp);
+                    }
+                } else if (part.startsWith(QStringLiteral("BYMONTHDAY="))) {
+                    byMonthDays = parseIntList(part.mid(11), -31, 31);
+                    byMonthDays.erase(std::remove(byMonthDays.begin(), byMonthDays.end(), 0),
+                                      byMonthDays.end());
+                } else if (part.startsWith(QStringLiteral("BYMONTH="))) {
+                    byMonths = parseIntList(part.mid(8), 1, 12);
+                } else if (part.startsWith(QStringLiteral("BYYEARDAY="))) {
+                    QList<int> days = parseIntList(part.mid(10), -366, 366);
+                    days.erase(std::remove(days.begin(), days.end(), 0), days.end());
+                    byYearDays = days;
+                } else if (part.startsWith(QStringLiteral("BYWEEKNO="))) {
+                    QList<int> weeks = parseIntList(part.mid(9), -53, 53);
+                    weeks.erase(std::remove(weeks.begin(), weeks.end(), 0), weeks.end());
+                    byWeekNos = weeks;
+                } else if (part.startsWith(QStringLiteral("BYSETPOS="))) {
+                    QList<int> pos = parseIntList(part.mid(9), -366, 366);
+                    pos.erase(std::remove(pos.begin(), pos.end(), 0), pos.end());
+                    bySetPos = pos;
+                } else if (part.startsWith(QStringLiteral("WKST="))) {
+                    int w = weekdayNumber(part.mid(5));
+                    if (w >= 1 && w <= 7) wkst = static_cast<short>(w);
                 }
+            }
+            if (!byDays.isEmpty()) rule->setByDays(byDays);
+            if (!byMonthDays.isEmpty()) rule->setByMonthDays(byMonthDays);
+            if (!byMonths.isEmpty()) rule->setByMonths(byMonths);
+            if (!byYearDays.isEmpty()) rule->setByYearDays(byYearDays);
+            if (!byWeekNos.isEmpty()) rule->setByWeekNumbers(byWeekNos);
+            if (!bySetPos.isEmpty()) rule->setBySetPos(bySetPos);
+            if (wkst != 0) rule->setWeekStart(wkst);
+            if (count > 0) {
+                rule->setDuration(count);
+            } else if (until.isValid()) {
+                rule->setEndDt(until);
             }
             ev->recurrence()->addRRule(rule); // recurrence takes ownership
         }
     }
-    // EXDATEs (T14 single-occurrence deletes).
+    // EXDATEs (T14 single-occurrence deletes). Values are floating when the
+    // source line carried TZID (params stripped by Rust), so interpret them
+    // in the event's timezone — UTC fallback was a 2h shift for zoned events.
     QJsonArray exdates = o.value(QLatin1String("exdates")).toArray();
     for (const QJsonValue &xv : exdates) {
-        QDateTime ex = ProtonCalendarPlugin::parseCalTime(xv.toString(), 0, QStringLiteral("UTC"));
+        QDateTime ex = ProtonCalendarPlugin::parseCalTime(xv.toString(), 0, startTz);
         if (ex.isValid()) ev->recurrence()->addExDateTime(ex);
     }
-    // Attendees (mailto: identities from merged fragments, T16).
-    QJsonArray atts = o.value(QLatin1String("attendees")).toArray();
-    for (const QJsonValue &av : atts) {
-        QString email = stripMailto(av.toString());
-        if (email.isEmpty()) continue;
-        ev->addAttendee(KCalendarCore::Attendee(QString(), email));
+    // Attendees: prefer structured attendees_full (CN/RSVP/PARTSTAT/ROLE),
+    // fall back to the legacy attendees email list (T16).
+    QJsonArray full = o.value(QLatin1String("attendees_full")).toArray();
+    if (!full.isEmpty()) {
+        for (const QJsonValue &av : full) {
+            QJsonObject ao = av.toObject();
+            QString email = stripMailto(ao.value(QLatin1String("email")).toString());
+            if (email.isEmpty()) continue;
+            QString name = ao.value(QLatin1String("name")).toString();
+            bool rsvp = ao.value(QLatin1String("rsvp")).toBool(false);
+            KCalendarCore::Attendee::PartStat st =
+                mapPartStat(ao.value(QLatin1String("partstat")).toString().toUpper());
+            KCalendarCore::Attendee::Role role =
+                mapAttendeeRole(ao.value(QLatin1String("role")).toString().toUpper());
+            KCalendarCore::Attendee attendee(name, email, rsvp, st, role);
+            QString cutype = ao.value(QLatin1String("cutype")).toString().toUpper();
+            if (!cutype.isEmpty()) attendee.setCuType(cutype);
+            ev->addAttendee(attendee);
+        }
+    } else {
+        QJsonArray atts = o.value(QLatin1String("attendees")).toArray();
+        for (const QJsonValue &av : atts) {
+            QString email = stripMailto(av.toString());
+            if (email.isEmpty()) continue;
+            ev->addAttendee(KCalendarCore::Attendee(QString(), email));
+        }
     }
-    QString organizer = stripMailto(o.value(QLatin1String("organizer")).toString());
-    if (!organizer.isEmpty()) ev->setOrganizer(organizer);
+    QString organizerEmail = stripMailto(o.value(QLatin1String("organizer")).toString());
+    QString organizerName = o.value(QLatin1String("organizer_name")).toString();
+    if (!organizerEmail.isEmpty()) {
+        if (organizerName.isEmpty()) {
+            ev->setOrganizer(organizerEmail);
+        } else {
+            ev->setOrganizer(KCalendarCore::Person(organizerName, organizerEmail));
+        }
+    }
     QString status = o.value(QLatin1String("status")).toString().toUpper();
     if (status == QLatin1String("CONFIRMED")) ev->setStatus(KCalendarCore::Incidence::StatusConfirmed);
     else if (status == QLatin1String("CANCELLED")) ev->setStatus(KCalendarCore::Incidence::StatusCanceled);
