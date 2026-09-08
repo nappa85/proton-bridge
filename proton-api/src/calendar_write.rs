@@ -554,22 +554,26 @@ pub struct LocalFields {
 }
 
 /// Format a DATE-TIME (UTC `…Z`) or DATE (all-day) property body AFTER the
-/// NAME (`":20260914T180000Z"` / `":20260709"`). All-day end input is the
-/// phone-INCLUSIVE unix; output DTEND is exclusive (+1 day), per RFC 5545
-/// and our shim's read-side inverse. Returns `None` for out-of-range input.
+/// NAME (`":20260914T180000Z"` / `";VALUE=DATE:20260709"`). DATE values
+/// carry the explicit `VALUE=DATE` parameter (what the server sends us and
+/// proton-cal emits — a bare dateless value is not valid DATE-TIME).
+/// All-day end input is the phone-INCLUSIVE unix; output DTEND is
+/// exclusive (+1 day), per RFC 5545 and our shim's read-side inverse.
+/// Returns `None` for out-of-range input.
 pub fn format_ical_dt(unix: i64, all_day: bool) -> Option<String> {
     let dt = chrono::DateTime::from_timestamp(unix, 0)?;
     if all_day {
-        Some(format!("{}", dt.format(":%Y%m%d")))
+        Some(format!("{}", dt.format(";VALUE=DATE:%Y%m%d")))
     } else {
         Some(format!("{}", dt.format(":%Y%m%dT%H%M%SZ")))
     }
 }
 
-/// Exclusive-end DATE body for a phone-inclusive all-day end unix.
+/// Exclusive-end DATE body for a phone-inclusive all-day end unix
+/// (`";VALUE=DATE:…"` — see `format_ical_dt`).
 pub fn format_ical_date_end_exclusive(inclusive_unix: i64) -> Option<String> {
     let dt = chrono::DateTime::from_timestamp(inclusive_unix, 0)? + chrono::Duration::days(1);
-    Some(format!("{}", dt.format(":%Y%m%d")))
+    Some(format!("{}", dt.format(";VALUE=DATE:%Y%m%d")))
 }
 
 /// Next `SEQUENCE` after an edit (RFC 5546 + api.md): bump only on

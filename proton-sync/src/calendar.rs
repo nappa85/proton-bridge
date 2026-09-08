@@ -229,11 +229,11 @@ impl CalendarSyncEngine {
             }
         }
         // Unlock user + address keys (same Token-aware logic as contacts engine).
-        let mut address_keys = self.unlock_address_keys(&access_token, &uid, config)?;
+        let mut keys = self.unlock_address_keys(&access_token, &uid, config)?;
         // Upsync phase 1 (uploads) before the download/decrypt loop below.
         // Fail-closed: Err aborts before any download/apply (start_sync
         // reports it; local state untouched; uploads retry next cycle).
-        self.run_upload_phase(config, &cal_client, &mut address_keys, &uid, &mut fetched)?;
+        self.run_upload_phase(config, &cal_client, &mut keys, &uid, &mut fetched)?;
         for (cal, events) in &fetched {
             // Bootstrap: members + keys + passphrase in one call (v2, fallback v1).
             let mut bootstrap =
@@ -308,14 +308,13 @@ impl CalendarSyncEngine {
                     }
                 });
             let member_id = pick_member_id(&bootstrap.Members, &config.username);
-            let mut cal_keys =
-                Self::unlock_calendar_keys(&bootstrap, &member_id, &mut address_keys);
+            let mut cal_keys = Self::unlock_calendar_keys(&bootstrap, &member_id, keys.combined());
             self.set_debug(format!(
                 "cal={} members={} calkeys={} addrkeys={} settings={}",
                 &cal.ID[..8.min(cal.ID.len())],
                 bootstrap.Members.len(),
                 cal_keys.len(),
-                address_keys.len(),
+                keys.combined().len(),
                 if bootstrap.Settings.is_some() {
                     "1"
                 } else {
@@ -332,7 +331,7 @@ impl CalendarSyncEngine {
                     &cal.ID,
                     &cal_name,
                     &mut cal_keys,
-                    &mut address_keys,
+                    keys.combined(),
                     bootstrap.Settings.as_ref(),
                     cached,
                 ) {
@@ -422,6 +421,13 @@ impl CalendarSyncEngine {
                     message: format!("upsync {what} upload failed: {e}"),
                 })?;
         if let Some(err) = resp.first_error() {
+            // Failure-only structure log (scrubbed: no Data/Signatures,
+            // no plaintext) — the next debug step for server rejections.
+            self.set_debug(format!(
+                "upsync_{what}_rejected cal={} {} msg={err}",
+                &cal_id[..8.min(cal_id.len())],
+                crate::upsync::scrub_batch(batch),
+            ));
             return Err(proton_api::ProtonError::Api {
                 code: 0,
                 message: format!("upsync {what} upload failed: {err}"),
@@ -434,7 +440,7 @@ impl CalendarSyncEngine {
         &self,
         config: &SyncConfig,
         cal_client: &CalendarClient,
-        address_keys: &mut [UnlockedKey],
+        keys: &mut UnlockedAddressKeys,
         uid: &str,
         fetched: &mut [(proton_api::Calendar, Vec<CalendarEvent>)],
     ) -> Result<(), proton_api::ProtonError> {
@@ -511,7 +517,7 @@ impl CalendarSyncEngine {
                 continue;
             };
             let mut cal_keys =
-                Self::unlock_calendar_keys(&bootstrap, &Some(member_id.clone()), address_keys);
+                Self::unlock_calendar_keys(&bootstrap, &Some(member_id.clone()), keys.combined());
             // Creates: seal fresh bodies (missing fields/calendar or
             // unserializable recurrence defers with a log line).
             let mut created = Vec::new();
@@ -537,7 +543,7 @@ impl CalendarSyncEngine {
                             fields,
                             &fresh_uid,
                             &mut cal_keys,
-                            address_keys,
+                            keys.address_only(),
                         ) {
                             Ok(Some(body)) => created.push(body),
                             Ok(None) => {
@@ -603,7 +609,7 @@ impl CalendarSyncEngine {
                     &fresh,
                     fields,
                     &mut cal_keys,
-                    address_keys,
+                    keys.address_only(),
                 ) {
                     Ok(Some(body)) => sealed.push((proton_id.clone(), body)),
                     Ok(None) => {
@@ -840,7 +846,7 @@ impl CalendarSyncEngine {
         access_token: &str,
         uid: &str,
         config: &SyncConfig,
-    ) -> Result<Vec<UnlockedKey>, proton_api::ProtonError> {
+    ) -> Result<UnlockedAddressKeys, proton_api::ProtonError> {
         let keys_client = match &config.api_base_url {
             Some(base) if !base.is_empty() => KeysClient::new_with_base_url(
                 base.clone(),
@@ -901,7 +907,11 @@ impl CalendarSyncEngine {
                 }
             }
         }
-        // Address keys: Token first, then salt fallback.
+        // Address keys: Token first, then salt fallback. Everything from
+        // here on is address (not user) material — the sync write path
+        // MUST sign with these (server rejects user-key signatures on
+        // event data: "Provide data signed using the address key").
+        let address_start = unlocked.len();
         for addr in &addresses {
             for key in &addr.Keys {
                 if key.PrivateKey.is_empty() {
@@ -953,7 +963,10 @@ impl CalendarSyncEngine {
         }
         debug_parts.push(format!("total={}", unlocked.len()));
         self.set_debug(debug_parts.join(";"));
-        Ok(unlocked)
+        Ok(UnlockedAddressKeys {
+            keys: unlocked,
+            address_start,
+        })
     }
 
     fn passphrase_for(
@@ -1021,6 +1034,26 @@ impl CalendarSyncEngine {
 
     fn set_status(&self, s: SyncStatus) {
         *self.status.lock().unwrap() = s;
+    }
+}
+
+/// Unlocked keys with the user/address split point. Decryption tries the
+/// whole `combined` set (passphrase cards may be encrypted to any account
+/// key); SEALING (event signatures, key packets) uses `address_only`
+/// exclusively — the server verifies event data against address keys.
+pub struct UnlockedAddressKeys {
+    keys: Vec<UnlockedKey>,
+    address_start: usize,
+}
+
+impl UnlockedAddressKeys {
+    pub fn combined(&mut self) -> &mut [UnlockedKey] {
+        &mut self.keys
+    }
+
+    pub fn address_only(&mut self) -> &mut [UnlockedKey] {
+        let start = self.address_start.min(self.keys.len());
+        &mut self.keys[start..]
     }
 }
 
@@ -1617,6 +1650,58 @@ mod tests {
         assert_eq!(purgeable, vec!["n9".to_string()]);
         let purgeable: Vec<String> = serde_json::from_str(&engine.purgeable_json()).unwrap();
         assert_eq!(purgeable, vec!["n9".to_string()]);
+        let _held = guards;
+    }
+
+    #[test]
+    fn test_unlock_splits_user_and_address_keys() {
+        // Regression test for the live 2001 "Provide data signed using the
+        // address key" rejection: the sealer signs with keys
+        // [address_start..] (address material), never the user keys pushed
+        // first. Locks the construction order the signing path depends on.
+        let user_armored = armored_tsk();
+        let addr_armored = armored_tsk();
+        let mut server = mockito::Server::new();
+        let mut guards = Vec::new();
+        macro_rules! mock_get {
+            ($re:expr, $code:expr, $body:expr) => {
+                guards.push(
+                    server
+                        .mock("GET", mockito::Matcher::Regex($re.into()))
+                        .with_status($code)
+                        .with_header("content-type", "application/json")
+                        .with_body($body)
+                        .create(),
+                );
+            };
+        }
+        mock_get!(
+            r"/core/v4/users.*",
+            200,
+            format!(
+                r#"{{"User":{{"ID":"u","Name":"t","Keys":[{{"ID":"k1","PrivateKey":"{user_armored}","Token":"","Signature":""}}]}}}}"#
+            )
+        );
+        mock_get!(
+            r"/core/v4/keys/salts.*",
+            200,
+            r#"{"KeySalts":[{"ID":"k1","KeySalt":""},{"ID":"ak1","KeySalt":""}]}"#
+        );
+        mock_get!(
+            r"/core/v4/addresses.*",
+            200,
+            format!(
+                r#"{{"Addresses":[{{"ID":"a1","Email":"t@x","Keys":[{{"ID":"ak1","PrivateKey":"{addr_armored}","Token":"","Signature":""}}]}}]}}"#
+            )
+        );
+        let mut c = cfg();
+        c.password = "testpw".into();
+        c.api_base_url = Some(server.url());
+        let engine = CalendarSyncEngine::new(c.clone());
+        let keys = engine.unlock_address_keys("at", "uid", &c).unwrap();
+        assert_eq!(keys.keys.len(), 2);
+        assert_eq!(keys.address_start, 1);
+        assert_eq!(keys.keys.len() - keys.address_start, 1);
         let _held = guards;
     }
 

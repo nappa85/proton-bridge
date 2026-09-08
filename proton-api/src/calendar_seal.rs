@@ -342,8 +342,11 @@ pub fn build_update_body(
         addr_keys,
     )
     .ok_or_else(|| ProtonError::Crypto("update: attendees card undecryptable".into()))?;
+    // Attendee/organizer identities in ANY signed card (shared AND
+    // calendar — invites may carry them outside the shared card).
     let signed_plains: Vec<String> = shared
         .iter()
+        .chain(calendar.iter())
         .filter(|(enc, _)| !enc)
         .map(|(_, plain)| plain.clone())
         .collect();
@@ -354,6 +357,16 @@ pub fn build_update_body(
     let all_day = fields.all_day.unwrap_or(row.FullDay.unwrap_or(false));
     let mut signed_patch = CardPatch::default();
     let mut enc_patch = CardPatch::default();
+    // Server-sent VERSION/PRODID lines are read-tolerated but never
+    // written: proton-cal's builder never emits them, so whole-object
+    // replaces must not echo them back (live 2011 lesson 2026-09-08).
+    for patch in [&mut signed_patch, &mut enc_patch] {
+        patch.delete.insert("VERSION".into());
+        patch.delete.insert("PRODID".into());
+    }
+    let mut strip_patch = CardPatch::default();
+    strip_patch.delete.insert("VERSION".into());
+    strip_patch.delete.insert("PRODID".into());
     // Times (signed card). Phone all-day end is inclusive → exclusive.
     if let Some(start) = fields.start_unix {
         if let Some(v) = format_ical_dt(start, all_day) {
@@ -435,13 +448,13 @@ pub fn build_update_body(
     )?;
     let calendar_parts = reseal_group(
         &calendar,
-        vec![CardPatch::default(); calendar.len()],
+        vec![strip_patch.clone(); calendar.len()],
         cal_sk.as_ref().map(|(algo, sk)| (sk, *algo)),
         addr_keys,
     )?;
     let attendees_parts = reseal_group(
         &attendees,
-        vec![CardPatch::default(); attendees.len()],
+        vec![strip_patch.clone(); attendees.len()],
         shared_sk.as_ref().map(|(algo, sk)| (sk, *algo)),
         addr_keys,
     )?;
@@ -940,6 +953,52 @@ mod tests {
     }
 
     #[test]
+    fn test_update_strips_version_prodid() {
+        // Live 2011 lesson: server-sent VERSION/PRODID are read-tolerated
+        // but never re-emitted (proton-cal's builder never emits them).
+        let mut fx = update_fixture();
+        fx.row.SharedEvents[0].Data = format!(
+            "BEGIN:VEVENT\r\nVERSION:2.0\r\nPRODID:-//Proton AG//web-calendar//EN\r\n{}",
+            fx.row.SharedEvents[0].Data
+        );
+        let fields = LocalFields {
+            summary: Some("Stripped".into()),
+            ..Default::default()
+        };
+        let body = build_update_body(&fx.row, &fields, &mut [fx.cal], &mut [fx.addr])
+            .unwrap()
+            .expect("strips and seals");
+        for part in body
+            .SharedEventContent
+            .iter()
+            .chain(body.CalendarEventContent.iter())
+        {
+            if (part.Type & 1) != 0 {
+                continue; // ciphertext opaque; signed parts carry the check
+            }
+            assert!(!part.Data.contains("VERSION:"), "{}", part.Data);
+            assert!(!part.Data.contains("PRODID:"), "{}", part.Data);
+        }
+    }
+
+    #[test]
+    fn test_update_defers_calendar_signed_attendees() {
+        // Invite data may live in the CALENDAR signed card, not shared —
+        // the guard must scan both (live 2011 lesson).
+        let mut fx = update_fixture();
+        fx.row.CalendarEvents[0].Data += "\r\nATTENDEE:mailto:a@b.c";
+        let fields = LocalFields {
+            summary: Some("x".into()),
+            ..Default::default()
+        };
+        assert!(
+            build_update_body(&fx.row, &fields, &mut [fx.cal], &mut [fx.addr])
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn test_update_defers_attendees_and_personal() {
         let mut fx = update_fixture();
         // Attendee identity in a signed card → clear RSVP rows at risk.
@@ -1064,11 +1123,15 @@ mod tests {
             .find(|p| p.Type == 2)
             .unwrap();
         assert!(
-            signed.Data.contains("DTSTART;") || signed.Data.contains("DTSTART:20260131"),
+            signed.Data.contains("DTSTART;VALUE=DATE:20260131"),
             "{}",
             signed.Data
         );
-        assert!(signed.Data.contains("DTEND:20260201"), "{}", signed.Data);
+        assert!(
+            signed.Data.contains("DTEND;VALUE=DATE:20260201"),
+            "{}",
+            signed.Data
+        );
     }
 
     #[test]
@@ -1113,14 +1176,17 @@ mod tests {
             format_ical_dt(0, false).as_deref(),
             Some(":19700101T000000Z")
         );
-        assert_eq!(format_ical_dt(0, true).as_deref(), Some(":19700101"));
+        assert_eq!(
+            format_ical_dt(0, true).as_deref(),
+            Some(";VALUE=DATE:19700101")
+        );
         // Phone-inclusive 2026-01-31 → exclusive 2026-02-01.
         let end_incl = chrono::DateTime::parse_from_rfc3339("2026-01-31T00:00:00Z")
             .unwrap()
             .timestamp();
         assert_eq!(
             format_ical_date_end_exclusive(end_incl).as_deref(),
-            Some(":20260201")
+            Some(";VALUE=DATE:20260201")
         );
         assert!(format_ical_dt(i64::MAX, false).is_none());
     }

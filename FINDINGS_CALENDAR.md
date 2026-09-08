@@ -855,6 +855,48 @@ design layer only; nothing uploads yet.
    Shim exports `fields` (dirty/never-synced rows only) + `calendar_id`
    + common-subset RRULE serializer. Engine mockito test with REAL
    generated keys (unencrypted + empty salts + password unlock path).
+   UPDATE VERIFIED LIVE 2026-09-08 (user-edited T20, 2nd calendar):
+   `upsync_updated cal=jL51FptW n=1`, sync complete, USER-CONFIRMED new
+   title on Proton web; phone agrees via post-upload re-list. Path to
+   green: address-key signing fix (2001) + attendee-guard/VERSION-strip/
+   DATE-param fixes (2011) — exact culprit among the three unisolated,
+   all three were genuine divergences from proton-cal.
+   CREATE VERIFIED LIVE 2026-09-08 (user-created phone event, main
+   calendar): `upsync_created cal=RfXFIcmY n=1` → `Saved 21`;
+   USER-CONFIRMED on Proton web with correct time; re-sync stable at 21
+   (no duplicates). Notebook scoping confirmed: only our
+   `proton-calendar-105-*` notebooks feed the planner — other calendars'
+   events are invisible to uploads and untouched by downloads. Calendar
+   upsync (create/update/delete) verified end-to-end; checkbox stays
+   open pending contacts parity + exotic-rule/attendee v1 gaps above.
+   LIVE 2001 LESSON 2026-09-08 (first update attempt): server rejected
+   with `Invalid event data (Provide data signed using the address key)`
+   — root cause OUR bug, not crypto format: `unlock_address_keys`
+   returns user keys FIRST, and sealing signed with the first pair (a
+   user key). proton-cal seals with the address keyring. Fix:
+   `UnlockedAddressKeys{keys, address_start}` split (decrypt tries the
+   whole set, SEALING uses `address_only()` exclusively) + structural
+   regression test locking the order. Multi-address refinement (match
+   signer to the event Author) recorded as future work. If the server
+   still rejects after this fix, next suspect is signature hash/type
+   (sequoia    `Signer` defaults), not key identity.
+   LIVE 2011 ROUND 2026-09-08 (first update retry): address-key signatures
+   ACCEPTED, but `code 2011: These properties are not supported`. Type
+   constants verified identical to proton-cal (`0/1/2/3`); top-level body
+   keys identical too — so it's an iCal property in our fragments. Three
+   divergences from the verified reference, all fixed locally (tests
+   green, live retry pending): (1) attendee guard scanned only SHARED
+   signed cards — invites may carry ORGANIZER/ATTENDEE in CALENDAR signed
+   cards (now scans both); (2) our reseal echoed server-sent
+   VERSION/PRODID (read-tolerated, never emitted by proton-cal — now
+   stripped on update in every group); (3) all-day DATE values lacked the
+   `;VALUE=DATE` parameter our parser strips on read (now emitted;
+   round-trips through `parse_ical`). Plus failure-only scrubbed batch
+   logging (`upsync_{create,update}_rejected`: op IDs + part types +
+   notif/color presence, never Data/Signatures/plaintext) so the next
+   rejection arrives with structure attached. If 2011 persists, the
+   scrubbed line + WHICH event (recurring? all-day? invite?) narrows it
+   without another blind round.
    Workspace 75+3+37 = 115 green. Known v1 gaps (documented in code):
    attendee/RSVP/reminder/color phone edits stay download-wins; out-of-
    window deletes can't upload; re-list failure after a create may retry

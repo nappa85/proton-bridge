@@ -108,6 +108,40 @@ pub struct SyncPlan {
     pub orphan_local_deletes: u32,
 }
 
+/// Scrubbed one-line summary of a sync batch for failure logs: op IDs,
+/// part-type lists, Notifications/Color presence. NEVER includes Data,
+/// Signature, or key packets (bulky ciphertext) nor any plaintext — safe
+/// for the world-readable debug log.
+pub fn scrub_batch(batch: &proton_api::SyncBatchRequest) -> String {
+    let ops: Vec<String> = batch
+        .Events
+        .iter()
+        .map(|op| match (&op.ID, &op.Overwrite, &op.Event) {
+            (Some(id), _, None) => format!("del({id})"),
+            (Some(id), _, Some(body)) => format!(
+                "upd({id} shared={:?} cal={:?} notif={} color={})",
+                body.SharedEventContent
+                    .iter()
+                    .map(|p| p.Type)
+                    .collect::<Vec<_>>(),
+                body.CalendarEventContent
+                    .iter()
+                    .map(|p| p.Type)
+                    .collect::<Vec<_>>(),
+                !body.Notifications.is_null(),
+                !body.Color.is_null(),
+            ),
+            (None, _, Some(body)) => format!(
+                "create(shared={} cal={})",
+                body.SharedEventContent.len(),
+                body.CalendarEventContent.len(),
+            ),
+            _ => "op(?)".into(),
+        })
+        .collect();
+    format!("member={} ops=[{}]", batch.MemberID, ops.join(" "))
+}
+
 /// Fixed cycle order. Upload failures abort before purge/download (the
 /// fail-closed rule from the race-condition review).
 pub struct SyncCycle;
@@ -514,6 +548,50 @@ mod tests {
             vec!["e1".to_string(), "e2".to_string()]
         );
         assert!(ids_for_uid(&rows, "missing").is_empty());
+    }
+
+    #[test]
+    fn test_scrub_batch_hides_blobs() {
+        use proton_api::{SyncContentPart, SyncEventBody, SyncEventOp};
+        let batch = proton_api::SyncBatchRequest {
+            MemberID: "m1".into(),
+            IsImport: None,
+            Events: vec![
+                SyncEventOp::delete("e9"),
+                SyncEventOp::update(
+                    "e1",
+                    SyncEventBody {
+                        Permissions: 1,
+                        SharedKeyPacket: None,
+                        CalendarKeyPacket: None,
+                        SharedEventContent: vec![
+                            SyncContentPart {
+                                Type: 2,
+                                Data: "SECRET-PLAIN".into(),
+                                Signature: "SECRET-SIG".into(),
+                            },
+                            SyncContentPart {
+                                Type: 3,
+                                Data: "SECRET-BLOB".into(),
+                                Signature: "SECRET-SIG".into(),
+                            },
+                        ],
+                        CalendarEventContent: Vec::new(),
+                        AttendeesEventContent: Vec::new(),
+                        Attendees: serde_json::json!([]),
+                        Notifications: serde_json::json!([{"Trigger": "-PT15M"}]),
+                        Color: serde_json::Value::Null,
+                    },
+                ),
+            ],
+        };
+        let s = scrub_batch(&batch);
+        assert!(s.contains("del(e9)"), "{s}");
+        assert!(s.contains("upd(e1"), "{s}");
+        assert!(s.contains("notif=true"), "{s}");
+        for secret in ["SECRET-PLAIN", "SECRET-BLOB", "SECRET-SIG"] {
+            assert!(!s.contains(secret), "{s}");
+        }
     }
 
     #[test]
