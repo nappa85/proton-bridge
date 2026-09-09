@@ -187,17 +187,37 @@ Sync (buteo OOPP, proton_bridge_shim.cpp, NoUserInteractionPolicy):
 - **Contact dedup**: No duplicate detection across Proton + local contacts
 - **Multiple photos**: People app only supports one avatar; only first photo is used
 - **Password never persisted** (intentional): raw 20-char login password is transient `Password` param only for `derive_all_passwords` at `Verify`; `signon-secrets.db` `CREDENTIALS.password` stays dummy `"x"`, `handleAuthOk` never returns `Secret`. New `KeySalt` after manual Proton key rotation will need one more **Update credentials → OTP** to re-derive and re-store `DerivedPasswords`.
-- [ ] **CAPTCHA / human-verification handling** (filed 2026-09-09, hit live
-  from the host: SRP login → `422 Code 9001`; details in
-  `FINDINGS_CONTACTS_UPSYNC.md` §8): today a 9001 challenge degrades to a
-  generic `NotAuthorized` sign-in error — no layer parses Code 9001, no
-  browser is ever opened, QML shows raw JSON soup, and the sync path loops
-  on "Session expired, please sign in again" back into the same CAPTCHA.
-  Direction: parse 9001 into a structured error (token/methods/WebUrl) →
-  distinct plugin `CaptchaRequired` result → QML message with the verify
-  URL as a link / "Open in browser" button (`Qt.openUrlExternally`,
-  user-initiated). Note: 9001 only gates SRP password logins
-  (creation/credential-update), never the refresh-token sync path.
+- [x] **CAPTCHA / human-verification handling** (filed 2026-09-09, hit live
+  from the host: SRP login → `422 Code 9001`; IMPLEMENTED 2026-09-09
+  local-only — a live 9001 cannot be triggered on demand, so the device
+  half stays code-reviewed only): research corrected the direction
+  (details in `FINDINGS_CONTACTS_UPSYNC.md` §8 + new §11): an external
+  browser does NOT unblock API logins (the proof returns via postMessage
+  to the embedding page; WebClients #473 open) — so the UI promises
+  nothing except explanation + retry guidance. Implemented:
+  `ProtonError::Captcha(CaptchaChallenge)` parsed from the 9001 body
+  (`HumanVerificationMethods`/`Token`/`WebUrl`, URL constructed
+  Captcha.tsx-style when absent; Display redacts token+URL per hydroxide
+  precedent; strict shape or generic-error fallback) in login + 2FA
+  submit paths; FFI status 3 + `captcha_url`/`captcha_methods` (cbindgen
+  header regenerated); SignOn plugin maps it to a `CaptchaRequired`
+  result (same shape as `TwoFARequired`, login + both 2FA-submit paths,
+  nothing stored); both QML agents show message + methods + tappable
+  verify link + Try-again with retry-safe state (incl. the
+  captcha-answers-OTP-verify edge that would have completed the flow
+  falsely). Full-review notes: QML hand-reviewed only (no qmllint on
+  host or SDK — CI gate covers it), token never logged (both full-data
+  QML logs removed). Verified: fmt + clippy clean, 184 tests
+  (108+5+71: parse/Fixture/WebUrl/reject/Display-redaction/2FA-submit
+  mapping/FFI status), full bundle green. Staged
+  `packaging/buteo-plugin/libproton-client.so` sha256
+  `0fd5770e4db4fd6cfbd7222e7a46e71ee76b3d7bbcc82293de442c90c8132086`
+  + refreshed account tarball (new QML) — deploy both. Phone gate when
+  a 9001 next occurs naturally (nothing to trigger it): captcha page
+  shows instead of JSON soup. Still open (future): embedded-WebView
+  proof capture (proton-filter-cli shape) or Proton device-flow support
+  (#473); retry-with-proof headers (`x-pm-human-verification-token`,
+  12087 handling).
 - [x] **Debug-log cleanup / opt-in flag** (filed 2026-09-07, DONE
   2026-09-09 local-only): single mechanism both layers — `PROTON_VERBOSE`
   env (non-empty, not `"0"`). Rust: `diag::verbose()` + `vlog!` macro

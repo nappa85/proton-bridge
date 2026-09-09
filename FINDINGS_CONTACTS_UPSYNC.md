@@ -481,3 +481,35 @@ Environment cleaned afterwards (`unset-environment` + restart,
 verified zero `PROTON` entries) with a final steady sync. Rotation
 (1 MiB cap) not triggerable live (log is ~130 KiB) — offline-tested
 only. Debug-log TODO closed.
+
+## 11. CAPTCHA handling – 2026-09-09 (local only, no live 9001 available)
+
+Research corrected the filed direction before any code: an external
+browser does NOT unblock API logins (proof returns via postMessage to
+the embedding page — major0/proton-utils doc, hydroxide fixtures,
+WebClients #473 OPEN requesting a device flow; even official Bridge
+only prints the URL + waits ENTER, retrying with the original token
+into 12087). So the UI promises explanation + retry guidance, never
+"continue". Authoritative wire (all fetched 2026-09-09): 9001 body =
+`Details{HumanVerificationMethods[], HumanVerificationToken, WebUrl?}`
+(go-proton-api `hv.go`, hydroxide real-shape fixture); verify URL =
+`Details.WebUrl` or Captcha.tsx-built
+`verify.proton.me/?methods=a,b&token=…`; retry headers
+`x-pm-human-verification-token/-type`; 12087 = bad/stale proof; current
+WebClients 2FA route is `core/v4/auth/2fa` for BOTH TOTP and FIDO2
+(our `/auth/v4/2fa` TOTP path stays — verified live, do not touch).
+Implemented: `ProtonError::Captcha(CaptchaChallenge)` (Display redacts
+token+URL — hydroxide String()-must-not-leak precedent) parsed in
+login + 2FA-submit paths (strict shape, generic fallback); FFI status 3
++ `captcha_url`/`captcha_methods` (cbindgen header regenerated);
+SignOn maps it to `CaptchaRequired` (TwoFA-shaped result, nothing
+stored; login + both submit paths); both QML agents show message +
+methods + tappable link + Try-again (incl. the captcha-answers-OTP
+edge; token never logged — both full-data QML logs removed).
+Verified: fmt + clippy `-D warnings` clean, 184 tests (108+5+71),
+full `make-pkg-bundle.sh --no-deploy` green (all three `.so`).
+Staged `0fd5770e…` + refreshed account tarball. Open device half:
+QML hand-reviewed only (no qmllint on host/SDK — CI gate on push);
+phone gate whenever a 9001 occurs naturally (untriggerable on
+demand). Future: embedded-WebView proof capture or Proton device flow;
+retry-with-proof headers.

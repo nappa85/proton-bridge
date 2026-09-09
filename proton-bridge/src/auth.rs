@@ -1,4 +1,4 @@
-use proton_api::{AuthClient, AuthTokens, LoginState};
+use proton_api::{AuthClient, AuthTokens, LoginState, ProtonError};
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 
@@ -9,6 +9,12 @@ pub struct ProtonAuthResult {
     pub refresh_token: *mut c_char,
     pub uid: *mut c_char,
     pub error: *mut c_char,
+    /// Set only when `status == 3` (human-verification challenge):
+    /// challenge URL for the verification UI (embeds the token).
+    pub captcha_url: *mut c_char,
+    /// Comma-joined verification methods (`"captcha, email, sms"`),
+    /// set only when `status == 3`.
+    pub captcha_methods: *mut c_char,
 }
 
 unsafe fn cstr_to_string(ptr: *const c_char) -> String {
@@ -25,6 +31,8 @@ fn ok_result(tokens: AuthTokens) -> ProtonAuthResult {
         refresh_token: CString::new(tokens.refresh_token).unwrap().into_raw(),
         uid: CString::new(tokens.uid).unwrap().into_raw(),
         error: std::ptr::null_mut(),
+        captcha_url: std::ptr::null_mut(),
+        captcha_methods: std::ptr::null_mut(),
     }
 }
 
@@ -35,6 +43,8 @@ fn needs_2fa_result(access_token: String, refresh_token: String, uid: String) ->
         refresh_token: CString::new(refresh_token).unwrap().into_raw(),
         uid: CString::new(uid).unwrap().into_raw(),
         error: std::ptr::null_mut(),
+        captcha_url: std::ptr::null_mut(),
+        captcha_methods: std::ptr::null_mut(),
     }
 }
 
@@ -45,6 +55,34 @@ fn error_result(msg: &str) -> ProtonAuthResult {
         refresh_token: std::ptr::null_mut(),
         uid: std::ptr::null_mut(),
         error: CString::new(msg).unwrap().into_raw(),
+        captcha_url: std::ptr::null_mut(),
+        captcha_methods: std::ptr::null_mut(),
+    }
+}
+
+/// Human-verification challenge (API 9001): status 3 carries the
+/// challenge URL + methods for the verification UI. The token itself
+/// never crosses FFI (unusable without an embedded proof callback).
+fn captcha_result(challenge: &proton_api::CaptchaChallenge) -> ProtonAuthResult {
+    ProtonAuthResult {
+        status: 3,
+        access_token: std::ptr::null_mut(),
+        refresh_token: std::ptr::null_mut(),
+        uid: std::ptr::null_mut(),
+        error: std::ptr::null_mut(),
+        captcha_url: CString::new(challenge.web_url.clone()).unwrap().into_raw(),
+        captcha_methods: CString::new(challenge.methods_display())
+            .unwrap()
+            .into_raw(),
+    }
+}
+
+/// Shared error mapping: structured 9001 → status 3, everything else →
+/// status 2 with the (token-redacted for Captcha) message.
+fn auth_error_result(e: &ProtonError) -> ProtonAuthResult {
+    match e {
+        ProtonError::Captcha(c) => captcha_result(c),
+        _ => error_result(&format!("{e}")),
     }
 }
 
@@ -65,7 +103,7 @@ pub extern "C" fn proton_auth_login(
             uid,
             ..
         }) => needs_2fa_result(access_token, refresh_token, uid),
-        Err(e) => error_result(&format!("{e}")),
+        Err(e) => auth_error_result(&e),
     }
 }
 
@@ -84,7 +122,7 @@ pub extern "C" fn proton_auth_submit_2fa(
     let client = AuthClient::new();
     match client.submit_2fa(&totp_code, &access_token, &refresh_token, &uid) {
         Ok(tokens) => ok_result(tokens),
-        Err(e) => error_result(&format!("{e}")),
+        Err(e) => auth_error_result(&e),
     }
 }
 
@@ -153,5 +191,47 @@ pub extern "C" fn proton_auth_free_result(result: *mut ProtonAuthResult) {
         if !r.error.is_null() {
             drop(CString::from_raw(r.error));
         }
+        if !r.captcha_url.is_null() {
+            drop(CString::from_raw(r.captcha_url));
+        }
+        if !r.captcha_methods.is_null() {
+            drop(CString::from_raw(r.captcha_methods));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hv_error() -> ProtonError {
+        ProtonError::Captcha(proton_api::CaptchaChallenge {
+            methods: vec!["captcha".into(), "email".into()],
+            token: "secret-token".into(),
+            web_url: "https://verify.proton.me/?methods=captcha&token=secret-token".into(),
+        })
+    }
+
+    #[test]
+    fn test_captcha_maps_to_status_3_with_url_and_methods() {
+        let mut r = auth_error_result(&hv_error());
+        assert_eq!(r.status, 3);
+        assert!(r.error.is_null());
+        let url = unsafe { cstr_to_string(r.captcha_url) };
+        let methods = unsafe { cstr_to_string(r.captcha_methods) };
+        assert!(url.starts_with("https://verify.proton.me/"), "{url}");
+        assert_eq!(methods, "captcha, email");
+        proton_auth_free_result(&mut r);
+    }
+
+    #[test]
+    fn test_generic_error_stays_status_2_without_captcha_fields() {
+        let mut r = auth_error_result(&ProtonError::Auth("bad password".into()));
+        assert_eq!(r.status, 2);
+        assert!(r.captcha_url.is_null());
+        assert!(r.captcha_methods.is_null());
+        let msg = unsafe { cstr_to_string(r.error) };
+        assert!(msg.contains("bad password"), "{msg}");
+        proton_auth_free_result(&mut r);
     }
 }

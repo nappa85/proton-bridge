@@ -23,8 +23,8 @@ AccountCredentialsAgent {
     id: root
 
     canCancelUpdate: true
-    // Keep agent alive while busy or waiting for OTP
-    delayDeletion: updatePage ? (updatePage._busy || updatePage._needsTwoFA) : false
+    // Keep agent alive while busy or waiting for OTP / captcha retry
+    delayDeletion: updatePage ? (updatePage._busy || updatePage._needsTwoFA || updatePage._needsCaptcha) : false
 
     initialPage: Page {
         id: updatePage
@@ -32,6 +32,9 @@ AccountCredentialsAgent {
         property bool _busy
         property string _errorMessage
         property bool _needsTwoFA
+        property bool _needsCaptcha
+        property string _captchaUrl
+        property string _captchaMethods
         property string _pendingAccessToken
         property string _pendingRefreshToken
         property string _pendingUid
@@ -126,7 +129,7 @@ AccountCredentialsAgent {
                 PasswordField {
                     id: passwordField
                     enabled: !updatePage._busy
-                    visible: !updatePage._needsTwoFA
+                    visible: !updatePage._needsTwoFA && !updatePage._needsCaptcha
                     EnterKey.iconSource: "image://theme/icon-m-enter-close"
                     EnterKey.onClicked: signInButton.clicked()
                 }
@@ -134,7 +137,7 @@ AccountCredentialsAgent {
                 Button {
                     id: signInButton
                     anchors.horizontalCenter: parent.horizontalCenter
-                    visible: !updatePage._needsTwoFA
+                    visible: !updatePage._needsTwoFA && !updatePage._needsCaptcha
                     //% "Sign in"
                     text: qsTr("Sign in")
                     enabled: !updatePage._busy && passwordField.text.length > 0
@@ -192,6 +195,65 @@ AccountCredentialsAgent {
                     visible: updatePage._busy
                 }
 
+                Column {
+                    width: parent.width
+                    spacing: Theme.paddingLarge
+                    visible: updatePage._needsCaptcha
+
+                    Label {
+                        //% "Proton blocked this sign-in attempt with a human-verification challenge (spam protection, usually triggered by the network)."
+                        text: qsTr("Proton blocked this sign-in attempt with a human-verification challenge (spam protection, usually triggered by the network).")
+                        wrapMode: Text.Wrap
+                        x: Theme.horizontalPageMargin
+                        width: parent.width - 2 * Theme.horizontalPageMargin
+                        color: Theme.highlightColor
+                        font.pixelSize: Theme.fontSizeSmall
+                    }
+
+                    Label {
+                        //% "Offered verification methods: %1"
+                        text: qsTr("Offered verification methods: %1").arg(updatePage._captchaMethods)
+                        wrapMode: Text.Wrap
+                        x: Theme.horizontalPageMargin
+                        width: parent.width - 2 * Theme.horizontalPageMargin
+                        color: Theme.highlightColor
+                        font.pixelSize: Theme.fontSizeSmall
+                    }
+
+                    Text {
+                        x: Theme.horizontalPageMargin
+                        width: parent.width - 2 * Theme.horizontalPageMargin
+                        wrapMode: Text.Wrap
+                        color: Theme.highlightColor
+                        font.pixelSize: Theme.fontSizeSmall
+                        textFormat: Text.RichText
+                        //% "Open the verification page"
+                        text: "<a href=\"" + updatePage._captchaUrl + "\">" + qsTr("Open the verification page") + "</a>"
+                        onLinkActivated: Qt.openUrlExternally(link)
+                    }
+
+                    Label {
+                        //% "Solving the challenge in the browser does not continue here automatically — afterwards, try signing in again, ideally from a different network."
+                        text: qsTr("Solving the challenge in the browser does not continue here automatically — afterwards, try signing in again, ideally from a different network.")
+                        wrapMode: Text.Wrap
+                        x: Theme.horizontalPageMargin
+                        width: parent.width - 2 * Theme.horizontalPageMargin
+                        color: Theme.highlightColor
+                        font.pixelSize: Theme.fontSizeSmall
+                    }
+
+                    Button {
+                        anchors.horizontalCenter: parent.horizontalCenter
+                        //% "Try again"
+                        text: qsTr("Try again")
+                        enabled: !updatePage._busy
+                        onClicked: {
+                            updatePage._needsCaptcha = false
+                            updatePage._update(null)
+                        }
+                    }
+                }
+
                 Label {
                     visible: updatePage._errorMessage.length > 0
                     text: updatePage._errorMessage
@@ -210,8 +272,17 @@ AccountCredentialsAgent {
         identifier: root.accountId
 
         onSignInCredentialsUpdated: {
-            console.log("proton-update: onSignInCredentialsUpdated data=" + JSON.stringify(data))
-            if (data["TwoFARequired"] === true) {
+            console.log("proton-update: onSignInCredentialsUpdated hasCaptcha=" + (data["CaptchaRequired"] === true) + " has2FA=" + (data["TwoFARequired"] === true))
+            if (data["CaptchaRequired"] === true) {
+                // Human-verification challenge: show message + link, keep
+                // the page for a retry. Never logs the URL (token). Clears
+                // the OTP state: the two forms exclude each other.
+                updatePage._captchaMethods = data["CaptchaMethods"] || ""
+                updatePage._captchaUrl = data["CaptchaUrl"] || ""
+                updatePage._needsTwoFA = false
+                updatePage._needsCaptcha = true
+                updatePage._busy = false
+            } else if (data["TwoFARequired"] === true) {
                 // Locked session: reveal the OTP field and wait for the code.
                 updatePage._pendingAccessToken = data["AccessToken"] || ""
                 updatePage._pendingRefreshToken = data["RefreshToken"] || ""
@@ -227,8 +298,8 @@ AccountCredentialsAgent {
         }
 
         onSignInError: {
-            if (updatePage._needsTwoFA) {
-                // Wrong code: let the user retry in the OTP field.
+            if (updatePage._needsTwoFA || updatePage._needsCaptcha) {
+                // Wrong code / failed retry: stay in place for another try.
                 updatePage._busy = false
                 updatePage._errorMessage = message
             } else {

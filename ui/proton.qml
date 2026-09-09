@@ -24,6 +24,13 @@ import com.jolla.settings.accounts 1.0
  *      user types the 6-digit code and the credentials are completed via
  *      Account.updateSignInCredentials with TwoFactorPassword + the locked
  *      tokens (POST /auth/v4/2fa upgrades the locked session in place).
+ *   3b. If the result contains CaptchaRequired (API 9001 human
+ *      verification, usually network reputation), a message + the
+ *      verification link + a retry button are revealed instead. Note:
+ *      solving the challenge in an external browser does NOT continue
+ *      the login here (the proof returns via postMessage to the embedding
+ *      page) — the copy says so and suggests retrying from another
+ *      network. The challenge token never lands in logs.
  *   4. Only tokens (AccessToken/RefreshToken/Uid) are persisted via the
  *      plugin's store(); the password stays in the signond identity.
  *   5. On success the account is enabled and saved; buteo's AccountsHelper
@@ -41,7 +48,7 @@ AccountCreationAgent {
         pageRoot._busy = false
         pageRoot._errorMessage = message
         delayDeletion = false
-        if (creationAccount.identifier > 0 && !pageRoot._needsTwoFA) {
+        if (creationAccount.identifier > 0 && !pageRoot._needsTwoFA && !pageRoot._needsCaptcha) {
             var id = creationAccount.identifier
             creationAccount.identifier = 0
             var acc = accountManager.account(id)
@@ -70,6 +77,9 @@ AccountCreationAgent {
         property bool _busy
         property string _errorMessage
         property bool _needsTwoFA
+        property bool _needsCaptcha
+        property string _captchaUrl
+        property string _captchaMethods
         property string _pendingAccessToken
         property string _pendingRefreshToken
         property string _pendingUid
@@ -78,12 +88,28 @@ AccountCreationAgent {
 
         backNavigation: !_busy
 
+        function _startSignIn() {
+            // Shared kickoff: first attempt (from Initialized) and captcha
+            // "Try again" both funnel here. Never logs passwords or URLs.
+            if (pageRoot._pendingUsername === "") pageRoot._pendingUsername = usernameField.text
+            if (pageRoot._pendingPassword === "") pageRoot._pendingPassword = passwordField.text
+            console.log("proton: creating credentials for " + pageRoot._pendingUsername + " pw_len=" + pageRoot._pendingPassword.length)
+            // Use dummy "x" for Secret (stored) and real password as transient "Password" param
+            // so raw password is never persisted (empty Secret with symmetricKey="" triggers isNull() error)
+            var sip = creationAccount.signInParameters("proton-carddav", pageRoot._pendingUsername, "x")
+            sip.setParameter("Password", pageRoot._pendingPassword)
+            creationAccount.createSignInCredentials("Jolla", "Jolla", sip, "")
+        }
+
         on_BusyChanged: {
             if (_busy) root.delayDeletion = true
-            else if (!_needsTwoFA && !creationAccount._flowComplete) root.delayDeletion = false
+            else if (!_needsTwoFA && !_needsCaptcha && !creationAccount._flowComplete) root.delayDeletion = false
         }
         on_NeedsTwoFAChanged: {
             if (_needsTwoFA) root.delayDeletion = true
+        }
+        on_NeedsCaptchaChanged: {
+            if (_needsCaptcha) root.delayDeletion = true
         }
 
         SilicaFlickable {
@@ -133,13 +159,13 @@ AccountCreationAgent {
                 AccountUsernameField {
                     id: usernameField
                     enabled: !pageRoot._busy
-                    visible: !pageRoot._needsTwoFA
+                    visible: !pageRoot._needsTwoFA && !pageRoot._needsCaptcha
                 }
 
                 PasswordField {
                     id: passwordField
                     enabled: !pageRoot._busy
-                    visible: !pageRoot._needsTwoFA
+                    visible: !pageRoot._needsTwoFA && !pageRoot._needsCaptcha
                 }
 
                 Column {
@@ -200,7 +226,7 @@ AccountCreationAgent {
 
                 Button {
                     anchors.horizontalCenter: parent.horizontalCenter
-                    visible: !pageRoot._needsTwoFA
+                    visible: !pageRoot._needsTwoFA && !pageRoot._needsCaptcha
                     //% "Sign in"
                     text: qsTr("Sign in")
                     enabled: !pageRoot._busy
@@ -214,6 +240,69 @@ AccountCreationAgent {
                         pageRoot._pendingPassword = passwordField.text
                         console.log("proton: Sign in clicked, stored pending username=" + pageRoot._pendingUsername + " pw_len=" + pageRoot._pendingPassword.length)
                         accountManager.createAccount(root.accountProvider.name)
+                    }
+                }
+
+                Column {
+                    width: parent.width
+                    spacing: Theme.paddingLarge
+                    visible: pageRoot._needsCaptcha
+
+                    Label {
+                        //% "Proton blocked this sign-in attempt with a human-verification challenge (spam protection, usually triggered by the network)."
+                        text: qsTr("Proton blocked this sign-in attempt with a human-verification challenge (spam protection, usually triggered by the network).")
+                        wrapMode: Text.Wrap
+                        x: Theme.horizontalPageMargin
+                        width: parent.width - 2 * Theme.horizontalPageMargin
+                        color: Theme.highlightColor
+                        font.pixelSize: Theme.fontSizeSmall
+                    }
+
+                    Label {
+                        //% "Offered verification methods: %1"
+                        text: qsTr("Offered verification methods: %1").arg(pageRoot._captchaMethods)
+                        wrapMode: Text.Wrap
+                        x: Theme.horizontalPageMargin
+                        width: parent.width - 2 * Theme.horizontalPageMargin
+                        color: Theme.highlightColor
+                        font.pixelSize: Theme.fontSizeSmall
+                    }
+
+                    Text {
+                        x: Theme.horizontalPageMargin
+                        width: parent.width - 2 * Theme.horizontalPageMargin
+                        wrapMode: Text.Wrap
+                        color: Theme.highlightColor
+                        font.pixelSize: Theme.fontSizeSmall
+                        textFormat: Text.RichText
+                        //% "Open the verification page"
+                        text: "<a href=\"" + pageRoot._captchaUrl + "\">" + qsTr("Open the verification page") + "</a>"
+                        onLinkActivated: Qt.openUrlExternally(link)
+                    }
+
+                    Label {
+                        //% "Solving the challenge in the browser does not continue here automatically — afterwards, try signing in again, ideally from a different network."
+                        text: qsTr("Solving the challenge in the browser does not continue here automatically — afterwards, try signing in again, ideally from a different network.")
+                        wrapMode: Text.Wrap
+                        x: Theme.horizontalPageMargin
+                        width: parent.width - 2 * Theme.horizontalPageMargin
+                        color: Theme.highlightColor
+                        font.pixelSize: Theme.fontSizeSmall
+                    }
+
+                    Button {
+                        anchors.horizontalCenter: parent.horizontalCenter
+                        //% "Try again"
+                        text: qsTr("Try again")
+                        enabled: !pageRoot._busy
+                        onClicked: {
+                            pageRoot._errorMessage = ""
+                            pageRoot._busy = true
+                            pageRoot._needsCaptcha = false
+                            root.delayDeletion = true
+                            creationAccount._credentialsRequested = false
+                            pageRoot._startSignIn()
+                        }
                     }
                 }
 
@@ -260,19 +349,11 @@ AccountCreationAgent {
         onStatusChanged: {
             console.log("proton: statusChanged status=" + status + " Account.Initialized=" + Account.Initialized + " Initializing=" + Account.Initializing + " Invalid=" + Account.Invalid + " SyncInProgress=" + Account.SyncInProgress + " Synced=" + Account.Synced + " SigningIn=" + Account.SigningIn + " Error=" + Account.Error + " _flowComplete=" + _flowComplete + " _busy=" + pageRoot._busy + " id=" + identifier + " hasCreds=" + hasSignInCredentials("Jolla","Jolla"))
             if (status == Account.Initialized && pageRoot._busy
-                    && !_credentialsRequested && !pageRoot._needsTwoFA) {
+                    && !_credentialsRequested && !pageRoot._needsTwoFA && !pageRoot._needsCaptcha) {
                 _credentialsRequested = true
                 // Store pending credentials for OTP second step (fields become hidden)
                 // Password is passed as transient "Password" param, NOT as Secret, so it is never stored in signond
-                if (pageRoot._pendingUsername === "" ) pageRoot._pendingUsername = usernameField.text
-                if (pageRoot._pendingPassword === "" ) pageRoot._pendingPassword = passwordField.text
-                console.log("proton: creating credentials for " + pageRoot._pendingUsername + " pw_len=" + pageRoot._pendingPassword.length)
-                // Use dummy "x" for Secret (stored) and real password as transient "Password" param
-                // so raw password is never persisted (empty Secret with symmetricKey="" triggers isNull() error)
-                var sip = signInParameters("proton-carddav", pageRoot._pendingUsername, "x")
-                sip.setParameter("Password", pageRoot._pendingPassword)
-                console.log("proton: sip username=" + sip.username + " password_len=" + (sip.password ? sip.password.length : 0) + " hasPasswordParam set")
-                createSignInCredentials("Jolla", "Jolla", sip, "")
+                pageRoot._startSignIn()
             } else if (status == Account.Synced && _flowComplete) {
                 // Credentials verified (OTP included when needed) and the
                 // account settings saved: done. Note: setStatus(Synced) is
@@ -290,8 +371,19 @@ AccountCreationAgent {
         }
 
         onSignInCredentialsCreated: {
-            console.log("proton: onSignInCredentialsCreated data=" + JSON.stringify(data))
-            if (data["TwoFARequired"] === true) {
+            console.log("proton: onSignInCredentialsCreated hasCaptcha=" + (data["CaptchaRequired"] === true) + " has2FA=" + (data["TwoFARequired"] === true))
+            if (data["CaptchaRequired"] === true) {
+                // Human-verification challenge: show message + link, keep
+                // the agent alive for a retry. Never logs the URL (token).
+                // Clears the OTP state too: a challenge can also answer the
+                // code-verification attempt, and the two forms exclude.
+                _credentialsRequested = false
+                pageRoot._captchaMethods = data["CaptchaMethods"] || ""
+                pageRoot._captchaUrl = data["CaptchaUrl"] || ""
+                pageRoot._needsTwoFA = false
+                pageRoot._needsCaptcha = true
+                pageRoot._busy = false
+            } else if (data["TwoFARequired"] === true) {
                 // Locked session: reveal the OTP field and wait for the code.
                 console.log("proton: TwoFARequired, pending tokens present: AccessToken=" + (data["AccessToken"] ? "yes" : "no"))
                 _credentialsRequested = false
@@ -331,9 +423,20 @@ AccountCreationAgent {
         }
 
         onSignInCredentialsUpdated: {
-            // OTP verified (2FA pass via updateSignInCredentials). Enable
-            // and save the account; Account.Synced completes the flow.
+            // OTP verified (2FA pass via updateSignInCredentials) — unless
+            // the server answered THAT with a challenge instead.
+            console.log("proton: onSignInCredentialsUpdated hasCaptcha=" + (data["CaptchaRequired"] === true))
+            if (data["CaptchaRequired"] === true) {
+                pageRoot._captchaMethods = data["CaptchaMethods"] || ""
+                pageRoot._captchaUrl = data["CaptchaUrl"] || ""
+                pageRoot._needsTwoFA = false
+                pageRoot._needsCaptcha = true
+                pageRoot._busy = false
+                return
+            }
             console.log("proton: onSignInCredentialsUpdated data=" + JSON.stringify(data))
+            // OTP verified (2FA pass). Enable and save the account;
+            // Account.Synced completes the flow.
             _flowComplete = true
             root.delayDeletion = true
             enabled = true
@@ -367,8 +470,8 @@ AccountCreationAgent {
         }
 
         onSignInError: {
-            if (pageRoot._needsTwoFA) {
-                // Wrong code: let the user retry in the OTP field.
+            if (pageRoot._needsTwoFA || pageRoot._needsCaptcha) {
+                // Wrong code / failed retry: let the user retry in place.
                 pageRoot._busy = false
                 // Keep delayDeletion true so agent stays alive for retry
                 pageRoot._errorMessage = message

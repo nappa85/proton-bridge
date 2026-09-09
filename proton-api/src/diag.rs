@@ -210,7 +210,8 @@ mod tests {
 
     #[test]
     fn test_rotate_missing_and_small_files() {
-        let dir = std::env::temp_dir().join(format!("proton-diag-test-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("proton-diag-test-{}-missing", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let missing = dir.join("missing.log");
@@ -228,7 +229,8 @@ mod tests {
 
     #[test]
     fn test_rotate_keeps_tail_on_line_boundary() {
-        let dir = std::env::temp_dir().join(format!("proton-diag-test-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("proton-diag-test-{}-tail", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("big.log");

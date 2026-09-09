@@ -25,7 +25,7 @@ pub use calendar_write::{
 };
 pub use contacts::{generate_contact_uid, ContactsClient};
 pub use crypto::{decrypt_contact_card, derive_mailbox_password, UnlockedKey};
-pub use error::{ProtonError, Result};
+pub use error::{CaptchaChallenge, ProtonError, Result};
 pub use keys::KeysClient;
 pub use models::*;
 pub use vcard::{

@@ -1,4 +1,4 @@
-use crate::{AuthTokens, ProtonError, Result};
+use crate::{AuthTokens, CaptchaChallenge, ProtonError, Result};
 use num_bigint::BigUint;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
@@ -136,6 +136,9 @@ impl AuthClient {
         let body = resp.text()?;
 
         if !status.is_success() {
+            if let Some(challenge) = parse_captcha_challenge(&body) {
+                return Err(ProtonError::Captcha(challenge));
+            }
             return Err(ProtonError::Auth(format!(
                 "2FA POST failed {status}: {body}"
             )));
@@ -297,6 +300,9 @@ impl AuthClient {
         let body = resp.text()?;
 
         if !status.is_success() {
+            if let Some(challenge) = parse_captcha_challenge(&body) {
+                return Err(ProtonError::Captcha(challenge));
+            }
             return Err(ProtonError::Auth(format!(
                 "Auth POST failed {status}: {body}"
             )));
@@ -305,6 +311,55 @@ impl AuthClient {
         let auth_resp: AuthResponse = serde_json::from_str(&body)?;
         Ok(auth_resp)
     }
+}
+
+/// Parse a 9001 human-verification challenge body (go-proton-api `hv.go`
+/// plus hydroxide's real-shape fixture). Expected shape: Code 9001 with a
+/// Details object carrying HumanVerificationMethods (array), a
+/// HumanVerificationToken string, and an optional WebUrl string (built
+/// Captcha.tsx-style from methods+token when absent).
+///
+/// Returns None for any other shape. Errs toward None: a missed 9001
+/// degrades to today's generic error, while a false positive would hide
+/// a real auth failure behind a verification prompt.
+pub fn parse_captcha_challenge(body: &str) -> Option<CaptchaChallenge> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    let code = v
+        .get("Code")
+        .and_then(|c| c.as_i64().or_else(|| c.as_str()?.parse::<i64>().ok()))?;
+    if code != 9001 {
+        return None;
+    }
+    let details = v.get("Details")?;
+    let methods: Vec<String> = details
+        .get("HumanVerificationMethods")?
+        .as_array()?
+        .iter()
+        .filter_map(|m| m.as_str().map(str::to_string))
+        .collect();
+    if methods.is_empty() {
+        return None;
+    }
+    let token = details.get("HumanVerificationToken")?.as_str()?;
+    if token.is_empty() {
+        return None;
+    }
+    let web_url = details
+        .get("WebUrl")
+        .and_then(|u| u.as_str())
+        .filter(|u| !u.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            format!(
+                "https://verify.proton.me/?methods={}&token={token}",
+                methods.join(",")
+            )
+        });
+    Some(CaptchaChallenge {
+        methods,
+        token: token.to_string(),
+        web_url,
+    })
 }
 
 impl Default for AuthClient {
@@ -1056,5 +1111,82 @@ mod tests {
         // Ensure TokenManager's restore path works
         tm.restore_tokens(res.unwrap());
         assert_eq!(tm.uid(), Some("uid"));
+    }
+
+    /// Real 9001 shape (hydroxide fixture: "shape of a real human
+    /// verification error response").
+    const HV_BODY: &str = r#"{"Code":9001,"Error":"For security reasons, please complete CAPTCHA.","Details":{"HumanVerificationMethods":["captcha","email","sms"],"HumanVerificationToken":"hv-token-abc"}}"#;
+
+    #[test]
+    fn test_parse_captcha_challenge_real_shape() {
+        let c = parse_captcha_challenge(HV_BODY).expect("9001 parses");
+        assert_eq!(c.methods, vec!["captcha", "email", "sms"]);
+        assert_eq!(c.token, "hv-token-abc");
+        // No WebUrl on the wire → Captcha.tsx-style construction.
+        assert_eq!(
+            c.web_url,
+            "https://verify.proton.me/?methods=captcha,email,sms&token=hv-token-abc"
+        );
+        assert_eq!(c.methods_display(), "captcha, email, sms");
+    }
+
+    #[test]
+    fn test_parse_captcha_prefers_wire_web_url() {
+        let body = r#"{"Code":9001,"Error":"x","Details":{"HumanVerificationMethods":["captcha"],"HumanVerificationToken":"t","WebUrl":"https://verify.proton.me/?methods=captcha&token=t"}}"#;
+        let c = parse_captcha_challenge(body).expect("9001 parses");
+        assert!(c.web_url.starts_with("https://verify.proton.me/"));
+    }
+
+    #[test]
+    fn test_parse_captcha_rejects_non_hv() {
+        // Wrong code, missing Details/methods/token, malformed JSON —
+        // all degrade to the generic error path, never a false prompt.
+        for body in [
+            r#"{"Code":422,"Error":"TotpWrong"}"#,
+            r#"{"Code":9001,"Error":"x"}"#,
+            r#"{"Code":9001,"Details":{"HumanVerificationToken":"t"}}"#,
+            r#"{"Code":9001,"Details":{"HumanVerificationMethods":[],"HumanVerificationToken":"t"}}"#,
+            r#"{"Code":9001,"Details":{"HumanVerificationMethods":["captcha"],"HumanVerificationToken":""}}"#,
+            "not json",
+            "",
+        ] {
+            assert!(parse_captcha_challenge(body).is_none(), "{body}");
+        }
+        // String-encoded code is tolerated (lenient wire).
+        let string_code = r#"{"Code":"9001","Details":{"HumanVerificationMethods":["captcha"],"HumanVerificationToken":"t"}}"#;
+        assert!(parse_captcha_challenge(string_code).is_some());
+    }
+
+    #[test]
+    fn test_captcha_display_redacts_token_and_url() {
+        // Hydroxide precedent: error strings must not leak the token
+        // (they reach UI labels and logs). The verify URL embeds the
+        // token, so it stays out of Display too.
+        let c = parse_captcha_challenge(HV_BODY).expect("9001 parses");
+        let msg = format!("{}", ProtonError::Captcha(c));
+        assert!(msg.contains("captcha"), "{msg}");
+        assert!(!msg.contains("hv-token-abc"), "{msg}");
+        assert!(!msg.contains("verify.proton.me"), "{msg}");
+    }
+
+    #[test]
+    fn test_submit_2fa_mock_captcha_maps_structured() {
+        // A 9001 on the 2FA submit maps to Captcha (not a flat string),
+        // carrying methods + constructed URL for the verification UI.
+        let mut server = mockito::Server::new();
+        let client = AuthClient::new_with_base_url(server.url());
+        let mock = server
+            .mock("POST", "/auth/v4/2fa")
+            .with_status(422)
+            .with_header("content-type", "application/json")
+            .with_body(HV_BODY)
+            .create();
+        let err = client
+            .submit_2fa("000000", "locked-at", "rt", "test-uid")
+            .expect_err("9001 must err");
+        let challenge = err.captcha_challenge().expect("structured Captcha");
+        assert_eq!(challenge.methods.len(), 3);
+        assert!(challenge.web_url.contains("verify.proton.me"));
+        mock.assert();
     }
 }
