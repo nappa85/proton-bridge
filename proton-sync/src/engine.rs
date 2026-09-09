@@ -209,6 +209,16 @@ impl SyncEngine {
                 };
                 *self.contact_conflicts.lock().unwrap() = outcome.conflicts;
                 *self.contact_anchors.lock().unwrap() = outcome.anchors;
+                // File-log visibility: the shim logs `keys_debug` on every
+                // run, so the upload trace survives without the journal.
+                if !outcome.trace.is_empty() {
+                    let prev = self.keys_debug.clone().unwrap_or_default();
+                    self.keys_debug = Some(if prev.is_empty() {
+                        outcome.trace
+                    } else {
+                        format!("{prev}|{}", outcome.trace)
+                    });
+                }
                 let contacts = outcome.contacts;
                 let total = contacts.len() as u32;
 
@@ -798,13 +808,16 @@ impl SyncEngine {
 }
 
 /// Outcome of the contacts upload phase: reconciled server rows plus
-/// shim outputs (conflicts to notify, anchors to persist).
-// (Second `impl SyncEngine` block below holds the upload phase; multiple
-// inherent impl blocks are legal Rust and keep the diff reviewable.)
+/// shim outputs (conflicts to notify, anchors to persist) plus a
+/// single-line trace (`contact_upsync …` fragments) that `run_sync` folds
+/// into `keys_debug` — the shim logs that to the file log on every run, so
+/// upload decisions are diagnosable without the (volatile, root-only)
+/// system journal. IDs only, never field contents.
 pub struct ContactUploadOutcome {
     pub contacts: Vec<proton_api::Contact>,
     pub conflicts: Vec<crate::contact_plan::ContactConflict>,
     pub anchors: std::collections::HashMap<String, i64>,
+    pub trace: String,
 }
 
 /// Fail-closed engine error for one upload batch kind.
@@ -842,6 +855,17 @@ impl SyncEngine {
     /// (fresh server truth incl. new IDs; fail-closed on error). Without a
     /// fed inventory the plan is empty and the input returns untouched.
     /// Unsealable rows defer (log + skip, never fail the phase).
+    ///
+    /// Delete safety (2026-09-09 incident: a phone edit that lost its Guid
+    /// looked like create-new + delete-old, wiping the server contact):
+    /// deletes are HELD whenever local identity is ambiguous — i.e. the
+    /// inventory holds guid-less rows (never-synced/phone-created) or rows
+    /// the server doesn't know (`apply_server_deletes`). The hold is always
+    /// transient: the next download replacement drops stray rows and the
+    /// persisted ID map refreshes, so a held delete either resolves (row
+    /// was an edit — nothing lost) or fires next cycle (genuine delete).
+    /// A held cycle still uploads creates/updates and still downloads, so
+    /// sync keeps converging; the hold is recorded in the trace.
     fn run_contact_upload_phase(
         client: Option<&ContactsClient>,
         config: &SyncConfig,
@@ -850,9 +874,35 @@ impl SyncEngine {
         contacts: Vec<proton_api::Contact>,
     ) -> Result<ContactUploadOutcome, proton_api::ProtonError> {
         use crate::contact_plan as cp;
-        let inventory = config.contact_inventory.clone().unwrap_or_default();
-        let known: std::collections::HashSet<String> =
+        // File-log trace fragments (IDs only, never contents) — folded into
+        // `keys_debug` after the phase so upload decisions survive without
+        // the journal.
+        let mut trace: Vec<String> = Vec::new();
+        let mut defer_reasons: Vec<String> = Vec::new();
+        // Half-fed defense (2026-09-09 wipe): the shim always feeds inventory
+        // AND known together, so inventory=None + known=Some(non-empty) can
+        // only mean the inventory JSON failed to parse (e.g. a contract key
+        // drift like `missing field photos`). Planning deletes from that
+        // shape wiped a server contact. Drop known (never plan deletes
+        // half-fed) and say so in the trace. Genuine "user deleted every
+        // local contact" arrives as Some([]) — untouched by this branch —
+        // and the pre-inventory constructor sends both as None (early return
+        // below, byte-identical download-only).
+        let mut known: std::collections::HashSet<String> =
             config.contact_known_uids.clone().unwrap_or_default();
+        if config.contact_inventory.is_none() && !known.is_empty() {
+            trace.push(format!(
+                "contact_upsync half_fed known_dropped={} (inventory absent/unparsable — deletes disabled)",
+                known.len()
+            ));
+            known.clear();
+        }
+        let inventory = config.contact_inventory.clone().unwrap_or_default();
+        trace.push(format!(
+            "contact_upsync inputs inv={} known={}",
+            inventory.len(),
+            known.len()
+        ));
         let local_uids: std::collections::HashSet<String> = inventory
             .iter()
             .filter_map(|item| item.proton_uid.clone())
@@ -870,11 +920,29 @@ impl SyncEngine {
                 contacts,
                 conflicts: Vec::new(),
                 anchors,
+                trace: trace.join("|"),
             });
         }
         let client = client
             .ok_or_else(|| proton_api::ProtonError::Auth("No contacts client for upload".into()))?;
         let plan = cp::plan_contacts(&contacts, &inventory, &known);
+        // File-log trace: planned ops next (IDs only, never contents).
+        trace.push(format!(
+            "contact_upsync plan c={} u={} d={} server_deletes_locally={}",
+            plan.uploads
+                .iter()
+                .filter(|op| matches!(op, cp::ContactUploadOp::Create { .. }))
+                .count(),
+            plan.uploads
+                .iter()
+                .filter(|op| matches!(op, cp::ContactUploadOp::Update { .. }))
+                .count(),
+            plan.uploads
+                .iter()
+                .filter(|op| matches!(op, cp::ContactUploadOp::Delete { .. }))
+                .count(),
+            plan.apply_server_deletes.len(),
+        ));
         let items: std::collections::HashMap<&str, &cp::ContactItem> = inventory
             .iter()
             .map(|item| (item.qcontact_id.as_str(), item))
@@ -895,28 +963,30 @@ impl SyncEngine {
                 Some(fields) => create_jobs.push((op.clone(), fields)),
                 None => {
                     deferred += 1;
+                    defer_reasons.push(format!("create:{op}:no-fields"));
                     eprintln!("upsync_deferred contact create {op} no-fields");
                 }
             }
         }
+        let mut created = 0u32;
         for chunk in create_jobs.chunks(10) {
             let mut cards_batch = Vec::with_capacity(chunk.len());
             for (_, fields) in chunk {
-                let nanos = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_nanos())
-                    .unwrap_or(0);
-                let fresh_uid = format!("proton-sync-contact-{nanos}");
+                let fresh_uid = proton_api::generate_contact_uid();
                 match proton_api::contact_seal::build_contact_create_cards(
                     fields, &fresh_uid, user_keys,
                 ) {
-                    Ok(Some(cards)) => cards_batch.push(cards),
+                    Ok(Some(cards)) => {
+                        cards_batch.push(proton_api::CreateContactCards { Cards: cards })
+                    }
                     Ok(None) => {
                         deferred += 1;
+                        defer_reasons.push("create:unsealable".to_string());
                         eprintln!("upsync_deferred contact create unsealable");
                     }
                     Err(e) => {
                         deferred += 1;
+                        defer_reasons.push(format!("create:seal-error:{e}"));
                         eprintln!("upsync_deferred contact create: {e}");
                     }
                 }
@@ -933,6 +1003,7 @@ impl SyncEngine {
                 .map_err(|e| contact_api_err("create", e))?;
             check_create_response(&resp)?;
             content_changed = true;
+            created += resp.Responses.len() as u32;
             eprintln!("upsync_created contacts n={}", resp.Responses.len());
         }
         // Updates: rebuild from listed rows + phone snapshots.
@@ -952,6 +1023,7 @@ impl SyncEngine {
                     .flatten(),
             ) else {
                 deferred += 1;
+                defer_reasons.push(format!("update:{op}:no-row-or-fields"));
                 eprintln!("upsync_deferred contact update {op} no-row-or-fields");
                 continue;
             };
@@ -967,10 +1039,13 @@ impl SyncEngine {
                 }
                 Ok(None) => {
                     deferred += 1;
-                    eprintln!("upsync_deferred contact update {op} unsealable");
+                    let why = proton_api::contact_seal::diagnose_update_block(&cards, user_keys);
+                    defer_reasons.push(format!("update:{op}:{why}"));
+                    eprintln!("upsync_deferred contact update {op} {why}");
                 }
                 Err(e) => {
                     deferred += 1;
+                    defer_reasons.push(format!("update:{op}:seal-error:{e}"));
                     eprintln!("upsync_deferred contact update {op}: {e}");
                 }
             }
@@ -981,6 +1056,12 @@ impl SyncEngine {
         }
         // Deletes: single batch call (IDs resolved from the listing),
         // filtered locally afterwards (exact IDs known — no re-list).
+        // HELD (not executed) while local identity is ambiguous: any
+        // guid-less inventory row (phone-created, possibly an edit that lost
+        // its Guid) or any row the server doesn't know (apply_server_deletes)
+        // means a "missing known UID" may be an edit, not a delete — firing
+        // would wipe the server contact (2026-09-09 incident). The hold is
+        // transient (next download + map refresh resolves it either way).
         let delete_ids: Vec<String> = plan
             .uploads
             .iter()
@@ -991,17 +1072,35 @@ impl SyncEngine {
                 _ => None,
             })
             .collect();
+        let ambiguous_local_rows = !plan.apply_server_deletes.is_empty()
+            || inventory.iter().any(|item| item.proton_uid.is_none());
         let mut contacts = contacts;
+        let mut deleted = 0u32;
         if !delete_ids.is_empty() {
-            client
-                .delete(&delete_ids)
-                .map_err(|e| contact_api_err("delete", e))?;
-            eprintln!("upsync_deleted contacts n={}", delete_ids.len());
-            let gone: std::collections::HashSet<String> = delete_ids.into_iter().collect();
-            contacts.retain(|c| !gone.contains(&c.ID));
+            if ambiguous_local_rows {
+                trace.push("contact_upsync deletes_held ambiguous_local_rows".to_string());
+                eprintln!("upsync_held contact deletes (ambiguous local rows)");
+            } else {
+                client
+                    .delete(&delete_ids)
+                    .map_err(|e| contact_api_err("delete", e))?;
+                deleted = delete_ids.len() as u32;
+                eprintln!("upsync_deleted contacts n={deleted}");
+                let gone: std::collections::HashSet<String> = delete_ids.into_iter().collect();
+                contacts.retain(|c| !gone.contains(&c.ID));
+            }
         }
         if deferred > 0 {
             eprintln!("upsync_deferred contacts total={deferred}");
+        }
+        trace.push(format!(
+            "contact_upsync ran created={created} updated={updated} deleted={deleted} deferred={deferred}"
+        ));
+        if !defer_reasons.is_empty() {
+            trace.push(format!(
+                "contact_upsync deferred_reasons {}",
+                defer_reasons.join(",")
+            ));
         }
         // Reconcile: re-list only when creates/updates landed (fresh truth
         // incl. new IDs; fail-closed on error). Deletes already filtered.
@@ -1024,6 +1123,7 @@ impl SyncEngine {
             contacts,
             conflicts: plan.conflicts,
             anchors,
+            trace: trace.join("|"),
         })
     }
 
@@ -1229,7 +1329,10 @@ mod tests {
                 .create(),
         );
         let delete = server
-            .mock("DELETE", mockito::Matcher::Regex(r"/contacts/v4$".into()))
+            .mock(
+                "PUT",
+                mockito::Matcher::Regex(r"/contacts/v4/delete".into()),
+            )
             .match_body(mockito::Matcher::JsonString(r#"{"IDs":["c1"]}"#.into()))
             .with_status(200)
             .with_body("{}")
@@ -1345,6 +1448,11 @@ mod tests {
                 "POST",
                 mockito::Matcher::Regex(r"/contacts/v4".into()),
             )
+            // Wire shape guard: `Contacts` is objects-with-`Cards`
+            // (`[{"Cards":…}]`), never bare arrays (`[[…]]`).
+            .match_body(mockito::Matcher::Regex(
+                r#""Contacts":\[\{"Cards":\["#.into(),
+            ))
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(
@@ -1353,6 +1461,7 @@ mod tests {
             .create();
         let put = server
             .mock("PUT", mockito::Matcher::Regex(r"/contacts/v4/c1".into()))
+            .match_body(mockito::Matcher::Regex(r#""Cards":\["#.into()))
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{"Contact":{"ID":"c1","Name":"Edited","UID":"u1","ModifyTime":101}}"#)
@@ -1395,6 +1504,497 @@ mod tests {
         assert_eq!(engine.status().state, "complete");
         post.assert();
         put.assert();
+        let _held = guards;
+    }
+
+    #[test]
+    fn test_contact_delete_held_while_create_pending_mock() {
+        // 2026-09-09 incident: a phone edit that lost its Guid plans a
+        // guid-less CREATE plus a known-diff DELETE in one cycle. The delete
+        // must NOT fire while the create is pending — even though the create
+        // lands fine here, the pairing is ambiguous (edit vs delete+create).
+        let (user_esc, _user_raw) = armored_test_key();
+        let (addr_esc, _) = armored_test_key();
+        let mut server = mockito::Server::new();
+        let mut guards = Vec::new();
+        macro_rules! mock_get {
+            ($re:expr, $code:expr, $body:expr) => {
+                guards.push(
+                    server
+                        .mock("GET", mockito::Matcher::Regex($re.into()))
+                        .with_status($code)
+                        .with_header("content-type", "application/json")
+                        .with_body($body)
+                        .create(),
+                );
+            };
+        }
+        mock_get!(
+            r"/core/v4/users.*",
+            200,
+            format!(
+                r#"{{"User":{{"ID":"u","Name":"t","Keys":[{{"ID":"k1abcdef01","PrivateKey":"{user_esc}","Token":"","Signature":""}}]}}}}"#
+            )
+        );
+        mock_get!(
+            r"/core/v4/keys/salts.*",
+            200,
+            r#"{"KeySalts":[{"ID":"k1abcdef01","KeySalt":""},{"ID":"ak1abcdef01","KeySalt":""}]}"#
+        );
+        mock_get!(
+            r"/core/v4/addresses.*",
+            200,
+            format!(
+                r#"{{"Addresses":[{{"ID":"a1","Email":"t@x","Keys":[{{"ID":"ak1abcdef01","PrivateKey":"{addr_esc}","Token":"","Signature":""}}]}}]}}"#
+            )
+        );
+        // Pre-upload listing AND post-create re-list serve the same row:
+        // the old server contact survives because its delete is held.
+        guards.push(
+            server
+                .mock("GET", mockito::Matcher::Regex(r"/contacts/v4".into()))
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                .with_body(
+                    r#"{"Contacts":[{"ID":"c1","Name":"Keep","UID":"u1","ModifyTime":100}],"Total":1}"#,
+                )
+                .create(),
+        );
+        let post = server
+            .mock(
+                "POST",
+                mockito::Matcher::Regex(r"/contacts/v4".into()),
+            )
+            .match_body(mockito::Matcher::Regex(
+                r#""Contacts":\[\{"Cards":\["#.into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"Responses": [{"Index": 0, "Response": {"Code": 1000, "Error": null, "Contact": {"ID": "new1", "Name": "Fresh", "UID": "newu"}}}]}"#,
+            )
+            .create();
+        // Any PUT to …/delete fails the test (expect-zero + assert).
+        let delete = server
+            .mock(
+                "PUT",
+                mockito::Matcher::Regex(r"/contacts/v4/delete".into()),
+            )
+            .expect(0)
+            .with_status(200)
+            .with_body("{}")
+            .create();
+
+        let mut c = cycle_cfg(server.url());
+        c.password = "testpw".into();
+        c.contact_inventory = Some(vec![crate::contact_plan::ContactItem {
+            qcontact_id: "q2".into(),
+            proton_uid: None,
+            modified: true,
+            last_synced_mtime: None,
+            fields: Some(proton_api::vcard::ParsedContact {
+                display_name: "Fresh".into(),
+                ..Default::default()
+            }),
+        }]);
+        c.contact_known_uids = Some(["u1".to_string()].into_iter().collect());
+
+        let mut engine = SyncEngine::new(c.clone());
+        engine.start_sync(c);
+        assert_eq!(engine.status().state, "complete");
+        post.assert();
+        delete.assert();
+        // Old row retained in the reconciled download (delete held).
+        assert!(engine.get_contacts_json().contains("\"uid\":\"u1\""));
+        // File-log trace carries the plan and the hold (journal-independent).
+        let dbg = engine.get_keys_debug().unwrap_or_default();
+        assert!(dbg.contains("contact_upsync plan c=1 u=0 d=1"), "{dbg}");
+        assert!(dbg.contains("deletes_held"), "{dbg}");
+        let _held = guards;
+    }
+
+    #[test]
+    fn test_contact_delete_held_for_unknown_guid_row_mock() {
+        // Same hold, other shape: a clean row with a server-unknown guid
+        // (identity replaced, not deleted) holds the known-diff delete.
+        // No crypto needed on this path (ID-only ops + holds).
+        let mut server = mockito::Server::new();
+        let mut guards = Vec::new();
+        mock_key_mocks(&mut server, &mut guards);
+        guards.push(
+            server
+                .mock("GET", mockito::Matcher::Regex(r"/contacts/v4".into()))
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                .with_body(
+                    r#"{"Contacts":[{"ID":"c1","Name":"Keep","UID":"u1","ModifyTime":100}],"Total":1}"#,
+                )
+                .create(),
+        );
+        let delete = server
+            .mock(
+                "PUT",
+                mockito::Matcher::Regex(r"/contacts/v4/delete".into()),
+            )
+            .expect(0)
+            .with_status(200)
+            .with_body("{}")
+            .create();
+
+        let mut c = cycle_cfg(server.url());
+        c.contact_known_uids = Some(["u1".to_string()].into_iter().collect());
+        c.contact_inventory = Some(vec![crate::contact_plan::ContactItem {
+            qcontact_id: "q9".into(),
+            proton_uid: Some("g2-unknown".into()),
+            modified: false,
+            last_synced_mtime: None,
+            fields: None,
+        }]);
+
+        let mut engine = SyncEngine::new(c.clone());
+        engine.start_sync(c);
+        assert_eq!(engine.status().state, "complete");
+        delete.assert();
+        // Server row survives locally (download restores it; stray row drops).
+        assert!(engine.get_contacts_json().contains("\"uid\":\"u1\""));
+        let dbg = engine.get_keys_debug().unwrap_or_default();
+        assert!(dbg.contains("server_deletes_locally=1"), "{dbg}");
+        assert!(dbg.contains("deletes_held"), "{dbg}");
+        let _held = guards;
+    }
+
+    #[test]
+    fn test_contact_half_fed_inventory_drops_known_mock() {
+        // 2026-09-09 wipe, second half of the fix: inventory=None (absent
+        // or unparsable — e.g. the old `missing field photos` contract
+        // drift) + known=Some must NEVER plan deletes. Genuine "user
+        // deleted every local contact" arrives as Some([]) and still fires
+        // (covered by the pure-delete cycle test).
+        let mut server = mockito::Server::new();
+        let mut guards = Vec::new();
+        mock_key_mocks(&mut server, &mut guards);
+        guards.push(
+            server
+                .mock("GET", mockito::Matcher::Regex(r"/contacts/v4".into()))
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                .with_body(
+                    r#"{"Contacts":[{"ID":"c1","Name":"Keep","UID":"u1","ModifyTime":100}],"Total":1}"#,
+                )
+                .create(),
+        );
+        let delete = server
+            .mock(
+                "PUT",
+                mockito::Matcher::Regex(r"/contacts/v4/delete".into()),
+            )
+            .expect(0)
+            .with_status(200)
+            .with_body("{}")
+            .create();
+
+        let mut c = cycle_cfg(server.url());
+        c.contact_known_uids = Some(["u1".to_string()].into_iter().collect());
+        c.contact_inventory = None;
+
+        let mut engine = SyncEngine::new(c.clone());
+        engine.start_sync(c);
+        assert_eq!(engine.status().state, "complete");
+        delete.assert();
+        assert!(engine.get_contacts_json().contains("\"uid\":\"u1\""));
+        let dbg = engine.get_keys_debug().unwrap_or_default();
+        assert!(dbg.contains("half_fed"), "{dbg}");
+        assert!(dbg.contains("inputs inv=0 known=0"), "{dbg}");
+        let _held = guards;
+    }
+
+    #[test]
+    fn test_contact_grouped_email_update_uploads_mock() {
+        // Live 2026-09-09: the re-created web contact carries grouped
+        // `item1.EMAIL`, and the plain phone edit deferred (`unsealable`)
+        // instead of uploading. With the group-aware guard the same shape
+        // must PUT rebuilt cards (REAL generated keys, password unlock).
+        let (user_esc, user_raw) = armored_test_key();
+        let (addr_esc, _) = armored_test_key();
+        let mut server = mockito::Server::new();
+        let mut guards = Vec::new();
+        macro_rules! mock_get {
+            ($re:expr, $code:expr, $body:expr) => {
+                guards.push(
+                    server
+                        .mock("GET", mockito::Matcher::Regex($re.into()))
+                        .with_status($code)
+                        .with_header("content-type", "application/json")
+                        .with_body($body)
+                        .create(),
+                );
+            };
+        }
+        mock_get!(
+            r"/core/v4/users.*",
+            200,
+            format!(
+                r#"{{"User":{{"ID":"u","Name":"t","Keys":[{{"ID":"k1abcdef01","PrivateKey":"{user_esc}","Token":"","Signature":""}}]}}}}"#
+            )
+        );
+        mock_get!(
+            r"/core/v4/keys/salts.*",
+            200,
+            r#"{"KeySalts":[{"ID":"k1abcdef01","KeySalt":""},{"ID":"ak1abcdef01","KeySalt":""}]}"#
+        );
+        mock_get!(
+            r"/core/v4/addresses.*",
+            200,
+            format!(
+                r#"{{"Addresses":[{{"ID":"a1","Email":"t@x","Keys":[{{"ID":"ak1abcdef01","PrivateKey":"{addr_esc}","Token":"","Signature":""}}]}}]}}"#
+            )
+        );
+        let mut user_key = proton_api::UnlockedKey::from_armored(&user_raw, b"").unwrap();
+        let (enc_data_raw, enc_sig_raw) = proton_api::contact_seal::seal_contact_card(
+            "BEGIN:VCARD\r\nVERSION:4.0\r\nUID:u1\r\nN:Old;Name;;;\r\nEND:VCARD",
+            std::slice::from_mut(&mut user_key),
+        )
+        .unwrap();
+        let enc_data = enc_data_raw.replace('\n', "\\n");
+        let enc_sig = enc_sig_raw.replace('\n', "\\n");
+        // WebClients shape: grouped email in the signed card.
+        let row_e1 = format!(
+            r#"{{"ID":"c1","Name":"Old","UID":"u1","ModifyTime":100,
+            "Cards":[{{"Type":2,"Data":"BEGIN:VCARD\r\nVERSION:4.0\r\nUID:u1\r\nFN:Old Name\r\nitem1.EMAIL:old@example.com\r\nEND:VCARD","Signature":"s"}},
+            {{"Type":3,"Data":"{enc_data}","Signature":"{enc_sig}"}}]}}"#,
+        );
+        guards.push(
+            server
+                .mock("GET", mockito::Matcher::Regex(r"/contacts/v4".into()))
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                .with_body(format!("{{\"Contacts\":[{row_e1}],\"Total\":1}}"))
+                .create(),
+        );
+        guards.push(
+            server
+                .mock("GET", mockito::Matcher::Regex(r"/contacts/v4/c1".into()))
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                .with_body(format!("{{\"Contact\":{row_e1}}}"))
+                .create(),
+        );
+        let put = server
+            .mock("PUT", mockito::Matcher::Regex(r"/contacts/v4/c1".into()))
+            .match_body(mockito::Matcher::Regex(r#""Cards":\["#.into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"Contact":{"ID":"c1","Name":"Edited","UID":"u1","ModifyTime":101}}"#)
+            .create();
+
+        let mut c = cycle_cfg(server.url());
+        c.password = "testpw".into();
+        c.contact_inventory = Some(vec![crate::contact_plan::ContactItem {
+            qcontact_id: "q1".into(),
+            proton_uid: Some("u1".into()),
+            modified: true,
+            last_synced_mtime: Some(100),
+            fields: Some(proton_api::vcard::ParsedContact {
+                first_name: "Edited".into(),
+                ..Default::default()
+            }),
+        }]);
+        let mut anchors = std::collections::HashMap::new();
+        anchors.insert("u1".to_string(), 100);
+        c.contact_anchors = Some(anchors);
+
+        let mut engine = SyncEngine::new(c.clone());
+        engine.start_sync(c);
+        assert_eq!(engine.status().state, "complete");
+        put.assert();
+        let dbg = engine.get_keys_debug().unwrap_or_default();
+        assert!(
+            dbg.contains("ran created=0 updated=1 deleted=0 deferred=0"),
+            "{dbg}"
+        );
+        let _held = guards;
+    }
+
+    #[test]
+    fn test_contact_email_only_create_uploads_single_card_mock() {
+        // `encrypt.ts` gate end-to-end: an email-only phone row seals to one
+        // Type-2 card — the POST must carry `"Type":2` and never `"Type":3`
+        // (an empty encrypted wrapper was never live-tested). REAL generated
+        // keys through the password unlock path.
+        let (user_esc, _user_raw) = armored_test_key();
+        let (addr_esc, _) = armored_test_key();
+        let mut server = mockito::Server::new();
+        let mut guards = Vec::new();
+        macro_rules! mock_get {
+            ($re:expr, $code:expr, $body:expr) => {
+                guards.push(
+                    server
+                        .mock("GET", mockito::Matcher::Regex($re.into()))
+                        .with_status($code)
+                        .with_header("content-type", "application/json")
+                        .with_body($body)
+                        .create(),
+                );
+            };
+        }
+        mock_get!(
+            r"/core/v4/users.*",
+            200,
+            format!(
+                r#"{{"User":{{"ID":"u","Name":"t","Keys":[{{"ID":"k1abcdef01","PrivateKey":"{user_esc}","Token":"","Signature":""}}]}}}}"#
+            )
+        );
+        mock_get!(
+            r"/core/v4/keys/salts.*",
+            200,
+            r#"{"KeySalts":[{"ID":"k1abcdef01","KeySalt":""},{"ID":"ak1abcdef01","KeySalt":""}]}"#
+        );
+        mock_get!(
+            r"/core/v4/addresses.*",
+            200,
+            format!(
+                r#"{{"Addresses":[{{"ID":"a1","Email":"t@x","Keys":[{{"ID":"ak1abcdef01","PrivateKey":"{addr_esc}","Token":"","Signature":""}}]}}]}}"#
+            )
+        );
+        mock_get!(r"/contacts/v4", 200, r#"{"Contacts":[],"Total":0}"#);
+        // Catch-all POST first…
+        let post = server
+            .mock(
+                "POST",
+                mockito::Matcher::Regex(r"/contacts/v4".into()),
+            )
+            .match_body(mockito::Matcher::Regex(
+                r#""Contacts":\[\{"Cards":\["#.into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"Responses": [{"Index": 0, "Response": {"Code": 1000, "Error": null, "Contact": {"ID": "new1", "Name": "Solo", "UID": "newu"}}}]}"#,
+            )
+            .create();
+        // …then the Type-3 detector (reverse precedence: a Type-3 body
+        // would land here and fail the expect-zero assert).
+        let no_type3 = server
+            .mock("POST", mockito::Matcher::Regex(r"/contacts/v4".into()))
+            .match_body(mockito::Matcher::Regex(r#""Type":3"#.into()))
+            .expect(0)
+            .with_status(200)
+            .with_body("{}")
+            .create();
+
+        let mut c = cycle_cfg(server.url());
+        c.password = "testpw".into();
+        c.contact_inventory = Some(vec![crate::contact_plan::ContactItem {
+            qcontact_id: "q9".into(),
+            proton_uid: None,
+            modified: true,
+            last_synced_mtime: None,
+            fields: Some(proton_api::vcard::ParsedContact {
+                display_name: "Solo".into(),
+                emails: vec![proton_api::vcard::ParsedEmail {
+                    email: "solo@example.com".into(),
+                    types: Vec::new(),
+                }],
+                ..Default::default()
+            }),
+        }]);
+        c.contact_known_uids = Some(std::collections::HashSet::new());
+
+        let mut engine = SyncEngine::new(c.clone());
+        engine.start_sync(c);
+        assert_eq!(engine.status().state, "complete");
+        post.assert();
+        no_type3.assert();
+        let dbg = engine.get_keys_debug().unwrap_or_default();
+        assert!(
+            dbg.contains("ran created=1 updated=0 deleted=0 deferred=0"),
+            "{dbg}"
+        );
+        let _held = guards;
+    }
+
+    #[test]
+    fn test_contact_create_chunks_at_ten_mock() {
+        // WebClients `ADD_CONTACTS_MAX_SIZE = 10`: 11 phone-only rows must
+        // go out as 2 POSTs (10 + 1), never one oversized batch. No crypto
+        // content asserted here (randomized ciphertext) — route + count.
+        let (user_esc, _user_raw) = armored_test_key();
+        let (addr_esc, _) = armored_test_key();
+        let mut server = mockito::Server::new();
+        let mut guards = Vec::new();
+        macro_rules! mock_get {
+            ($re:expr, $code:expr, $body:expr) => {
+                guards.push(
+                    server
+                        .mock("GET", mockito::Matcher::Regex($re.into()))
+                        .with_status($code)
+                        .with_header("content-type", "application/json")
+                        .with_body($body)
+                        .create(),
+                );
+            };
+        }
+        mock_get!(
+            r"/core/v4/users.*",
+            200,
+            format!(
+                r#"{{"User":{{"ID":"u","Name":"t","Keys":[{{"ID":"k1abcdef01","PrivateKey":"{user_esc}","Token":"","Signature":""}}]}}}}"#
+            )
+        );
+        mock_get!(
+            r"/core/v4/keys/salts.*",
+            200,
+            r#"{"KeySalts":[{"ID":"k1abcdef01","KeySalt":""},{"ID":"ak1abcdef01","KeySalt":""}]}"#
+        );
+        mock_get!(
+            r"/core/v4/addresses.*",
+            200,
+            format!(
+                r#"{{"Addresses":[{{"ID":"a1","Email":"t@x","Keys":[{{"ID":"ak1abcdef01","PrivateKey":"{addr_esc}","Token":"","Signature":""}}]}}]}}"#
+            )
+        );
+        mock_get!(r"/contacts/v4", 200, r#"{"Contacts":[],"Total":0}"#);
+        let posts = server
+            .mock(
+                "POST",
+                mockito::Matcher::Regex(r"/contacts/v4".into()),
+            )
+            .match_body(mockito::Matcher::Regex(
+                r#""Contacts":\[\{"Cards":\["#.into(),
+            ))
+            .expect(2)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"Responses": [{"Index": 0, "Response": {"Code": 1000, "Error": null, "Contact": {"ID": "new1", "Name": "Bulk", "UID": "newu"}}}]}"#,
+            )
+            .create();
+
+        let rows: Vec<crate::contact_plan::ContactItem> = (0..11)
+            .map(|i| crate::contact_plan::ContactItem {
+                qcontact_id: format!("qb{i}"),
+                proton_uid: None,
+                modified: true,
+                last_synced_mtime: None,
+                fields: Some(proton_api::vcard::ParsedContact {
+                    display_name: format!("Bulk {i}"),
+                    phones: vec![proton_api::vcard::ParsedPhone {
+                        number: "+3902000000".into(),
+                        types: Vec::new(),
+                    }],
+                    ..Default::default()
+                }),
+            })
+            .collect();
+        let mut c = cycle_cfg(server.url());
+        c.password = "testpw".into();
+        c.contact_inventory = Some(rows);
+        c.contact_known_uids = Some(std::collections::HashSet::new());
+
+        let mut engine = SyncEngine::new(c.clone());
+        engine.start_sync(c);
+        assert_eq!(engine.status().state, "complete");
+        posts.assert();
         let _held = guards;
     }
 }

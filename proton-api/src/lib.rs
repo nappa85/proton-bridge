@@ -23,7 +23,7 @@ pub use calendar_write::{
     SyncEventBody, SyncEventOp, SyncOpResponse, SyncOpResult, COLOR_DEFAULT_SENTINEL,
     SYNC_CODE_SUCCESS, SYNC_CODE_SUCCESS_MULTI,
 };
-pub use contacts::ContactsClient;
+pub use contacts::{generate_contact_uid, ContactsClient};
 pub use crypto::{decrypt_contact_card, derive_mailbox_password, UnlockedKey};
 pub use error::{ProtonError, Result};
 pub use keys::KeysClient;

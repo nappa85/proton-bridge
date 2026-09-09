@@ -310,6 +310,28 @@ void ProtonContactsPlugin::onSignOnResponse(const SignOn::SessionData &data)
     QByteArray knownUidsJson =
         QJsonDocument(knownUidsArr).toJson(QJsonDocument::Compact);
     proton_log(QStringLiteral("Contacts inventory: %1 rows").arg(contactsInventory.size()));
+    // Upsync trace inputs (2026-09-09 incident: upload decisions were only
+    // on stderr/journal — log what the planner will see). Identity flags
+    // only (never field contents, which the download path already logs):
+    // proton_uid=null rows plan creates, known-but-absent UIDs plan deletes.
+    {
+        QJsonArray flags;
+        for (const QJsonValue &v : contactsInventory) {
+            QJsonObject o = v.toObject();
+            QJsonObject f;
+            f.insert(QStringLiteral("qid"), o.value(QLatin1String("qcontact_id")).toString());
+            f.insert(QStringLiteral("uid"), o.value(QLatin1String("proton_uid")));
+            f.insert(QStringLiteral("modified"), o.value(QLatin1String("modified")).toBool());
+            f.insert(QStringLiteral("anchor"), o.value(QLatin1String("last_synced_mtime")));
+            f.insert(QStringLiteral("has_fields"), o.contains(QLatin1String("fields")));
+            flags.append(f);
+        }
+        proton_log(QStringLiteral("Contacts upsync in: %1")
+                       .arg(QString::fromUtf8(QJsonDocument(flags).toJson(QJsonDocument::Compact)).left(3000)));
+    }
+    proton_log(QStringLiteral("Contacts upsync known=%1 anchors=%2")
+                   .arg(QString::fromUtf8(knownUidsJson).left(2000))
+                   .arg(loadContactsAnchors().left(500)));
     m_engine = proton_bridge_create_engine_with_inventory(
         username.toUtf8().constData(),
         password.toUtf8().constData(),
@@ -995,6 +1017,7 @@ void ProtonContactsPlugin::persistContactsAnchors(const QString &anchorsJson) {
     if (anchorsJson.isEmpty()) {
         return;
     }
+    proton_log(QStringLiteral("Persisted contacts anchors: %1").arg(anchorsJson.left(2000)));
     QSettings settings(QStringLiteral("proton"), QStringLiteral("sync-tokens"));
     settings.beginGroup(m_accountId);
     settings.setValue(QStringLiteral("contacts_anchors"), anchorsJson);

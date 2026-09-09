@@ -124,14 +124,80 @@ Sync (buteo OOPP, proton_bridge_shim.cpp, NoUserInteractionPolicy):
   photos omitted v1) + persists ID map/snapshots/anchors (SDK `moc` +
   `g++ -c` OK — incl. fixes: `QContactGender::GenderType` has no Other,
   `QContactUrl::url()` is QString, cbindgen header needs forced rebuild).
-  Found + fixed live: `CreateContactResult.Contact` is NESTED on the wire
-  (WebClients reference), our `#[flatten]` never matched. NEXT: deploy +
-  live gate (scratch contact create → edit → delete).
-- **Two-way sync**: Currently download-only (Proton → phone). No upload of local changes
+   Found + fixed live: `CreateContactResult.Contact` is NESTED on the wire
+   (WebClients reference), our `#[flatten]` never matched. NEXT 2026-09-09:
+   research-first pass over WebClients `contacts/{encrypt,constants,surgery,
+   vcard,decrypt}.ts` + `api/contacts.ts` and go-proton-api `contact{,s}.go`
+   found 5 more never-live-tested wire bugs, all fixed locally with offline
+   tests (see `FINDINGS_CONTACTS_UPSYNC.md`): create body is now
+   `Contacts:[{Cards}]` (was bare arrays), delete is `PUT …/delete` (was
+   HTTP DELETE — matched NEITHER reference), fresh UIDs are
+   `proton-web-uuid` via `getrandom` (was nanos, collidable), empty FN falls
+   back to `Unknown`, PRODID no longer emitted (VERSION only, like fresh web
+   contacts); `get()` debug dump to `/tmp/proton-contact-raw.json` removed.
+   Local green: fmt + clippy `-D warnings` clean, 153 tests pass
+   (92+3+58), aarch64 cross OK, SDK `moc` + `g++ -c` OK. Staged
+   `/tmp/libproton-client.so` sha256
+   `af82339da7dec5d0d00ca75e9b17120bfb1ff57949a6fa7ee65d01cdc0953cc8`.
+   New host gate `proton-sync/examples/live_contacts_check.rs` (scratch
+   create → update → delete, compiles, BLOCKED twice by host 9001 CAPTCHA —
+   see CAPTCHA TODO below; OTPs unconsumed). INCIDENT 2026-09-09 07:33 +
+   08:32: a phone edit wiped the server contact twice. ROOT CAUSE (proven
+   locally, `missing field photos`): the shim never sends the `photos` key
+   but `ParsedContact` required it, so every edited row failed the whole
+   inventory parse → inventory=None → known-diff DELETE. Fixed:
+   `#[serde(default)]` on all vCard contract fields + half-fed defense
+   (inventory-None + known-Some drops known, never plans deletes) +
+   delete-hold rule + file-log trace (inputs/plan/ran/defer-reasons/hold
+   markers in `keys_debug`). Details + live log evidence in
+   `FINDINGS_CONTACTS_UPSYNC.md` §7. FOLLOW-UP 09:06: sealed PUT got server
+   `400 Bad Request` (fail-closed, local intact). Two fixes: error bodies
+   now captured (`check_response`, no more blind 4xx) + emails grouped
+   (`itemN.EMAIL`, WebClients refuses ungrouped). Staged sha256
+   `2e52fffa999bc801ce91594278b8aa682987967ea8311ff9ff09ad4efd851282`
+   (on phone `/tmp`, verified), 161 tests green. VERIFIED LIVE 09:16:
+   phone edit → `ran updated=1`, post-upload re-list carries the edited
+   name (grouped-email theory confirmed). VERIFIED LIVE 09:21: revert
+   re-gate green (`ran updated=1`, anchors advanced) — updates stable,
+   repeatable. REVIEW 2026-09-09 (research-first, no device): re-read both
+   references against the still-unverified create/delete paths; found 1
+   real bug + 1 hardening gap, fixed locally with offline tests (see
+   `FINDINGS_CONTACTS_UPSYNC.md` §9): email-only contacts no longer seal
+   an empty Type-3 wrapper (`build_vcard` → `(String, Option)` mirroring
+   the `encrypt.ts` `toEncryptAndSign.length > 0` gate — same 400-risk
+   class as ungrouped EMAIL); `delete()` now fails on an explicit
+   top-level error `Code` (lenient: codeless `{}` stays success).
+   go-proton-api routes confirmed byte-identical to ours (WebClients
+   `/contacts` suffix noted as a future-400 suspect only). Local green:
+   fmt + clippy `-D warnings` clean, 167 tests pass (99+3+65),
+   `make-pkg-bundle.sh --no-deploy` full gate green (container cross +
+   SDK moc/g++/link). Staged `packaging/buteo-plugin/libproton-client.so`
+   sha256 `384e9d9d415179b2b5d0f93c22977119b305277506c87891e77565448acc72fe`
+   (supersedes ALL earlier builds — deploy only this). LIVE 2026-09-09:
+   11:32 phone-created-UID edit → `updated=1` (UPDATE convergence, no
+   dup); 11:36 two phone creates → `created=2` (single POST, re-list
+   carries fresh UIDs, decrypt round-trip OK); 11:37 both deleted →
+   Full create/update/delete cycle verified end-to-end. CLOSED 11:38:
+   user confirmed scratch rows gone on web; steady-state re-sync with
+   zero ops (`c=0 u=0 d=0`), ID map self-pruned 4→2.
+- **Two-way sync**: Contacts upsync implements it (creates/updates/deletes
+  upload; server-wins conflicts; contacts upsync gate in progress — see
+  above); calendar create/update/delete already live-verified
 - **Incremental sync**: No sync token support; full fetch every time
 - **Contact dedup**: No duplicate detection across Proton + local contacts
 - **Multiple photos**: People app only supports one avatar; only first photo is used
 - **Password never persisted** (intentional): raw 20-char login password is transient `Password` param only for `derive_all_passwords` at `Verify`; `signon-secrets.db` `CREDENTIALS.password` stays dummy `"x"`, `handleAuthOk` never returns `Secret`. New `KeySalt` after manual Proton key rotation will need one more **Update credentials → OTP** to re-derive and re-store `DerivedPasswords`.
+- [ ] **CAPTCHA / human-verification handling** (filed 2026-09-09, hit live
+  from the host: SRP login → `422 Code 9001`; details in
+  `FINDINGS_CONTACTS_UPSYNC.md` §8): today a 9001 challenge degrades to a
+  generic `NotAuthorized` sign-in error — no layer parses Code 9001, no
+  browser is ever opened, QML shows raw JSON soup, and the sync path loops
+  on "Session expired, please sign in again" back into the same CAPTCHA.
+  Direction: parse 9001 into a structured error (token/methods/WebUrl) →
+  distinct plugin `CaptchaRequired` result → QML message with the verify
+  URL as a link / "Open in browser" button (`Qt.openUrlExternally`,
+  user-initiated). Note: 9001 only gates SRP password logins
+  (creation/credential-update), never the refresh-token sync path.
 - [ ] **Debug-log cleanup / opt-in flag** (filed 2026-09-07): today every
   sync appends verbosely to `/tmp/proton-sync-debug.log` (shim `proton_log`
   on every run incl. full row JSON, `diag` bodies, Rust `eprintln` traces)
@@ -163,8 +229,22 @@ Sync (buteo OOPP, proton_bridge_shim.cpp, NoUserInteractionPolicy):
   fallback — custom `qsTrId` without shipped `.qm` renders empty). Also in
   scope: `proton.provider` name/description (XML, not QML). Out of scope:
   dynamic server/plugin error messages (`_errorMessage`, English by
-  nature). Cheap first step when revived: commit English-source `.ts`
-  template only.
+   nature). Cheap first step when revived: commit English-source `.ts`
+   template only.
+- [ ] **Docs rewrite: findings → objective documentation** (filed 2026-09-09
+  by user decision — final TODO, do after all sync work stabilizes):
+  convert `PLAN.md` / `ARCHITECTURE.md` / `FINDINGS_OTP.md` /
+  `FINDINGS_CALENDAR.md` / `FINDINGS_CONTACTS_UPSYNC.md` from running
+  research/dev journals into objective documentation. Target shape:
+  only schemas of how things work (architecture, component contracts,
+  API wire shapes, sync-cycle state machines, file paths) — strip all
+  commentary, live-log excerpts, incident narratives, per-session
+  progress notes, TODOs, and superseded analysis. Keep the references
+  (URLs) that pin each schema to its source. Suggested order: freeze
+  one `docs/` layout (e.g. `architecture.md`, `auth.md`,
+  `contacts-sync.md`, `calendar-sync.md`, `build-deploy.md`), rewrite
+  each from the current files, then delete the `FINDINGS_*.md` journals
+  (history stays in git).
 
 ## Key Technical Details
 

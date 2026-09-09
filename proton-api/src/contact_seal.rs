@@ -129,6 +129,40 @@ fn decrypt_server_cards(
         .collect()
 }
 
+/// Diagnose WHY an update rebuild deferred, for the file-log trace
+/// (schema/IDs only, never card contents). Best-effort mirror of
+/// `decrypt_server_cards` — call it when `build_contact_update_cards`
+/// returns `Ok(None)`. First hit wins, in rebuild order.
+pub fn diagnose_update_block(
+    cards: &[crate::ContactCard],
+    user_keys: &mut [UnlockedKey],
+) -> String {
+    if cards.iter().any(|card| card.Type == 0) {
+        return "cleartext-card".to_string();
+    }
+    let mut plains = Vec::with_capacity(cards.len());
+    for card in cards {
+        if card.Type == 2 {
+            plains.push(card.Data.clone());
+        } else {
+            match crate::crypto::decrypt_contact_card(&card.Data, user_keys) {
+                Ok(plain) => plains.push(plain),
+                Err(_) => return "undecryptable-card".to_string(),
+            }
+        }
+    }
+    for plain in &plains {
+        if crate::vcard::parse_vcard(plain).is_err() {
+            return "unparsable-card".to_string();
+        }
+    }
+    let unknown = crate::vcard::unknown_vcard_props(&plains);
+    if !unknown.is_empty() {
+        return format!("unknown-props:{}", unknown.join(","));
+    }
+    "sealable".to_string()
+}
+
 /// Build sealed update cards for one server contact + full phone snapshot:
 /// server photos preserved (phone has no photo upload v1), UID preserved,
 /// phone fields win otherwise. Returns `None` (= deferred) on any guard
@@ -149,19 +183,23 @@ pub fn build_contact_update_cards(
         .collect();
     let (signed_plain, enc_plain) = crate::vcard::build_vcard(&merged, contact_uid);
     let signed_sig = detached_sign_any(&signed_plain, user_keys)?;
-    let (enc_data, enc_sig) = seal_contact_card(&enc_plain, user_keys)?;
-    Ok(Some(vec![
-        crate::ContactCard {
-            Type: 2,
-            Data: signed_plain,
-            Signature: signed_sig,
-        },
-        crate::ContactCard {
+    // Mirror `encrypt.ts`: no Type 3 when there is nothing encrypt-side
+    // (email-only contact) — order stays [signed, encrypted] like before;
+    // the live-verified [Type2, Type3] shape for full contacts is untouched.
+    let mut cards = vec![crate::ContactCard {
+        Type: 2,
+        Data: signed_plain,
+        Signature: signed_sig,
+    }];
+    if let Some(enc_plain) = enc_plain {
+        let (enc_data, enc_sig) = seal_contact_card(&enc_plain, user_keys)?;
+        cards.push(crate::ContactCard {
             Type: 3,
             Data: enc_data,
             Signature: enc_sig,
-        },
-    ]))
+        });
+    }
+    Ok(Some(cards))
 }
 
 /// Build sealed create cards from a phone snapshot (no server base).
@@ -175,19 +213,20 @@ pub fn build_contact_create_cards(
     merged.photos = Vec::new(); // no photo upload v1 (documented gap)
     let (signed_plain, enc_plain) = crate::vcard::build_vcard(&merged, uid);
     let signed_sig = detached_sign_any(&signed_plain, user_keys)?;
-    let (enc_data, enc_sig) = seal_contact_card(&enc_plain, user_keys)?;
-    Ok(Some(vec![
-        crate::ContactCard {
-            Type: 2,
-            Data: signed_plain,
-            Signature: signed_sig,
-        },
-        crate::ContactCard {
+    let mut cards = vec![crate::ContactCard {
+        Type: 2,
+        Data: signed_plain,
+        Signature: signed_sig,
+    }];
+    if let Some(enc_plain) = enc_plain {
+        let (enc_data, enc_sig) = seal_contact_card(&enc_plain, user_keys)?;
+        cards.push(crate::ContactCard {
             Type: 3,
             Data: enc_data,
             Signature: enc_sig,
-        },
-    ]))
+        });
+    }
+    Ok(Some(cards))
 }
 
 #[cfg(test)]
@@ -361,6 +400,10 @@ mod tests {
         let mut user = test_user_identity();
         let phone = crate::vcard::ParsedContact {
             display_name: "Fresh Contact".into(),
+            phones: vec![crate::vcard::ParsedPhone {
+                number: "+3902000000".into(),
+                types: Vec::new(),
+            }],
             ..Default::default()
         };
         let out = build_contact_create_cards(&phone, "fresh-uid", std::slice::from_mut(&mut user))
@@ -371,5 +414,118 @@ mod tests {
         assert_eq!(out[1].Type, 3);
         let signed = decrypt_card(&out[0], &mut user);
         assert_eq!(signed.display_name, "Fresh Contact");
+        let enc = decrypt_card(&out[1], &mut user);
+        assert_eq!(enc.phones.len(), 1);
+    }
+
+    #[test]
+    fn test_create_email_only_seals_single_signed_card() {
+        // WebClients `encrypt.ts` gate: no encrypt-side properties → no
+        // Type-3 card at all (an empty wrapper was never live-tested).
+        let mut user = test_user_identity();
+        let phone = crate::vcard::ParsedContact {
+            display_name: "Solo".into(),
+            emails: vec![crate::vcard::ParsedEmail {
+                email: "solo@example.com".into(),
+                types: Vec::new(),
+            }],
+            ..Default::default()
+        };
+        let out = build_contact_create_cards(&phone, "solo-uid", std::slice::from_mut(&mut user))
+            .unwrap()
+            .expect("create seals");
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(out[0].Type, 2);
+        assert!(out[0].Data.contains("item1.EMAIL:solo@example.com"));
+        let back = decrypt_card(&out[0], &mut user);
+        assert_eq!(back.display_name, "Solo");
+        assert_eq!(back.emails.len(), 1);
+    }
+
+    #[test]
+    fn test_update_email_only_snapshot_drops_encrypted_card() {
+        // Phone stripped every encrypt-side field: the rebuilt update is a
+        // single signed card (deterministic split, like the web) — the old
+        // server Type 3 is intentionally replaced away.
+        let mut user = test_user_identity();
+        let (cards, _) = server_cards_fixture(&mut user);
+        let phone = crate::vcard::ParsedContact {
+            display_name: "Stripped".into(),
+            emails: vec![crate::vcard::ParsedEmail {
+                email: "s@example.com".into(),
+                types: Vec::new(),
+            }],
+            ..Default::default()
+        };
+        let out =
+            build_contact_update_cards(&cards, &phone, "c-1", std::slice::from_mut(&mut user))
+                .unwrap()
+                .expect("update seals");
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(out[0].Type, 2);
+    }
+
+    #[test]
+    fn test_grouped_email_updates_and_diagnoses() {
+        // Live 2026-09-09: Proton web groups emails (`item1.EMAIL`), which
+        // the pre-fix guard treated as unknown → every plain edit deferred.
+        // Grouped standard props must seal; genuinely exotic ones must name
+        // themselves via `diagnose_update_block` (schema only, safe to log).
+        let mut user = test_user_identity();
+        let signed_grouped = "BEGIN:VCARD\r\nVERSION:4.0\r\nUID:c-1\r\nFN:Old Name\r\nitem1.EMAIL;TYPE=HOME:old@example.com\r\nEND:VCARD";
+        let (enc_data, enc_sig) = seal_contact_card(
+            "BEGIN:VCARD\r\nVERSION:4.0\r\nUID:c-1\r\nN:Old;Name;;;\r\nEND:VCARD",
+            std::slice::from_mut(&mut user),
+        )
+        .unwrap();
+        let cards = vec![
+            crate::ContactCard {
+                Type: 2,
+                Data: signed_grouped.to_string(),
+                Signature: "sig".into(),
+            },
+            crate::ContactCard {
+                Type: 3,
+                Data: enc_data,
+                Signature: enc_sig,
+            },
+        ];
+        let phone = crate::vcard::ParsedContact {
+            first_name: "New".into(),
+            ..Default::default()
+        };
+        assert!(
+            build_contact_update_cards(&cards, &phone, "c-1", std::slice::from_mut(&mut user))
+                .unwrap()
+                .is_some(),
+            "grouped EMAIL seals"
+        );
+        assert_eq!(
+            diagnose_update_block(&cards, std::slice::from_mut(&mut user)),
+            "sealable"
+        );
+        // Exotic prop still defers, and names itself.
+        let (enc2, sig2) = seal_contact_card(
+            "BEGIN:VCARD\r\nVERSION:4.0\r\nUID:c\r\nX-CUSTOM:1\r\nEND:VCARD",
+            std::slice::from_mut(&mut user),
+        )
+        .unwrap();
+        let exotic = vec![crate::ContactCard {
+            Type: 3,
+            Data: enc2,
+            Signature: sig2,
+        }];
+        assert!(build_contact_update_cards(
+            &exotic,
+            &crate::vcard::ParsedContact::default(),
+            "c",
+            std::slice::from_mut(&mut user)
+        )
+        .unwrap()
+        .is_none());
+        assert_eq!(
+            diagnose_update_block(&exotic, std::slice::from_mut(&mut user)),
+            "unknown-props:X-CUSTOM"
+        );
     }
 }

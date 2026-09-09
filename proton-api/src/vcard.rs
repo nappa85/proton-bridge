@@ -1,45 +1,79 @@
 use serde::{Deserialize, Serialize};
 use std::io::BufReader;
 
+/// Phone field snapshot for one contact. EVERY field carries
+/// `#[serde(default)]`: this struct is the exact shim↔engine JSON contract
+/// (`contact_plan::ContactItem.fields`), and the shim omits keys it has
+/// nothing for (`photos` — no photo upload v1 — and any future key). A
+/// single missing key must never fail the whole inventory parse: on
+/// 2026-09-09 exactly that (`missing field photos`) silently degraded the
+/// engine to inventory=None and the known-diff planner wiped the server
+/// contact the user had just edited.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ParsedContact {
+    #[serde(default)]
     pub first_name: String,
+    #[serde(default)]
     pub last_name: String,
+    #[serde(default)]
     pub display_name: String,
+    #[serde(default)]
     pub emails: Vec<ParsedEmail>,
+    #[serde(default)]
     pub phones: Vec<ParsedPhone>,
+    #[serde(default)]
     pub addresses: Vec<ParsedAddress>,
+    #[serde(default)]
     pub organization: String,
+    #[serde(default)]
     pub title: String,
+    #[serde(default)]
     pub role: String,
+    #[serde(default)]
     pub notes: Vec<String>,
+    #[serde(default)]
     pub url: String,
+    #[serde(default)]
     pub birthday: String,
+    #[serde(default)]
     pub anniversary: String,
+    #[serde(default)]
     pub nickname: String,
+    #[serde(default)]
     pub gender: String,
+    #[serde(default)]
     pub photos: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ParsedEmail {
+    #[serde(default)]
     pub email: String,
+    #[serde(default)]
     pub types: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ParsedPhone {
+    #[serde(default)]
     pub number: String,
+    #[serde(default)]
     pub types: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ParsedAddress {
+    #[serde(default)]
     pub street: String,
+    #[serde(default)]
     pub locality: String,
+    #[serde(default)]
     pub region: String,
+    #[serde(default)]
     pub postal_code: String,
+    #[serde(default)]
     pub country: String,
+    #[serde(default)]
     pub types: Vec<String>,
 }
 
@@ -302,17 +336,28 @@ fn wrap_vcard(lines: &[String]) -> String {
         .join("\r\n")
 }
 
-/// The two writable card bodies for one contact (WebClients
+/// The writable card bodies for one contact (WebClients
 /// `prepareCardsFromVCard` split): `signed` carries uid/fn/emails (+
-/// version), `encrypted` carries everything else. No cleartext part —
+/// version), `encrypted` (`None` when the contact has no encrypt-side
+/// properties) carries everything else. No cleartext part —
 /// our model has no categories (the only Type 0 trigger). `uid` is the
 /// contact UID (freshly generated on create, preserved on update).
 /// Display-name fallback mirrors the web client: explicit FN, else
-/// `first last`, else the first email. Emits the Proton PRODID like the
-/// web client does (see `is_known_vcard_prop` — server cards carrying
-/// anything outside the known set defer updates instead of dropping
-/// data).
-pub fn build_vcard(contact: &ParsedContact, uid: &str) -> (String, String) {
+/// `first last`, else the first email, else `Unknown` (`getFallbackFNValue`
+/// — the server expects a non-empty FN). No PRODID is emitted: fresh web
+/// contacts carry none (only VERSION, forced by the wrapper); PRODID on
+/// server cards comes from imports and stays read-tolerated (see
+/// `is_known_vcard_prop` — server cards carrying anything outside the
+/// known set defer updates instead of dropping data).
+/// Emails are grouped (`item1.EMAIL`, `item2.EMAIL`, …) exactly like
+/// WebClients `prepareForSaving` (which refuses ungrouped emails — live
+/// 2026-09-09 the server 400-rejected our ungrouped update). Other props
+/// stay ungrouped, matching the web shape for key-less contacts.
+/// The `Option` mirrors `encrypt.ts` exactly: the Type-3 promise is only
+/// pushed `if (toEncryptAndSign.length > 0)` — an email-only contact seals
+/// to a single Type-2 card, and sending an empty BEGIN/VERSION/END wrapper
+/// as Type 3 risks a 400 (never live-tested either way, so match the web).
+pub fn build_vcard(contact: &ParsedContact, uid: &str) -> (String, Option<String>) {
     let display = if !contact.display_name.is_empty() {
         contact.display_name.clone()
     } else {
@@ -325,17 +370,18 @@ pub fn build_vcard(contact: &ParsedContact, uid: &str) -> (String, String) {
                 .emails
                 .first()
                 .map(|e| e.email.clone())
-                .unwrap_or_default()
+                .filter(|e| !e.is_empty())
+                .unwrap_or_else(|| "Unknown".to_string())
         }
     };
     let mut signed = vec![
-        "PRODID:-//Proton AG//ProtonMail//EN".into(),
         format!("UID:{uid}"),
         format!("FN:{}", escape_vcard(&display)),
     ];
-    for mail in &contact.emails {
+    for (i, mail) in contact.emails.iter().enumerate() {
         signed.push(format!(
-            "EMAIL{}:{}",
+            "item{}.EMAIL{}:{}",
+            i + 1,
             type_param(&mail.types),
             escape_vcard(&mail.email)
         ));
@@ -402,7 +448,15 @@ pub fn build_vcard(contact: &ParsedContact, uid: &str) -> (String, String) {
     for photo in &contact.photos {
         encrypted.push(format!("PHOTO:{}", escape_vcard(photo)));
     }
-    (wrap_vcard(&signed), wrap_vcard(&encrypted))
+    let signed = wrap_vcard(&signed);
+    // WebClients omits the encrypted card when there is nothing to seal
+    // (`toEncryptAndSign.length > 0` gate in `encrypt.ts`).
+    let encrypted = if encrypted.is_empty() {
+        None
+    } else {
+        Some(wrap_vcard(&encrypted))
+    };
+    (signed, encrypted)
 }
 
 /// Back to single-letter GENDER (inverse of the parse mapping).
@@ -451,7 +505,11 @@ pub fn is_known_vcard_prop(name: &str) -> bool {
 }
 
 /// Upper-cased property names of one card's content lines (unfolded),
-/// for the update guard. `None` when the text doesn't parse as lines.
+/// for the update guard. Group prefixes (`ITEM1.EMAIL` — which Proton web
+/// ALWAYS emits for emails, see `prepareForSaving`) are stripped: only the
+/// base name matters, and `.` is not a valid property-name character so
+/// anything before the last dot can only be a group. `None` when the text
+/// doesn't parse as lines.
 fn card_prop_names(card: &str) -> Vec<String> {
     let normalized = card.replace("\r\n", "\n").replace('\r', "\n");
     let mut unfolded: Vec<String> = Vec::new();
@@ -468,10 +526,12 @@ fn card_prop_names(card: &str) -> Vec<String> {
         .iter()
         .filter_map(|line| {
             let name = line.split([';', ':']).next()?.trim().to_uppercase();
-            if name.is_empty() {
+            // Strip `GROUP.` prefix (`ITEM1.EMAIL` → `EMAIL`).
+            let base = name.rsplit('.').next().unwrap_or_default();
+            if base.is_empty() {
                 None
             } else {
-                Some(name)
+                Some(base.to_string())
             }
         })
         .collect()
@@ -480,11 +540,22 @@ fn card_prop_names(card: &str) -> Vec<String> {
 /// True when any decrypted server card carries properties outside the
 /// known set (the update rebuild would silently drop them — defer).
 pub fn has_unknown_vcard_props(cards: &[String]) -> bool {
-    cards.iter().any(|card| {
-        card_prop_names(card)
-            .iter()
-            .any(|name| !is_known_vcard_prop(name))
-    })
+    !unknown_vcard_props(cards).is_empty()
+}
+
+/// Sorted unique unknown property names across cards (schema only, never
+/// values — safe to log for deferral diagnosis). Group prefixes are already
+/// stripped, so `ITEM1.FOO` surfaces as `FOO`: a genuine rebuild hazard,
+/// not a grouping artifact.
+pub fn unknown_vcard_props(cards: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = cards
+        .iter()
+        .flat_map(|card| card_prop_names(card))
+        .filter(|name| !is_known_vcard_prop(name))
+        .collect();
+    out.sort();
+    out.dedup();
+    out
 }
 
 pub fn format_bday(raw: String) -> String {
@@ -537,10 +608,11 @@ mod tests {
     fn test_build_vcard_round_trips() {
         let contact = rich_contact();
         let (signed, encrypted) = build_vcard(&contact, "uid-9");
+        let encrypted = encrypted.expect("rich contact seals an encrypted card");
         // Split contract: uid/fn/emails signed, everything else encrypted.
         assert!(signed.contains("UID:uid-9"));
         assert!(signed.contains("FN:Ada\\, the Lovelace"));
-        assert!(signed.contains("EMAIL;TYPE=HOME:ada@example.com"));
+        assert!(signed.contains("item1.EMAIL;TYPE=HOME:ada@example.com"));
         assert!(!signed.contains("TEL"));
         assert!(encrypted.contains("TEL;TYPE=CELL,VOICE:+39 02 123"));
         assert!(encrypted.contains("N:Lovelace;Ada\\, the;;;"));
@@ -603,6 +675,45 @@ mod tests {
         };
         let (signed2, _) = build_vcard(&c2, "u");
         assert!(signed2.contains("FN:solo@example.com"));
+        // Else `Unknown` (WebClients `getFallbackFNValue` — never empty).
+        let (signed3, _) = build_vcard(&ParsedContact::default(), "u");
+        assert!(signed3.contains("FN:Unknown"), "{signed3}");
+    }
+
+    #[test]
+    fn test_build_vcard_emits_no_prodid() {
+        // Fresh web contacts carry VERSION (forced) but no PRODID; the old
+        // always-emit risked a calendar-style 2011 property rejection.
+        let (signed, encrypted) = build_vcard(&rich_contact(), "u");
+        let encrypted = encrypted.expect("rich contact seals an encrypted card");
+        assert!(!signed.contains("PRODID"), "{signed}");
+        assert!(!encrypted.contains("PRODID"), "{encrypted}");
+        assert!(signed.contains("VERSION:4.0"), "{signed}");
+    }
+
+    #[test]
+    fn test_build_vcard_email_only_omits_encrypted() {
+        // `encrypt.ts` only pushes the Type-3 promise
+        // `if (toEncryptAndSign.length > 0)`: an email-only contact seals to
+        // a single signed card. Emitting an empty BEGIN/VERSION/END wrapper
+        // as Type 3 was never live-tested and risks a 400.
+        let c = ParsedContact {
+            display_name: "Solo".into(),
+            emails: vec![ParsedEmail {
+                email: "solo@example.com".into(),
+                types: Vec::new(),
+            }],
+            ..Default::default()
+        };
+        let (signed, encrypted) = build_vcard(&c, "u-solo");
+        assert!(signed.contains("UID:u-solo"));
+        assert!(signed.contains("FN:Solo"));
+        assert!(signed.contains("item1.EMAIL:solo@example.com"));
+        assert!(encrypted.is_none(), "{encrypted:?}");
+        // Nameless + phoneless + addressless is the same shape.
+        let (signed2, encrypted2) = build_vcard(&ParsedContact::default(), "u-empty");
+        assert!(signed2.contains("FN:Unknown"));
+        assert!(encrypted2.is_none(), "{encrypted2:?}");
     }
 
     #[test]
@@ -612,11 +723,32 @@ mod tests {
             ..Default::default()
         };
         let (_, encrypted) = build_vcard(&c, "u");
+        let encrypted = encrypted.expect("note seals an encrypted card");
         for line in encrypted.split("\r\n") {
             assert!(line.len() <= 75, "overlong: {line}");
         }
         // Folded NOTE re-parses whole.
         let back = parse_vcard(&encrypted).unwrap();
         assert_eq!(back.notes, vec!["x".repeat(200)]);
+    }
+
+    #[test]
+    fn test_grouped_props_dont_trip_guard() {
+        // Proton web groups emails (`prepareForSaving` adds itemN groups),
+        // so every real-world signed card carries `item1.EMAIL`. The update
+        // guard must see the base name, or every web-created contact defers
+        // (live 2026-09-09: `update:<uid>:unsealable` for a plain edit).
+        let grouped = "BEGIN:VCARD\r\nVERSION:4.0\r\nUID:u1\r\nFN:Old\r\nitem1.EMAIL;TYPE=HOME:old@example.com\r\nEND:VCARD";
+        assert!(!has_unknown_vcard_props(&[grouped.to_string()]));
+        assert!(unknown_vcard_props(&[grouped.to_string()]).is_empty());
+        // …while a genuinely unknown base name still trips, group or not.
+        let exotic = "BEGIN:VCARD\r\nVERSION:4.0\r\nUID:u1\r\nX-CUSTOM:1\r\nEND:VCARD";
+        assert_eq!(unknown_vcard_props(&[exotic.to_string()]), vec!["X-CUSTOM"]);
+        let grouped_exotic =
+            "BEGIN:VCARD\r\nVERSION:4.0\r\nUID:u1\r\nitem1.X-CUSTOM:1\r\nEND:VCARD";
+        assert_eq!(
+            unknown_vcard_props(&[grouped_exotic.to_string()]),
+            vec!["X-CUSTOM"]
+        );
     }
 }

@@ -326,4 +326,30 @@ mod tests {
         let back: ContactItem = serde_json::from_value(v).unwrap();
         assert_eq!(back, item);
     }
+
+    #[test]
+    fn test_shim_inventory_json_parses_without_photos() {
+        // 2026-09-09 live incident: the shim NEVER sends the `photos` key
+        // (no photo upload v1), but `ParsedContact.photos` lacked
+        // `#[serde(default)]` — so EVERY inventory row carrying `fields`
+        // failed the whole `Vec<ContactItem>` parse, the engine degraded to
+        // inventory=None, and the known-diff planner DELETEd the server
+        // contact the user had just edited. This literal shim-shaped JSON
+        // must parse with fields intact, and the planner must see an UPDATE.
+        let shim_json = r#"[{"qcontact_id":"q1","proton_uid":"u1","modified":true,"last_synced_mtime":100,"fields":{"first_name":"Marco","last_name":"Napetti","display_name":"nappa85","emails":[{"email":"a@b.c","types":[]}],"phones":[],"addresses":[],"organization":"","title":"","role":"","notes":[],"birthday":"","anniversary":"","nickname":"","url":"","gender":""}}]"#;
+        let items: Vec<ContactItem> = serde_json::from_str(shim_json).expect("shim JSON parses");
+        assert_eq!(items.len(), 1);
+        let fields = items[0].fields.clone().expect("fields intact");
+        assert_eq!(fields.first_name, "Marco");
+        assert_eq!(fields.emails.len(), 1);
+        // …and the planner sees an update, never a delete, for it.
+        let server = vec![contact("id1", "u1", 100)];
+        let plan = plan_contacts(&server, &items, &known(&["u1"]));
+        assert_eq!(
+            plan.uploads,
+            vec![ContactUploadOp::Update {
+                proton_uid: "u1".into()
+            }]
+        );
+    }
 }

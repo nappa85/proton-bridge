@@ -205,9 +205,18 @@ pub struct ContactsListResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateContactsRequest {
-    pub Contacts: Vec<Vec<ContactCard>>,
+    /// One entry per contact (WebClients `addContacts` + go-proton-api
+    /// `CreateContactsReq`: array of `{Cards: [...]}` OBJECTS — never a
+    /// bare array of arrays; the server rejects the latter).
+    pub Contacts: Vec<CreateContactCards>,
     pub Overwrite: i32,
     pub Labels: i32,
+}
+
+/// Single batch-create entry: the sealed cards for one new contact.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateContactCards {
+    pub Cards: Vec<ContactCard>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

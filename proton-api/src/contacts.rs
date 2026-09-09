@@ -45,6 +45,27 @@ impl ContactsClient {
         format!("Bearer {}", self.access_token)
     }
 
+    /// Like `error_for_status`, but keeps the (truncated) response body in
+    /// the error: Proton rejects bad card content with HTTP 4xx + a
+    /// `{Code, Error}` JSON body (calendar 2001/2011 lesson), and dropping
+    /// it leaves live rejections undiagnosable. Bodies are server-generated
+    /// codes/messages, never card plaintext.
+    fn check_response(
+        resp: reqwest::blocking::Response,
+        what: &str,
+    ) -> Result<reqwest::blocking::Response> {
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(resp);
+        }
+        let body = resp.text().unwrap_or_default();
+        let short: String = body.chars().take(1000).collect();
+        Err(ProtonError::Api {
+            code: 0,
+            message: format!("contacts {what} failed {status}: {short}"),
+        })
+    }
+
     /// List contacts with pagination
     pub fn list(&self, page: u32, page_size: u32) -> Result<ContactsListResponse> {
         let resp = self
@@ -110,10 +131,6 @@ impl ContactsClient {
             .send()?
             .error_for_status()?;
         let text = resp.text()?;
-        if let Ok(mut f) = std::fs::File::create("/tmp/proton-contact-raw.json") {
-            use std::io::Write;
-            let _ = f.write_all(text.as_bytes());
-        }
         let parsed: serde_json::Value = serde_json::from_str(&text)?;
         let contact: Contact =
             serde_json::from_value(parsed["Contact"].clone()).map_err(ProtonError::Serde)?;
@@ -138,36 +155,43 @@ impl ContactsClient {
 
     /// Create contacts (batch)
     pub fn create(&self, req: CreateContactsRequest) -> Result<CreateContactsResponse> {
-        let resp = self
-            .client
-            .post(format!("{}/contacts/v4", self.base_url))
-            .header("Authorization", self.auth_header())
-            .header("x-pm-uid", &self.uid)
-            .header("x-pm-appversion", APP_VERSION)
-            .json(&req)
-            .send()?
-            .error_for_status()?
-            .json()?;
+        let resp = Self::check_response(
+            self.client
+                .post(format!("{}/contacts/v4", self.base_url))
+                .header("Authorization", self.auth_header())
+                .header("x-pm-uid", &self.uid)
+                .header("x-pm-appversion", APP_VERSION)
+                .json(&req)
+                .send()?,
+            "create",
+        )?
+        .json()?;
         Ok(resp)
     }
 
     /// Update contact
     pub fn update(&self, contact_id: &str, req: UpdateContactRequest) -> Result<Contact> {
-        let resp = self
-            .client
-            .put(format!("{}/contacts/v4/{}", self.base_url, contact_id))
-            .header("Authorization", self.auth_header())
-            .header("x-pm-uid", &self.uid)
-            .header("x-pm-appversion", APP_VERSION)
-            .json(&req)
-            .send()?
-            .error_for_status()?
-            .json::<serde_json::Value>()?;
+        let resp = Self::check_response(
+            self.client
+                .put(format!("{}/contacts/v4/{}", self.base_url, contact_id))
+                .header("Authorization", self.auth_header())
+                .header("x-pm-uid", &self.uid)
+                .header("x-pm-appversion", APP_VERSION)
+                .json(&req)
+                .send()?,
+            "update",
+        )?
+        .json::<serde_json::Value>()?;
 
         serde_json::from_value(resp["Contact"].clone()).map_err(ProtonError::Serde)
     }
 
-    /// Delete contacts (batch)
+    /// Delete contacts (batch). go-proton-api + WebClients `deleteContacts`
+    /// both use `PUT …/delete` with `{IDs}` (never HTTP DELETE — the old
+    /// `DELETE /contacts/v4` shape matched neither reference and would fail
+    /// live). The top-level `Code` is checked leniently (fail only when the
+    /// server explicitly reports one outside 1000/1001 — a bare `{}` stays
+    /// success, matching go-proton-api's transport-only handling).
     pub fn delete(&self, ids: &[String]) -> Result<()> {
         #[allow(non_snake_case)]
         #[derive(Serialize)]
@@ -175,14 +199,150 @@ impl ContactsClient {
             IDs: Vec<String>,
         }
 
-        self.client
-            .delete(format!("{}/contacts/v4", self.base_url))
-            .header("Authorization", self.auth_header())
-            .header("x-pm-uid", &self.uid)
-            .header("x-pm-appversion", APP_VERSION)
-            .json(&DeleteReq { IDs: ids.to_vec() })
-            .send()?
-            .error_for_status()?;
+        let body = Self::check_response(
+            self.client
+                .put(format!("{}/contacts/v4/delete", self.base_url))
+                .header("Authorization", self.auth_header())
+                .header("x-pm-uid", &self.uid)
+                .header("x-pm-appversion", APP_VERSION)
+                .json(&DeleteReq { IDs: ids.to_vec() })
+                .send()?,
+            "delete",
+        )?
+        .text()?;
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
+            if let Some(code) = v.get("Code").and_then(serde_json::Value::as_i64) {
+                if code != 1000 && code != 1001 {
+                    let err_msg = v.get("Error").and_then(|e| e.as_str()).unwrap_or_default();
+                    let short: String = body.chars().take(1000).collect();
+                    return Err(ProtonError::Api {
+                        code: 0,
+                        message: format!("contacts delete failed {code}: {err_msg} {short}"),
+                    });
+                }
+            }
+        }
         Ok(())
+    }
+}
+
+/// Generate a fresh contact UID in the WebClients `generateProtonWebUID`
+/// shape (`proton-web-<hex…>`). Random via `getrandom` (no new deps);
+/// falls back to time+pid mixing only when the RNG is unavailable, so two
+/// creates in one batch can never share a UID (the old nanos-only scheme
+/// could collide inside a fast loop).
+pub fn generate_contact_uid() -> String {
+    let mut rand = [0u8; 16];
+    if getrandom::getrandom(&mut rand).is_err() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let pid = std::process::id();
+        for (i, b) in rand.iter_mut().enumerate() {
+            *b = ((nanos >> (8 * (i % 8))) as u8).wrapping_add((pid >> (8 * (i % 4))) as u8);
+        }
+    }
+    let h = |b: u8| format!("{b:02x}");
+    let s4 = |i: usize| format!("{}{}", h(rand[i]), h(rand[i + 1]));
+    format!(
+        "proton-web-{}{}-{}-{}-{}-{}{}{}",
+        s4(0),
+        s4(2),
+        s4(4),
+        s4(6),
+        s4(8),
+        s4(10),
+        s4(12),
+        s4(14)
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_generate_contact_uid_shape_and_uniqueness() {
+        let a = generate_contact_uid();
+        let b = generate_contact_uid();
+        for uid in [&a, &b] {
+            assert!(uid.starts_with("proton-web-"), "{uid}");
+            assert_eq!(uid.len(), "proton-web-".len() + 36, "{uid}");
+        }
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn test_create_request_wire_shape() {
+        // WebClients `addContacts` sends `Contacts` as objects with a
+        // `Cards` key — a bare array-of-arrays never matched the wire.
+        let req = CreateContactsRequest {
+            Contacts: vec![CreateContactCards {
+                Cards: vec![ContactCard {
+                    Type: 2,
+                    Data: "d".into(),
+                    Signature: "s".into(),
+                }],
+            }],
+            Overwrite: 0,
+            Labels: 0,
+        };
+        let v = serde_json::to_value(&req).unwrap();
+        assert_eq!(v["Contacts"][0]["Cards"][0]["Type"], 2);
+        assert_eq!(v["Overwrite"], 0);
+        assert!(v["Contacts"][0].get("Cards").unwrap().is_array());
+    }
+
+    #[test]
+    fn test_update_rejection_keeps_body() {
+        // A 400 with a `{Code, Error}` body must surface the body (live
+        // 2026-09-09: bare `error_for_status` hid WHY the PUT was rejected).
+        let mut server = mockito::Server::new();
+        let _m = server
+            .mock("PUT", mockito::Matcher::Regex(r"/contacts/v4/c9".into()))
+            .with_status(400)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"Code":2000,"Error":"Invalid contact data"}"#)
+            .create();
+        let client = ContactsClient::new_with_base_url(server.url(), "at".into(), "uid".into());
+        let err = client
+            .update("c9", UpdateContactRequest { Cards: Vec::new() })
+            .expect_err("400 must err");
+        let msg = format!("{err}");
+        assert!(msg.contains("400"), "{msg}");
+        assert!(msg.contains("Invalid contact data"), "{msg}");
+    }
+
+    #[test]
+    fn test_delete_checks_top_level_code_leniently() {
+        // Fail-closed on an explicit error Code, success on Code 1000 or a
+        // codeless body (go-proton-api treats delete as transport-only).
+        for (body, ok) in [
+            (r#"{"Code":1000}"#, true),
+            (r#"{"Code":1001}"#, true),
+            (r#"{}"#, true),
+            (r#"{"Code":2000,"Error":"Invalid IDs"}"#, false),
+        ] {
+            let mut server = mockito::Server::new();
+            let _m = server
+                .mock(
+                    "PUT",
+                    mockito::Matcher::Regex(r"/contacts/v4/delete".into()),
+                )
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                .with_body(body)
+                .create();
+            let client = ContactsClient::new_with_base_url(server.url(), "at".into(), "uid".into());
+            let res = client.delete(&["c1".to_string()]);
+            assert_eq!(res.is_ok(), ok, "{body}");
+            if !ok {
+                assert!(
+                    format!("{}", res.unwrap_err()).contains("Invalid IDs"),
+                    "{body}"
+                );
+            }
+        }
     }
 }
