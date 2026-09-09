@@ -298,15 +298,29 @@ void ProtonContactsPlugin::onSignOnResponse(const SignOn::SessionData &data)
 
     // If derived passwords are available, password can be empty (derived-only mode)
     // Keep password for first sync to generate derived, afterwards derived will be used
-    m_engine = proton_bridge_create_engine_with_derived(
+    // Upsync inputs: local inventory + known UIDs + anchors. Empty inventory
+    // = download-only, identical to the old constructor path.
+    QJsonArray contactsInventory = exportContactsInventory();
+    QByteArray contactsInventoryJson =
+        QJsonDocument(contactsInventory).toJson(QJsonDocument::Compact);
+    QJsonArray knownUidsArr;
+    for (const QString &knownUid : loadContactsKnownUids()) {
+        knownUidsArr.append(knownUid);
+    }
+    QByteArray knownUidsJson =
+        QJsonDocument(knownUidsArr).toJson(QJsonDocument::Compact);
+    proton_log(QStringLiteral("Contacts inventory: %1 rows").arg(contactsInventory.size()));
+    m_engine = proton_bridge_create_engine_with_inventory(
         username.toUtf8().constData(),
         password.toUtf8().constData(),
         accessToken.toUtf8().constData(),
         refreshToken.toUtf8().constData(),
         uid.toUtf8().constData(),
         "",
-        derivedJson.toUtf8().constData()
-    );
+        derivedJson.toUtf8().constData(),
+        contactsInventoryJson.constData(),
+        knownUidsJson.constData(),
+        loadContactsAnchors().toUtf8().constData());
 
     if (!m_engine) {
         emit error(getProfileName(), QStringLiteral("Failed to create sync engine"), Buteo::SyncResults::INTERNAL_ERROR);
@@ -454,6 +468,25 @@ void ProtonContactsPlugin::pollStatus()
         QString keysDebug = keysDbg ? QString::fromUtf8(keysDbg) : QString();
         if (keysDbg) proton_bridge_free_string(keysDbg);
         proton_log(QStringLiteral("Keys debug: ") + keysDebug);
+
+        // Upsync outputs (only meaningful on `complete`, which is where we
+        // are): anchors persist wholesale (null/empty never clobbers),
+        // conflicts notify server-wins.
+        char *contactAnchors = proton_bridge_get_contact_anchors_json(m_engine);
+        if (contactAnchors) {
+            persistContactsAnchors(QString::fromUtf8(contactAnchors));
+            proton_bridge_free_string(contactAnchors);
+        }
+        char *contactConflicts = proton_bridge_get_contact_conflicts_json(m_engine);
+        if (contactConflicts) {
+            QJsonDocument doc = QJsonDocument::fromJson(QByteArray(contactConflicts));
+            proton_bridge_free_string(contactConflicts);
+            if (doc.isArray() && !doc.array().isEmpty()) {
+                sendProtonNotification(
+                    QStringLiteral("Proton Contacts sync conflicts"),
+                    QStringLiteral("%1 contacts changed on both sides; server version kept").arg(doc.array().size()));
+            }
+        }
 
         char *json = proton_bridge_get_synced_contacts_json(m_engine);
         if (json) {
@@ -758,9 +791,233 @@ bool ProtonContactsPlugin::writeContactsToQtPIM(const QByteArray &json)
         }
         QCoreApplication::processEvents();
         proton_log(QStringLiteral("Saved %1 contacts via QContactManager, error=%2").arg(qtContacts.size()).arg(static_cast<int>(m_manager->error())));
+        // Upsync bookkeeping (write-only until the engine consumes it):
+        // ID map + lastModified snapshots for change detection.
+        persistContactsMaps(qtContacts);
     }
 
     return true;
+}
+
+// Upsync bookkeeping for contacts (write-only until the engine consumes
+// it; mirrors the calendar proton_id_map/anchors pattern, minus tombstones
+// — QtContacts has no delete tracking, so deletes come from ID-map diffing
+// instead). Three JSON blobs under QSettings proton/sync-tokens/<account>:
+// - contacts_id_map: {proton_uid: qcontact_id string} — known set for delete
+//   detection + Guid fallback ( Guid is authoritative; the map is the net).
+// - contacts_last_modified: {qcontact_id: lastModified msecs} — dirt baseline
+//   (missing entry = treat clean, so pre-feature rows never mass-upload).
+// - contacts_anchors: {proton_uid: server ModifyTime} — planner anchors,
+//   persisted wholesale from the engine getter (never clobbered with empty).
+static QStringList contactContextsToTypes(const QList<int> &contexts) {
+    QStringList out;
+    if (contexts.contains(QtContacts::QContactDetail::ContextHome)) {
+        out << QStringLiteral("home");
+    }
+    if (contexts.contains(QtContacts::QContactDetail::ContextWork)) {
+        out << QStringLiteral("work");
+    }
+    return out;
+}
+
+static QStringList contactPhoneSubTypesToTypes(const QList<int> &subTypes) {
+    QStringList out;
+    typedef QtContacts::QContactPhoneNumber P;
+    if (subTypes.contains(P::SubTypeMobile)) out << QStringLiteral("cell");
+    if (subTypes.contains(P::SubTypeFax)) out << QStringLiteral("fax");
+    if (subTypes.contains(P::SubTypePager)) out << QStringLiteral("pager");
+    if (subTypes.contains(P::SubTypeVoice)) out << QStringLiteral("voice");
+    if (subTypes.contains(P::SubTypeVideo)) out << QStringLiteral("video");
+    if (subTypes.contains(P::SubTypeCar)) out << QStringLiteral("car");
+    return out;
+}
+
+void ProtonContactsPlugin::persistContactsMaps(const QList<QtContacts::QContact> &saved) {
+    // Assigned IDs are valid on the in-memory objects post-save; timestamps
+    // are re-fetched per row (the in-memory copies may predate storage).
+    QVariantMap idMap, lastMod;
+    for (const QtContacts::QContact &c : saved) {
+        if (c.id().isNull()) continue;
+        QString uid = c.detail<QtContacts::QContactGuid>().guid();
+        if (uid.isEmpty()) continue;
+        QString qid = c.id().toString();
+        idMap.insert(uid, qid);
+        QtContacts::QContact fresh = m_manager->contact(c.id());
+        if (m_manager->error() != QtContacts::QContactManager::NoError) continue;
+        QtContacts::QContactTimestamp ts = fresh.detail<QtContacts::QContactTimestamp>();
+        if (ts.lastModified().isValid()) {
+            lastMod.insert(qid, ts.lastModified().toMSecsSinceEpoch());
+        }
+    }
+    QSettings settings(QStringLiteral("proton"), QStringLiteral("sync-tokens"));
+    settings.beginGroup(m_accountId);
+    settings.setValue(QStringLiteral("contacts_id_map"),
+                      QString::fromUtf8(QJsonDocument::fromVariant(idMap).toJson(QJsonDocument::Compact)));
+    settings.setValue(QStringLiteral("contacts_last_modified"),
+                      QString::fromUtf8(QJsonDocument::fromVariant(lastMod).toJson(QJsonDocument::Compact)));
+    settings.endGroup();
+}
+
+// Local inventory for the contacts planner: one object per row in our
+// collection — {qcontact_id, proton_uid|null, modified, last_synced_mtime
+// |null, fields?} (exact `contact_plan::ContactItem` contract). `fields`
+// carries the full phone snapshot for dirty/never-synced rows only
+// (photos intentionally omitted: no photo upload v1, server photos are
+// preserved engine-side).
+QJsonArray ProtonContactsPlugin::exportContactsInventory() {
+    QJsonArray out;
+    QtContacts::QContactCollection collection = findOrCreateCollection();
+    if (collection.id().isNull()) return out;
+    QSettings settings(QStringLiteral("proton"), QStringLiteral("sync-tokens"));
+    settings.beginGroup(m_accountId);
+    auto readMap = [&](const QString &key) {
+        QVariantMap map;
+        QJsonDocument doc = QJsonDocument::fromJson(
+            settings.value(key).toString().toUtf8());
+        if (doc.isObject()) map = doc.toVariant().toMap();
+        return map;
+    };
+    QVariantMap anchors = readMap(QStringLiteral("contacts_anchors"));
+    QVariantMap lastMod = readMap(QStringLiteral("contacts_last_modified"));
+    settings.endGroup();
+
+    QtContacts::QContactCollectionFilter collectionFilter;
+    collectionFilter.setCollectionId(collection.id());
+    QList<QtContacts::QContact> rows = m_manager->contacts(collectionFilter);
+    for (const QtContacts::QContact &c : rows) {
+        QJsonObject o;
+        QString qid = c.id().toString();
+        o.insert(QStringLiteral("qcontact_id"), qid);
+        QString guid = c.detail<QtContacts::QContactGuid>().guid();
+        o.insert(QStringLiteral("proton_uid"),
+                 guid.isEmpty() ? QJsonValue() : QJsonValue(guid));
+        bool dirty = false;
+        QDateTime lm = c.detail<QtContacts::QContactTimestamp>().lastModified();
+        if (lm.isValid() && lastMod.contains(qid)) {
+            dirty = lastMod.value(qid).toLongLong() != lm.toMSecsSinceEpoch();
+        }
+        o.insert(QStringLiteral("modified"), dirty);
+        if (!guid.isEmpty() && anchors.contains(guid)) {
+            o.insert(QStringLiteral("last_synced_mtime"),
+                     QJsonValue(anchors.value(guid).toLongLong()));
+        } else {
+            o.insert(QStringLiteral("last_synced_mtime"), QJsonValue());
+        }
+        if (!guid.isEmpty() && !dirty) {
+            out.append(o); // clean synced row: no fields needed
+            continue;
+        }
+        // Dirty or never-synced: full snapshot (mirror of the write path).
+        QJsonObject f;
+        QtContacts::QContactName name = c.detail<QtContacts::QContactName>();
+        f.insert(QStringLiteral("first_name"), name.firstName());
+        f.insert(QStringLiteral("last_name"), name.lastName());
+        f.insert(QStringLiteral("display_name"),
+                 c.detail<QtContacts::QContactDisplayLabel>().label());
+        QJsonArray emails;
+        for (const QtContacts::QContactEmailAddress &e :
+             c.details<QtContacts::QContactEmailAddress>()) {
+            if (e.emailAddress().isEmpty()) continue;
+            QJsonObject eo;
+            eo.insert(QStringLiteral("email"), e.emailAddress());
+            QJsonArray types;
+            for (const QString &t : contactContextsToTypes(e.contexts())) types.append(t);
+            eo.insert(QStringLiteral("types"), types);
+            emails.append(eo);
+        }
+        f.insert(QStringLiteral("emails"), emails);
+        QJsonArray phones;
+        for (const QtContacts::QContactPhoneNumber &p :
+             c.details<QtContacts::QContactPhoneNumber>()) {
+            if (p.number().isEmpty()) continue;
+            QJsonObject po;
+            po.insert(QStringLiteral("number"), p.number());
+            QJsonArray types;
+            for (const QString &t : contactPhoneSubTypesToTypes(p.subTypes())) types.append(t);
+            for (const QString &t : contactContextsToTypes(p.contexts())) types.append(t);
+            po.insert(QStringLiteral("types"), types);
+            phones.append(po);
+        }
+        f.insert(QStringLiteral("phones"), phones);
+        QJsonArray addresses;
+        for (const QtContacts::QContactAddress &a :
+             c.details<QtContacts::QContactAddress>()) {
+            QJsonObject ao;
+            ao.insert(QStringLiteral("street"), a.street());
+            ao.insert(QStringLiteral("locality"), a.locality());
+            ao.insert(QStringLiteral("region"), a.region());
+            ao.insert(QStringLiteral("postal_code"), a.postcode());
+            ao.insert(QStringLiteral("country"), a.country());
+            QJsonArray types;
+            for (const QString &t : contactContextsToTypes(a.contexts())) types.append(t);
+            ao.insert(QStringLiteral("types"), types);
+            addresses.append(ao);
+        }
+        f.insert(QStringLiteral("addresses"), addresses);
+        QtContacts::QContactOrganization org = c.detail<QtContacts::QContactOrganization>();
+        f.insert(QStringLiteral("organization"), org.name());
+        f.insert(QStringLiteral("title"), org.title());
+        f.insert(QStringLiteral("role"), org.role());
+        QStringList notes;
+        for (const QtContacts::QContactNote &n : c.details<QtContacts::QContactNote>()) {
+            if (!n.note().isEmpty()) notes << n.note();
+        }
+        QJsonArray notesArr;
+        for (const QString &n : notes) notesArr.append(n);
+        f.insert(QStringLiteral("notes"), notesArr);
+        QtContacts::QContactBirthday bday = c.detail<QtContacts::QContactBirthday>();
+        f.insert(QStringLiteral("birthday"),
+                 bday.date().isValid() ? bday.date().toString(Qt::ISODate) : QString());
+        QtContacts::QContactAnniversary ann = c.detail<QtContacts::QContactAnniversary>();
+        QDate annDate = ann.originalDate();
+        f.insert(QStringLiteral("anniversary"),
+                 annDate.isValid() ? annDate.toString(Qt::ISODate) : QString());
+        f.insert(QStringLiteral("nickname"), c.detail<QtContacts::QContactNickname>().nickname());
+        f.insert(QStringLiteral("url"), c.detail<QtContacts::QContactUrl>().url());
+        QtContacts::QContactGender::GenderType gender =
+            c.detail<QtContacts::QContactGender>().gender();
+        QString genderStr;
+        if (gender == QtContacts::QContactGender::GenderMale) {
+            genderStr = QStringLiteral("Male");
+        } else if (gender == QtContacts::QContactGender::GenderFemale) {
+            genderStr = QStringLiteral("Female");
+        }
+        // Unspecified (or anything else) exports as "" = no gender detail
+        // (the write path only ever stores Male/Female anyway).
+        f.insert(QStringLiteral("gender"), genderStr);
+        o.insert(QStringLiteral("fields"), f);
+        out.append(o);
+    }
+    return out;
+}
+
+void ProtonContactsPlugin::persistContactsAnchors(const QString &anchorsJson) {
+    if (anchorsJson.isEmpty()) {
+        return;
+    }
+    QSettings settings(QStringLiteral("proton"), QStringLiteral("sync-tokens"));
+    settings.beginGroup(m_accountId);
+    settings.setValue(QStringLiteral("contacts_anchors"), anchorsJson);
+    settings.endGroup();
+}
+
+QString ProtonContactsPlugin::loadContactsAnchors() {
+    QSettings settings(QStringLiteral("proton"), QStringLiteral("sync-tokens"));
+    settings.beginGroup(m_accountId);
+    QString a = settings.value(QStringLiteral("contacts_anchors")).toString();
+    settings.endGroup();
+    return a;
+}
+
+QStringList ProtonContactsPlugin::loadContactsKnownUids() {
+    QSettings settings(QStringLiteral("proton"), QStringLiteral("sync-tokens"));
+    settings.beginGroup(m_accountId);
+    QVariantMap map;
+    QJsonDocument doc = QJsonDocument::fromJson(
+        settings.value(QStringLiteral("contacts_id_map")).toString().toUtf8());
+    if (doc.isObject()) map = doc.toVariant().toMap();
+    settings.endGroup();
+    return map.keys();
 }
 
 QtContacts::QContactCollection ProtonContactsPlugin::findOrCreateCollection()
@@ -1286,6 +1543,42 @@ static QString intList(const QList<int> &nums) {
     QStringList parts;
     for (int n : nums) parts << QString::number(n);
     return parts.join(',');
+}
+
+// Signed offset seconds → Proton ISO8601 duration Trigger ("-PT15M").
+// Weeks/days/time split greedily; zero → "-PT0S". Positive (after-start)
+// offsets keep a '+'-less unsigned form, mirroring parse_notification_trigger.
+static QString durationTrigger(qint64 offsetSecs) {
+    bool neg = offsetSecs < 0;
+    qint64 mag = neg ? -offsetSecs : offsetSecs;
+    qint64 weeks = mag / 604800;
+    mag %= 604800;
+    qint64 days = mag / 86400;
+    mag %= 86400;
+    qint64 hours = mag / 3600;
+    mag %= 3600;
+    qint64 minutes = mag / 60;
+    qint64 seconds = mag % 60;
+    // ISO8601 forbids mixing W with other units: fold weeks into days
+    // unless the whole offset is exact weeks.
+    if (weeks > 0 && (days > 0 || hours > 0 || minutes > 0 || seconds > 0)) {
+        days += weeks * 7;
+        weeks = 0;
+    }
+    if (weeks > 0) {
+        return (neg ? QStringLiteral("-") : QString())
+            + QStringLiteral("P%1W").arg(weeks);
+    }
+    QString out = QStringLiteral("P");
+    if (days > 0) out += QStringLiteral("%1D").arg(days);
+    QString time;
+    if (hours > 0) time += QStringLiteral("%1H").arg(hours);
+    if (minutes > 0) time += QStringLiteral("%1M").arg(minutes);
+    if (seconds > 0 || (days == 0 && hours == 0 && minutes == 0)) {
+        time += QStringLiteral("%1S").arg(seconds);
+    }
+    if (!time.isEmpty()) out += QStringLiteral("T") + time;
+    return (neg ? QStringLiteral("-") : QString()) + out;
 }
 
 // Serialize a KCalendarCore recurrence rule to an RFC5545 RRULE string for
@@ -1886,6 +2179,23 @@ QJsonArray ProtonCalendarPlugin::exportLocalInventory() {
                     fields.insert(QStringLiteral("has_recurrence"), true);
                     fields.insert(QStringLiteral("rrule"), QJsonValue());
                 }
+                // Reminder state: current display alarms as row-shaped
+                // {Trigger, Type:1} entries (explicit [] = user cleared all;
+                // server-sent email alarms are merged back engine-side).
+                // Only start-offset alarms map to Proton triggers.
+                QJsonArray notifs;
+                for (const KCalendarCore::Alarm::Ptr &alarm : ev->alarms()) {
+                    if (!alarm || !alarm->hasStartOffset()) continue;
+                    notifs.append(QJsonObject({
+                        { QStringLiteral("Trigger"),
+                          durationTrigger(alarm->startOffset().asSeconds()) },
+                        { QStringLiteral("Type"), 1 },
+                    }));
+                }
+                fields.insert(QStringLiteral("notifications"), notifs);
+                // Event color (#RRGGBB or "" when unset; engine validates
+                // against the palette, "" reverts to the calendar color).
+                fields.insert(QStringLiteral("color"), ev->color());
                 o.insert(QStringLiteral("fields"), fields);
             }
             out.append(o);
@@ -1904,6 +2214,15 @@ QJsonArray ProtonCalendarPlugin::exportLocalInventory() {
             if (protonId.isEmpty()) protonId = idMap.value(inc->uid()).toString();
             o.insert(QStringLiteral("proton_id"),
                      protonId.isEmpty() ? QJsonValue() : QJsonValue(protonId));
+            // Raw iCal UID for the out-of-window fallback (strip the
+            // account namespace + any #rid exception suffix): lets the
+            // engine UID-list rows the windowed listing missed.
+            QString rawUid = inc->uid();
+            if (rawUid.startsWith(prefix)) rawUid = rawUid.mid(prefix.length());
+            int hash = rawUid.indexOf('#');
+            if (hash >= 0) rawUid = rawUid.left(hash);
+            o.insert(QStringLiteral("uid"),
+                     rawUid.isEmpty() ? QJsonValue() : QJsonValue(rawUid));
             o.insert(QStringLiteral("deleted"), true);
             o.insert(QStringLiteral("modified"), false);
             if (!protonId.isEmpty() && anchors.contains(protonId)) {

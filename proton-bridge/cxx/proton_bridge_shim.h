@@ -33,6 +33,7 @@
 #include <QContactUrl>
 #include <QContactGender>
 #include <QContactAnniversary>
+#include <QContactTimestamp>
 #include <extendedcalendar.h>
 #include <extendedstorage.h>
 #include <notebook.h>
@@ -90,6 +91,11 @@ private:
     QtContacts::QContactCollection findOrCreateCollection();
     void persistTokens(const QString &refreshToken, const QString &uid);
     QPair<QString, QString> loadPersistedTokens();
+    void persistContactsMaps(const QList<QtContacts::QContact> &saved);
+    QJsonArray exportContactsInventory();
+    void persistContactsAnchors(const QString &anchorsJson);
+    QString loadContactsAnchors();
+    QStringList loadContactsKnownUids();
 
     ProtonSyncEngine *m_engine = nullptr;
     QTimer *m_timer = nullptr;

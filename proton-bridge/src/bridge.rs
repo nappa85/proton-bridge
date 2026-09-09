@@ -132,6 +132,95 @@ pub extern "C" fn proton_bridge_create_engine_with_derived(
     }))
 }
 
+/// Full constructor for the wired contacts upsync cycle: inventory (shim
+/// local-inventory JSON array), known UIDs (persisted ID-map keys JSON
+/// array) and anchors (map JSON) feed the planner; empty/invalid strings
+/// safely degrade to download-only.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn proton_bridge_create_engine_with_inventory(
+    username: *const c_char,
+    password: *const c_char,
+    access_token: *const c_char,
+    refresh_token: *const c_char,
+    uid: *const c_char,
+    totp_code: *const c_char,
+    derived_passwords_json: *const c_char,
+    inventory_json: *const c_char,
+    known_uids_json: *const c_char,
+    anchors_json: *const c_char,
+) -> *mut ProtonSyncEngine {
+    let username = unsafe { cstr_to_string(username) };
+    let password = unsafe { cstr_to_string(password) };
+    let access_token_str = unsafe { cstr_to_string(access_token) };
+    let refresh_token_str = unsafe { cstr_to_string(refresh_token) };
+    let uid_str = unsafe { cstr_to_string(uid) };
+    let totp_code_str = unsafe { cstr_to_string(totp_code) };
+    let derived_json_str = unsafe { cstr_to_string(derived_passwords_json) };
+    let inventory_str = unsafe { cstr_to_string(inventory_json) };
+    let known_str = unsafe { cstr_to_string(known_uids_json) };
+    let anchors_str = unsafe { cstr_to_string(anchors_json) };
+
+    let derived_passwords = if derived_json_str.is_empty() {
+        None
+    } else {
+        serde_json::from_str(&derived_json_str).ok()
+    };
+    // Malformed inventory/anchors degrade to download-only (None), never
+    // to a half-fed plan.
+    let contact_inventory = if inventory_str.is_empty() {
+        None
+    } else {
+        serde_json::from_str(&inventory_str).ok()
+    };
+    let contact_known_uids = if known_str.is_empty() {
+        None
+    } else {
+        serde_json::from_str(&known_str).ok()
+    };
+    let contact_anchors = if anchors_str.is_empty() {
+        None
+    } else {
+        serde_json::from_str(&anchors_str).ok()
+    };
+
+    let config = SyncConfig {
+        username,
+        password,
+        derived_passwords,
+        access_token: if access_token_str.is_empty() {
+            None
+        } else {
+            Some(access_token_str)
+        },
+        refresh_token: if refresh_token_str.is_empty() {
+            None
+        } else {
+            Some(refresh_token_str)
+        },
+        uid: if uid_str.is_empty() {
+            None
+        } else {
+            Some(uid_str)
+        },
+        totp_code: if totp_code_str.is_empty() {
+            None
+        } else {
+            Some(totp_code_str)
+        },
+        contact_inventory,
+        contact_known_uids,
+        contact_anchors,
+        ..Default::default()
+    };
+
+    let engine = SyncEngine::new(config);
+    Box::into_raw(Box::new(ProtonSyncEngine {
+        inner: Arc::new(Mutex::new(Some(engine))),
+        synced_contacts_json: Arc::new(Mutex::new(None)),
+    }))
+}
+
 #[no_mangle]
 pub extern "C" fn proton_bridge_destroy_engine(engine: *mut ProtonSyncEngine) {
     if !engine.is_null() {
@@ -290,6 +379,48 @@ pub extern "C" fn proton_bridge_get_keys_debug(engine: *mut ProtonSyncEngine) ->
             Some(s) => CString::new(s).unwrap().into_raw(),
             None => std::ptr::null_mut(),
         },
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// Contacts upsync outputs (valid after `complete`): server-wins
+/// conflicts (`[]` JSON, shim notifies) and merged anchors (null when
+/// nothing known — caller must not overwrite a good cache with that).
+#[no_mangle]
+pub extern "C" fn proton_bridge_get_contact_conflicts_json(
+    engine: *mut ProtonSyncEngine,
+) -> *mut c_char {
+    if engine.is_null() {
+        return std::ptr::null_mut();
+    }
+    let engine_ref = unsafe { &*engine };
+    let guard = engine_ref.inner.lock().unwrap();
+    match guard.as_ref() {
+        Some(e) => CString::new(e.get_contact_conflicts_json())
+            .unwrap()
+            .into_raw(),
+        None => std::ptr::null_mut(),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn proton_bridge_get_contact_anchors_json(
+    engine: *mut ProtonSyncEngine,
+) -> *mut c_char {
+    if engine.is_null() {
+        return std::ptr::null_mut();
+    }
+    let engine_ref = unsafe { &*engine };
+    let guard = engine_ref.inner.lock().unwrap();
+    match guard.as_ref() {
+        Some(e) => {
+            let s = e.get_contact_anchors_json();
+            if s.is_empty() {
+                std::ptr::null_mut()
+            } else {
+                CString::new(s).unwrap().into_raw()
+            }
+        }
         None => std::ptr::null_mut(),
     }
 }

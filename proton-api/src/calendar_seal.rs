@@ -191,17 +191,6 @@ fn max_sequence(plaintexts: &[String]) -> i64 {
         .unwrap_or(0)
 }
 
-/// Any attendee identity in signed plaintext cards (ORGANIZER/ATTENDEE
-/// lines)? Such rows carry clear Attendee RSVP rows server-side that an
-/// update body (`Attendees: []`) would wipe — caller must defer.
-fn has_attendee_identities(plaintexts: &[String]) -> bool {
-    plaintexts.iter().any(|plain| {
-        crate::calendar::parse_ical(plain)
-            .map(|parsed| !parsed.attendees.is_empty() || !parsed.organizer.is_empty())
-            .unwrap_or(false)
-    })
-}
-
 /// Decrypt one card group, returning `(is_encrypted, plaintext)` per part
 /// in order. `None` when any encrypted part fails (verbatim requirement).
 fn decrypt_group(
@@ -286,21 +275,25 @@ fn apply_text(patch: &mut CardPatch, name: &str, value: Option<&str>) {
 
 /// Build the sealed update body for one GET-fresh row + local fields.
 /// Returns `None` (= deferred, engine logs + skips) when the row carries
-/// data an update would destroy: attendee cards/identities (clear RSVP
-/// rows aren't in our model — `Attendees: []` would wipe them) or member
-/// `PersonalEvents` (never decrypted, must not drop).
+/// member `PersonalEvents` (never decrypted — must not drop) or has
+/// undecryptable cards (can't seal what we can't read; never fail the
+/// phase for one bad row). Attendee data is SAFE: cards reseal verbatim
+/// and clear `Attendees` token rows re-send verbatim (wiping them would
+/// destroy RSVP state — the pre-token guard is gone).
 ///
 /// Patch scope (v1): TEXT (SUMMARY/DESCRIPTION/LOCATION) + times + RRULE.
-/// Notifications/Color re-send verbatim (reminder/phone edits stay
-/// download-wins); calendar + attendees cards reseal verbatim.
+/// Notifications/Color re-send verbatim unless `overrides` says otherwise;
+/// calendar + attendees cards reseal verbatim. Phone-side attendee-identity
+/// edits are NOT exported (download-wins, documented).
 #[allow(clippy::too_many_lines)]
 pub fn build_update_body(
     row: &CalendarEvent,
     fields: &LocalFields,
+    overrides: Option<&crate::calendar_write::UpdateOverrides>,
     cal_keys: &mut [UnlockedKey],
     addr_keys: &mut [UnlockedKey],
 ) -> Result<Option<SyncEventBody>> {
-    if !row.AttendeesEvents.is_empty() || !row.PersonalEvents.is_empty() {
+    if !row.PersonalEvents.is_empty() {
         return Ok(None);
     }
     // Session keys (update carries no packets — all reuse). Present exactly
@@ -326,33 +319,28 @@ pub fn build_update_body(
             Err(_) => return Ok(None),
         }
     }
-    let shared = decrypt_group(&row.SharedEvents, &row.SharedKeyPacket, cal_keys, addr_keys)
-        .ok_or_else(|| ProtonError::Crypto("update: shared card undecryptable".into()))?;
-    let calendar = decrypt_group(
+    // Undecryptable groups defer the row (log + skip) instead of failing
+    // the whole upload phase — we can't seal what we can't read.
+    let Some(shared) = decrypt_group(&row.SharedEvents, &row.SharedKeyPacket, cal_keys, addr_keys)
+    else {
+        return Ok(None);
+    };
+    let Some(calendar) = decrypt_group(
         &row.CalendarEvents,
         &row.CalendarKeyPacket,
         cal_keys,
         addr_keys,
-    )
-    .ok_or_else(|| ProtonError::Crypto("update: calendar card undecryptable".into()))?;
-    let attendees = decrypt_group(
+    ) else {
+        return Ok(None);
+    };
+    let Some(attendees) = decrypt_group(
         &row.AttendeesEvents,
         &row.SharedKeyPacket,
         cal_keys,
         addr_keys,
-    )
-    .ok_or_else(|| ProtonError::Crypto("update: attendees card undecryptable".into()))?;
-    // Attendee/organizer identities in ANY signed card (shared AND
-    // calendar — invites may carry them outside the shared card).
-    let signed_plains: Vec<String> = shared
-        .iter()
-        .chain(calendar.iter())
-        .filter(|(enc, _)| !enc)
-        .map(|(_, plain)| plain.clone())
-        .collect();
-    if has_attendee_identities(&signed_plains) {
+    ) else {
         return Ok(None);
-    }
+    };
 
     let all_day = fields.all_day.unwrap_or(row.FullDay.unwrap_or(false));
     let mut signed_patch = CardPatch::default();
@@ -460,6 +448,32 @@ pub fn build_update_body(
     )?;
     // Re-send row metadata verbatim (whole-object replace must not reset
     // reminders/color; phone edits to those stay download-wins in v1).
+    // Clear attendee token rows re-send verbatim (wiping them would
+    // destroy server-side RSVP state); `[]` exactly when the row has none.
+    let attendees_value = if row.Attendees.is_empty() {
+        serde_json::Value::Array(Vec::new())
+    } else {
+        crate::calendar_write::marshal_attendees(
+            &row.Attendees
+                .iter()
+                .map(|t| (t.Token.clone(), t.Status))
+                .collect::<Vec<_>>(),
+        )
+    };
+    let no_overrides = crate::calendar_write::UpdateOverrides::default();
+    let applied = overrides.unwrap_or(&no_overrides);
+    let notifications = match &applied.notifications {
+        None => marshal_notifications(
+            row.Notifications.is_some(),
+            &row.Notifications.clone().unwrap_or_default(),
+        ),
+        Some(None) => serde_json::Value::Null,
+        Some(Some(list)) => marshal_notifications(true, list),
+    };
+    let color = match &applied.color {
+        None => marshal_color(row.Color.as_deref().unwrap_or("")),
+        Some(hex) => marshal_color(hex),
+    };
     Ok(Some(SyncEventBody {
         Permissions: 1,
         SharedKeyPacket: None,
@@ -467,12 +481,9 @@ pub fn build_update_body(
         SharedEventContent: shared_parts,
         CalendarEventContent: calendar_parts,
         AttendeesEventContent: attendees_parts,
-        Attendees: serde_json::Value::Array(Vec::new()),
-        Notifications: marshal_notifications(
-            row.Notifications.is_some(),
-            &row.Notifications.clone().unwrap_or_default(),
-        ),
-        Color: marshal_color(row.Color.as_deref().unwrap_or("")),
+        Attendees: attendees_value,
+        Notifications: notifications,
+        Color: color,
     }))
 }
 
@@ -875,6 +886,7 @@ mod tests {
         let body = build_update_body(
             &fx.row,
             &fields,
+            None,
             std::slice::from_mut(&mut fx.cal),
             std::slice::from_mut(&mut fx.addr),
         )
@@ -929,6 +941,7 @@ mod tests {
         let body = build_update_body(
             &fx.row,
             &fields,
+            None,
             std::slice::from_mut(&mut fx.cal),
             std::slice::from_mut(&mut fx.addr),
         )
@@ -965,9 +978,15 @@ mod tests {
             summary: Some("Stripped".into()),
             ..Default::default()
         };
-        let body = build_update_body(&fx.row, &fields, &mut [fx.cal], &mut [fx.addr])
-            .unwrap()
-            .expect("strips and seals");
+        let body = build_update_body(
+            &fx.row,
+            &fields,
+            None,
+            std::slice::from_mut(&mut fx.cal),
+            std::slice::from_mut(&mut fx.addr),
+        )
+        .unwrap()
+        .expect("strips and seals");
         for part in body
             .SharedEventContent
             .iter()
@@ -982,40 +1001,89 @@ mod tests {
     }
 
     #[test]
-    fn test_update_defers_calendar_signed_attendees() {
-        // Invite data may live in the CALENDAR signed card, not shared —
-        // the guard must scan both (live 2011 lesson).
+    fn test_update_preserves_attendee_tokens() {
+        // Attendee data is now SAFE (not deferred): cards reseal verbatim
+        // and clear token rows re-send verbatim — wiping them would destroy
+        // server-side RSVP state. Only PersonalEvents still defers.
         let mut fx = update_fixture();
         fx.row.CalendarEvents[0].Data += "\r\nATTENDEE:mailto:a@b.c";
+        fx.row.Attendees = vec![crate::AttendeeToken {
+            Token: "tok-1".into(),
+            Status: 3,
+        }];
         let fields = LocalFields {
             summary: Some("x".into()),
             ..Default::default()
         };
-        assert!(
-            build_update_body(&fx.row, &fields, &mut [fx.cal], &mut [fx.addr])
-                .unwrap()
-                .is_none()
+        let body = build_update_body(
+            &fx.row,
+            &fields,
+            None,
+            std::slice::from_mut(&mut fx.cal),
+            std::slice::from_mut(&mut fx.addr),
+        )
+        .unwrap()
+        .expect("attendee rows proceed");
+        assert_eq!(
+            body.Attendees,
+            serde_json::json!([{"Token": "tok-1", "Status": 3, "Comment": null}])
         );
     }
 
     #[test]
-    fn test_update_defers_attendees_and_personal() {
+    fn test_update_overrides_notifications_and_color() {
         let mut fx = update_fixture();
-        // Attendee identity in a signed card → clear RSVP rows at risk.
-        fx.row.SharedEvents[0].Data += "\r\nATTENDEE:mailto:a@b.c";
+        // Row carries one custom reminder; override replaces it, null
+        // forces inherit, color swaps the row value.
+        let fields = LocalFields::default();
+        let overrides = crate::calendar_write::UpdateOverrides {
+            notifications: Some(Some(vec![
+                serde_json::json!({"Trigger": "-PT1H", "Type": 1}),
+            ])),
+            color: Some("#EC3E7C".into()),
+        };
+        let body = build_update_body(
+            &fx.row,
+            &fields,
+            Some(&overrides),
+            std::slice::from_mut(&mut fx.cal),
+            std::slice::from_mut(&mut fx.addr),
+        )
+        .unwrap()
+        .expect("overrides seal");
+        assert_eq!(
+            body.Notifications,
+            serde_json::json!([{"Trigger": "-PT1H", "Type": 1}])
+        );
+        assert_eq!(body.Color, serde_json::json!("#EC3E7C"));
+        let null_over = crate::calendar_write::UpdateOverrides {
+            notifications: Some(None),
+            color: None,
+        };
+        let body2 = build_update_body(
+            &fx.row,
+            &fields,
+            Some(&null_over),
+            std::slice::from_mut(&mut fx.cal),
+            std::slice::from_mut(&mut fx.addr),
+        )
+        .unwrap()
+        .expect("null override seals");
+        assert_eq!(body2.Notifications, serde_json::Value::Null);
+        // No overrides → verbatim row values (prove with the fixture's row).
+        assert_eq!(
+            fx.row.Notifications,
+            Some(vec![serde_json::json!({"Trigger": "-PT15M", "Type": 1})])
+        );
+    }
+
+    #[test]
+    fn test_update_defers_personal_events() {
+        // PersonalEvents card → never decrypted, must not drop.
         let fields = LocalFields {
             summary: Some("x".into()),
             ..Default::default()
         };
-        assert!(build_update_body(
-            &fx.row,
-            &fields,
-            std::slice::from_mut(&mut fx.cal),
-            std::slice::from_mut(&mut fx.addr)
-        )
-        .unwrap()
-        .is_none());
-        // PersonalEvents card → never decrypted, must not drop.
         let mut fx2 = update_fixture();
         fx2.row.PersonalEvents = vec![CalendarEventPart {
             MemberID: String::new(),
@@ -1025,7 +1093,7 @@ mod tests {
             Author: String::new(),
         }];
         assert!(
-            build_update_body(&fx2.row, &fields, &mut [fx2.cal], &mut [fx2.addr])
+            build_update_body(&fx2.row, &fields, None, &mut [fx2.cal], &mut [fx2.addr])
                 .unwrap()
                 .is_none()
         );
@@ -1047,6 +1115,8 @@ mod tests {
             all_day: Some(false),
             rrule: None,
             has_recurrence: false,
+            notifications: None,
+            color: None,
         };
         let body = build_create_body(
             &fields,

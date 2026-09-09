@@ -2,6 +2,7 @@ pub mod auth;
 pub mod calendar;
 pub mod calendar_seal;
 pub mod calendar_write;
+pub mod contact_seal;
 pub mod contacts;
 pub mod crypto;
 pub mod diag;

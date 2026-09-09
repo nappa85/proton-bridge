@@ -28,6 +28,19 @@ impl ContactsClient {
         }
     }
 
+    pub fn new_with_base_url(base_url: String, access_token: String, uid: String) -> Self {
+        Self {
+            client: Client::builder()
+                .timeout(Duration::from_secs(60))
+                .user_agent("curl/8.0")
+                .build()
+                .expect("HTTP client"),
+            base_url,
+            access_token,
+            uid,
+        }
+    }
+
     fn auth_header(&self) -> String {
         format!("Bearer {}", self.access_token)
     }

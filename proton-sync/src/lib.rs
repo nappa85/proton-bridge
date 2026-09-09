@@ -4,6 +4,7 @@
 pub mod calendar;
 pub mod calendar_full;
 pub mod config;
+pub mod contact_plan;
 pub mod engine;
 pub mod status;
 pub mod upsync;

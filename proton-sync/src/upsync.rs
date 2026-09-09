@@ -60,6 +60,11 @@ pub struct LocalItem {
     /// notebook UID; needed to route creates, which have no server row).
     #[serde(default)]
     pub calendar_id: Option<String>,
+    /// Raw iCal UID (prefix/suffix stripped from the stored UID) for
+    /// tombstones: lets the engine UID-list rows the windowed listing
+    /// missed (out-of-window deletes). Live rows don't need it.
+    #[serde(default)]
+    pub uid: Option<String>,
 }
 
 /// One upload operation (phase 1), in plan order.
@@ -390,6 +395,7 @@ mod tests {
             last_synced_mtime: anchor,
             fields: None,
             calendar_id: None,
+            uid: None,
         }
     }
 

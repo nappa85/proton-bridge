@@ -396,14 +396,99 @@ impl CalendarSyncEngine {
         cal_keys
     }
 
-    /// Upsync upload phase (phase 1 of `SyncCycle::ORDER`). Plans from the
-    /// shim-fed inventory + listed rows, executes create/update/delete
-    /// batches per calendar (fail-closed), refreshes `fetched` for affected
-    /// calendars (deletes filter locally; creates/updates re-list to pick
-    /// up server echoes), and records purgeable/conflicts/anchors for the
-    /// shim getters. Unsealable rows defer (log + skip, never fail the
-    /// phase). Without a fed inventory the plan is empty and this is a
-    /// no-op.
+    /// Resolve reminder/color overrides for one update from phone fields.
+    /// Returns `None` when the phone sent neither (verbatim re-send).
+    /// - color: validated palette hex; `""` reverts to the calendar's own
+    ///   member color (web-client behavior); off-palette keeps server.
+    /// - notifications: phone display alarms merged with the row's
+    ///   server-sent (Type 0) entries; when the merged set equals the
+    ///   effective calendar defaults, force inherit (`null`) instead of
+    ///   materializing copies. Unknown defaults (no live, no cache) fall
+    ///   back to verbatim — never alter what we can't evaluate.
+    fn update_overrides(
+        row: &CalendarEvent,
+        fields: &proton_api::LocalFields,
+        live_settings: Option<&proton_api::CalendarSettings>,
+        cached: Option<&crate::config::CalendarDefaults>,
+        member_color: &str,
+    ) -> Option<proton_api::calendar_write::UpdateOverrides> {
+        use proton_api::calendar_write::UpdateOverrides;
+        let color = match fields.color.as_deref() {
+            None => None,
+            Some("") => proton_api::resolve_color(member_color).ok(),
+            Some(hex) => proton_api::resolve_color(hex).ok(),
+        };
+        let notifications: Option<Option<Vec<serde_json::Value>>> =
+            match fields.notifications.as_ref() {
+                None => None,
+                Some(phone) => {
+                    let display: Vec<serde_json::Value> = phone
+                        .iter()
+                        .filter(|v| v.get("Type").and_then(|t| t.as_i64()) != Some(0))
+                        .cloned()
+                        .collect();
+                    let email: Vec<serde_json::Value> = row
+                        .Notifications
+                        .as_deref()
+                        .unwrap_or(&[])
+                        .iter()
+                        .filter(|v| v.get("Type").and_then(|t| t.as_i64()) == Some(0))
+                        .cloned()
+                        .collect();
+                    let full_day = row.FullDay.unwrap_or(false);
+                    let live_list = live_settings.and_then(|s| {
+                        if full_day {
+                            s.DefaultFullDayNotifications.as_ref()
+                        } else {
+                            s.DefaultPartDayNotifications.as_ref()
+                        }
+                    });
+                    let cached_list: Option<&[proton_api::CalNotification]> = cached.map(|c| {
+                        if full_day {
+                            c.full.as_slice()
+                        } else {
+                            c.part.as_slice()
+                        }
+                    });
+                    let known = live_list.is_some() || cached_list.is_some_and(|l| !l.is_empty());
+                    if !known {
+                        return color.map(|color| UpdateOverrides {
+                            notifications: None,
+                            color: Some(color),
+                        });
+                    }
+                    let mut default_offsets = std::collections::HashSet::new();
+                    if let Some(list) = live_list {
+                        default_offsets.extend(
+                            Self::parse_notification_list(list)
+                                .into_iter()
+                                .map(|n| n.offset_secs),
+                        );
+                    } else if let Some(list) = cached_list {
+                        default_offsets.extend(list.iter().map(|n| n.offset_secs));
+                    }
+                    let phone_offsets: std::collections::HashSet<i64> = display
+                        .iter()
+                        .filter_map(|v| v.get("Trigger").and_then(|t| t.as_str()))
+                        .filter_map(proton_api::parse_notification_trigger)
+                        .collect();
+                    Some(if phone_offsets == default_offsets {
+                        None
+                    } else {
+                        let mut merged = email;
+                        merged.extend(display);
+                        Some(merged)
+                    })
+                }
+            };
+        match (notifications, color) {
+            (None, None) => None,
+            (notifications, color) => Some(UpdateOverrides {
+                notifications,
+                color,
+            }),
+        }
+    }
     /// PUT one batch, mapping transport + per-op failures to a fail-closed
     /// engine error (the caller aborts before any download/apply).
     fn put_batch(
@@ -436,6 +521,13 @@ impl CalendarSyncEngine {
         Ok(())
     }
 
+    /// Upsync upload phase (phase 1 of `SyncCycle::ORDER`). Plans from the
+    /// shim-fed inventory + listed rows, executes create/update/delete
+    /// batches per calendar (fail-closed), reconciles `fetched` (deletes
+    /// filter locally; creates/updates re-list for fresh server truth),
+    /// and records purgeable/conflicts/anchors for the shim getters.
+    /// Unsealable rows defer (log + skip, never fail the phase). Without
+    /// a fed inventory the plan is empty and this is a no-op.
     fn run_upload_phase(
         &self,
         config: &SyncConfig,
@@ -445,6 +537,45 @@ impl CalendarSyncEngine {
         fetched: &mut [(proton_api::Calendar, Vec<CalendarEvent>)],
     ) -> Result<(), proton_api::ProtonError> {
         let inventory = config.local_inventory.clone().unwrap_or_default();
+        // Out-of-window tombstone resolution: the windowed listing only
+        // covers 2 years, so a tombstone whose ID is missing may still
+        // exist server-side. UID-list it (server-side filter, no window)
+        // and merge hits into `fetched` so the planner below sees them.
+        // Without a UID there is nothing to query by — planner skips.
+        if !inventory.is_empty() {
+            let listed: HashSet<String> = fetched
+                .iter()
+                .flat_map(|(_, evs)| evs.iter().map(|e| e.ID.clone()))
+                .collect();
+            for item in inventory.iter().filter(|i| {
+                i.deleted
+                    && i.uid.as_deref().is_some_and(|u| !u.is_empty())
+                    && i.proton_id
+                        .as_deref()
+                        .is_some_and(|pid| !listed.contains(pid))
+            }) {
+                let (Some(pid), Some(ruid)) = (item.proton_id.as_ref(), item.uid.as_ref()) else {
+                    continue;
+                };
+                for (cal, events) in fetched.iter_mut() {
+                    if events.iter().any(|e| &e.ID == pid) {
+                        break;
+                    }
+                    match cal_client.list_by_uid(&cal.ID, ruid) {
+                        Ok(mut found) if !found.is_empty() => {
+                            self.set_debug(format!(
+                                "upsync_uid cal={} uid-rows={}",
+                                &cal.ID[..8.min(cal.ID.len())],
+                                found.len()
+                            ));
+                            events.append(&mut found);
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
         let all_rows: Vec<CalendarEvent> = fetched
             .iter()
             .flat_map(|(_, evs)| evs.iter().cloned())
@@ -605,11 +736,34 @@ impl CalendarSyncEngine {
                         continue;
                     }
                 };
+                let live_settings = bootstrap.Settings.as_ref();
+                let cached = config
+                    .calendar_defaults
+                    .as_ref()
+                    .and_then(|m| m.get(&cal.ID));
+                let member_color = bootstrap
+                    .Members
+                    .iter()
+                    .find_map(|m| (!m.Color.is_empty()).then(|| m.Color.clone()))
+                    .unwrap_or_default();
+                let overrides =
+                    Self::update_overrides(&fresh, fields, live_settings, cached, &member_color);
+                // Author-matched signing key (multi-address refinement);
+                // falls back to the whole address range. The narrowed slice
+                // also scopes decrypt-fallback to the author's key — the
+                // common case for passphrase-encrypted member cards.
+                let sign_range = signing_index(&keys.address_emails, &fresh.Author)
+                    .filter(|i| *i < keys.address_only().len())
+                    .map(|i| (i, i + 1));
+                let addr_all = keys.address_only();
+                let (lo, hi) = sign_range.unwrap_or((0, addr_all.len()));
+                let sign_keys = &mut addr_all[lo..hi];
                 match proton_api::calendar_seal::build_update_body(
                     &fresh,
                     fields,
+                    overrides.as_ref(),
                     &mut cal_keys,
-                    keys.address_only(),
+                    sign_keys,
                 ) {
                     Ok(Some(body)) => sealed.push((proton_id.clone(), body)),
                     Ok(None) => {
@@ -870,6 +1024,7 @@ impl CalendarSyncEngine {
         };
         let addresses = keys_client.get_addresses().unwrap_or_default();
         let mut unlocked: Vec<UnlockedKey> = Vec::new();
+        let mut address_emails: Vec<String> = Vec::new();
         let mut debug_parts: Vec<String> = Vec::new();
         debug_parts.push(format!(
             "derived_keys={}",
@@ -933,6 +1088,7 @@ impl CalendarSyncEngine {
                             debug_parts
                                 .push(format!("a_{}_tok_ok", &key.ID[..8.min(key.ID.len())]));
                             unlocked.push(ak);
+                            address_emails.push(addr.Email.clone());
                             continue;
                         }
                     }
@@ -947,6 +1103,7 @@ impl CalendarSyncEngine {
                         Ok(ak) => {
                             debug_parts.push(format!("a_{}_{src}", &key.ID[..8.min(key.ID.len())]));
                             unlocked.push(ak);
+                            address_emails.push(addr.Email.clone());
                         }
                         Err(_) => {
                             debug_parts.push(format!(
@@ -966,6 +1123,7 @@ impl CalendarSyncEngine {
         Ok(UnlockedAddressKeys {
             keys: unlocked,
             address_start,
+            address_emails,
         })
     }
 
@@ -1044,6 +1202,9 @@ impl CalendarSyncEngine {
 pub struct UnlockedAddressKeys {
     keys: Vec<UnlockedKey>,
     address_start: usize,
+    /// Account address emails parallel to `address_only` (one entry per
+    /// pushed address key) for author-matched signing.
+    address_emails: Vec<String>,
 }
 
 impl UnlockedAddressKeys {
@@ -1055,6 +1216,30 @@ impl UnlockedAddressKeys {
         let start = self.address_start.min(self.keys.len());
         &mut self.keys[start..]
     }
+}
+
+/// Signing-key index into the address-only slice for `author` (a row
+/// `Author` value of undocumented shape — email or display text):
+/// case-insensitive exact email match, else contains-match either way,
+/// else `None` (caller falls back to the whole range = first address key).
+/// Multi-address refinement; single-address accounts always hit index 0.
+fn signing_index(address_emails: &[String], author: &str) -> Option<usize> {
+    let author = author.trim();
+    if author.is_empty() {
+        return None;
+    }
+    if let Some(i) = address_emails
+        .iter()
+        .position(|e| e.eq_ignore_ascii_case(author))
+    {
+        return Some(i);
+    }
+    address_emails.iter().position(|e| {
+        let e = e.trim();
+        !e.is_empty()
+            && (author.to_lowercase().contains(&e.to_lowercase())
+                || e.to_lowercase().contains(&author.to_lowercase()))
+    })
 }
 
 fn pick_member_id(members: &[proton_api::CalendarMember], _username: &str) -> Option<String> {
@@ -1420,6 +1605,7 @@ mod tests {
                 last_synced_mtime: Some(100),
                 fields: None,
                 calendar_id: None,
+                uid: None,
             },
             crate::upsync::LocalItem {
                 mkcal_uid: "n9".into(),
@@ -1429,6 +1615,7 @@ mod tests {
                 last_synced_mtime: Some(50),
                 fields: None,
                 calendar_id: None,
+                uid: None,
             },
         ]);
         let mut anchors = std::collections::HashMap::new();
@@ -1619,6 +1806,7 @@ mod tests {
                     ..Default::default()
                 }),
                 calendar_id: Some("cal1".into()),
+                uid: None,
             },
             crate::upsync::LocalItem {
                 mkcal_uid: "n9".into(),
@@ -1628,6 +1816,7 @@ mod tests {
                 last_synced_mtime: Some(50),
                 fields: None,
                 calendar_id: Some("cal1".into()),
+                uid: None,
             },
         ]);
         let mut anchors = std::collections::HashMap::new();
@@ -1702,6 +1891,224 @@ mod tests {
         assert_eq!(keys.keys.len(), 2);
         assert_eq!(keys.address_start, 1);
         assert_eq!(keys.keys.len() - keys.address_start, 1);
+        let _held = guards;
+    }
+
+    #[test]
+    fn test_signing_index_matches_author() {
+        let emails = vec!["a@x.y".to_string(), "b@x.y".to_string()];
+        assert_eq!(signing_index(&emails, "b@x.y"), Some(1));
+        assert_eq!(signing_index(&emails, "B@X.Y"), Some(1));
+        assert_eq!(signing_index(&emails, "Bob <b@x.y>"), Some(1));
+        assert_eq!(signing_index(&emails, "nobody@z"), None);
+        assert_eq!(signing_index(&emails, ""), None);
+        assert_eq!(signing_index(&[], "b@x.y"), None);
+    }
+
+    fn timed_settings() -> proton_api::CalendarSettings {
+        proton_api::CalendarSettings {
+            DefaultPartDayNotifications: Some(
+                serde_json::from_str::<Vec<serde_json::Value>>(
+                    r#"[{"Type":1,"Trigger":"-PT15M"}]"#,
+                )
+                .unwrap(),
+            ),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_overrides_defaults_to_verbatim() {
+        let row = CalendarEvent {
+            ..Default::default()
+        };
+        let fields = proton_api::LocalFields::default();
+        assert!(CalendarSyncEngine::update_overrides(&row, &fields, None, None, "").is_none());
+    }
+
+    #[test]
+    fn test_overrides_inherit_when_matching_defaults() {
+        // Phone shows materialized defaults after a title-only edit →
+        // force inherit (null) instead of persisting copies.
+        let row = CalendarEvent {
+            FullDay: Some(false),
+            ..Default::default()
+        };
+        let fields = proton_api::LocalFields {
+            notifications: Some(vec![serde_json::json!({"Trigger": "-PT15M", "Type": 1})]),
+            ..Default::default()
+        };
+        let out =
+            CalendarSyncEngine::update_overrides(&row, &fields, Some(&timed_settings()), None, "")
+                .expect("override computed");
+        assert_eq!(out.notifications, Some(None));
+        assert_eq!(out.color, None);
+    }
+
+    #[test]
+    fn test_overrides_merge_email_and_explicit() {
+        // Custom phone alarm + server-sent email entry merge; color validates.
+        let row = CalendarEvent {
+            FullDay: Some(false),
+            Notifications: Some(vec![serde_json::json!({"Trigger": "-P1D", "Type": 0})]),
+            ..Default::default()
+        };
+        let fields = proton_api::LocalFields {
+            notifications: Some(vec![serde_json::json!({"Trigger": "-PT1H", "Type": 1})]),
+            color: Some("#EC3E7C".into()),
+            ..Default::default()
+        };
+        let out =
+            CalendarSyncEngine::update_overrides(&row, &fields, Some(&timed_settings()), None, "")
+                .expect("override computed");
+        let list = out.notifications.expect("array").expect("not null");
+        assert_eq!(list.len(), 2); // email kept + custom display
+        assert_eq!(out.color.as_deref(), Some("#EC3E7C"));
+    }
+
+    #[test]
+    fn test_overrides_unknown_defaults_stay_verbatim() {
+        // No live settings, no cache: never alter what we can't evaluate.
+        let row = CalendarEvent {
+            ..Default::default()
+        };
+        let fields = proton_api::LocalFields {
+            notifications: Some(vec![serde_json::json!({"Trigger": "-PT1H", "Type": 1})]),
+            color: Some("not-a-color".into()),
+            ..Default::default()
+        };
+        // Unknown defaults + invalid color: nothing resolvable → None
+        // (verbatim re-send of the row values).
+        assert!(CalendarSyncEngine::update_overrides(&row, &fields, None, None, "").is_none());
+    }
+
+    #[test]
+    fn test_overrides_empty_color_reverts_to_member() {
+        let row = CalendarEvent {
+            ..Default::default()
+        };
+        let fields = proton_api::LocalFields {
+            color: Some(String::new()),
+            ..Default::default()
+        };
+        let out = CalendarSyncEngine::update_overrides(&row, &fields, None, None, "#EC3E7C")
+            .expect("override computed");
+        assert_eq!(out.color.as_deref(), Some("#EC3E7C"));
+    }
+
+    #[test]
+    fn test_uid_augment_resolves_out_of_window_tombstone() {
+        // Tombstone whose ID missed the windowed listing but carries a UID:
+        // the engine UID-lists it, merges the hit, and the delete PUT fires.
+        // Without the UID query the planner would (safely) skip the upload.
+        let mut server = mockito::Server::new();
+        let mut guards = Vec::new();
+        macro_rules! mock_get {
+            ($re:expr, $code:expr, $body:expr) => {
+                guards.push(
+                    server
+                        .mock("GET", mockito::Matcher::Regex($re.into()))
+                        .with_status($code)
+                        .with_header("content-type", "application/json")
+                        .with_body($body)
+                        .create(),
+                );
+            };
+        }
+        mock_get!(
+            r"/core/v4/users.*",
+            200,
+            r#"{"User":{"ID":"u","Name":"t","Keys":[]}}"#
+        );
+        mock_get!(r"/core/v4/keys/salts.*", 200, r#"{"KeySalts":[]}"#);
+        mock_get!(r"/core/v4/addresses.*", 200, r#"{"Addresses":[]}"#);
+        mock_get!(
+            r"/calendar/v1$",
+            200,
+            r#"{"Code":1000,"Calendars":[{"ID":"cal1","Name":"C"}]}"#
+        );
+        let now = chrono::Utc::now().timestamp();
+        guards.push(
+            server
+                .mock(
+                    "GET",
+                    mockito::Matcher::Regex(r"/calendar/v1/cal1/events.*".into()),
+                )
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                .with_body(format!(
+                    "{{\"Code\":1000,\"Events\":[{{\"ID\":\"e1\",\"UID\":\"u1\",\"CalendarID\":\"cal1\",\"StartTime\":{now},\"EndTime\":{},\"LastEditTime\":100,\"FullDay\":0,\"SharedEvents\":[{{\"Type\":2,\"Data\":\"BEGIN:VEVENT\\nUID:u1\\nSUMMARY:Keep\\nEND:VEVENT\",\"Signature\":\"s\"}}]}}],\"More\":0}}",
+                    now + 3600
+                ))
+                .create(),
+        );
+        // UID fallback route returns the missing row.
+        guards.push(
+            server
+                .mock(
+                    "GET",
+                    mockito::Matcher::Regex(r"/calendar/v1/cal1/events.*".into()),
+                )
+                .match_query(mockito::Matcher::UrlEncoded("UID".into(), "u9".into()))
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                .with_body(format!(
+                    "{{\"Code\":1000,\"Events\":[{{\"ID\":\"e9\",\"UID\":\"u9\",\"CalendarID\":\"cal1\",\"StartTime\":{now},\"EndTime\":{},\"LastEditTime\":50,\"FullDay\":0,\"SharedEvents\":[{{\"Type\":2,\"Data\":\"BEGIN:VEVENT\\nUID:u9\\nSUMMARY:Gone\\nEND:VEVENT\",\"Signature\":\"s\"}}]}}],\"More\":0}}",
+                    now + 3600
+                ))
+                .create(),
+        );
+        mock_get!(r"/calendar/v2/cal1/bootstrap.*", 404, "{}");
+        mock_get!(
+            r"/calendar/v1/cal1/members.*",
+            200,
+            r#"{"Members":[{"ID":"m1","Email":"t@x","Name":"T"}]}"#
+        );
+        mock_get!(r"/calendar/v1/cal1/keys.*", 200, r#"{"Keys":[]}"#);
+        mock_get!(
+            r"/calendar/v1/cal1/passphrase.*",
+            200,
+            r#"{"Passphrase":null}"#
+        );
+        mock_get!(
+            r"/calendar/v1/cal1/settings.*",
+            200,
+            r#"{"Code":1000,"CalendarSettings":{}}"#
+        );
+        let put = server
+            .mock(
+                "PUT",
+                mockito::Matcher::Regex(r"/calendar/v1/cal1/events/sync.*".into()),
+            )
+            .match_body(mockito::Matcher::JsonString(
+                r#"{"MemberID":"m1","Events":[{"ID":"e9"}]}"#.into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"Code":1001,"Responses":[]}"#)
+            .create();
+
+        let mut c = cfg();
+        c.refresh_token = Some("rt".into());
+        c.uid = Some("uid".into());
+        c.access_token = Some("at".into());
+        c.api_base_url = Some(server.url());
+        c.local_inventory = Some(vec![crate::upsync::LocalItem {
+            mkcal_uid: "n9".into(),
+            proton_id: Some("e9".into()),
+            deleted: true,
+            modified: false,
+            last_synced_mtime: Some(50),
+            fields: None,
+            calendar_id: Some("cal1".into()),
+            uid: Some("u9".into()),
+        }]);
+        let mut engine = CalendarSyncEngine::new(c.clone());
+        engine.start_sync(c);
+        assert_eq!(engine.status().state, "complete");
+        put.assert(); // UID hit merged → delete uploaded
+        let purgeable: Vec<String> = serde_json::from_str(&engine.purgeable_json()).unwrap();
+        assert_eq!(purgeable, vec!["n9".to_string()]);
         let _held = guards;
     }
 

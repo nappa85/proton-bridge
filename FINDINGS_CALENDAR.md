@@ -866,9 +866,37 @@ design layer only; nothing uploads yet.
    USER-CONFIRMED on Proton web with correct time; re-sync stable at 21
    (no duplicates). Notebook scoping confirmed: only our
    `proton-calendar-105-*` notebooks feed the planner — other calendars'
-   events are invisible to uploads and untouched by downloads. Calendar
-   upsync (create/update/delete) verified end-to-end; checkbox stays
-   open pending contacts parity + exotic-rule/attendee v1 gaps above.
+   events are invisible to uploads and untouched by downloads.
+   REMINDER UPLOAD VERIFIED LIVE 2026-09-08 (T05 → 1 hour before):
+   `upsync_updated n=1`; web shows ONLY the 1-hour display reminder —
+   inherited 15-min display AND email both correctly gone (custom list
+   replaces inheritance in Proton's model, not merged with it). Phone UI
+   limitation noted: the Calendar app edits a single display alarm; email
+   reminders can never originate from the phone (explicit server-side
+   email entries WOULD be preserved via the Type-0 merge — code-covered,
+   no live case on this account).
+   PHONE UI WALL 2026-09-08: T16 (organizer + 2 attendees, the only
+   attendee event on the account) is fully read-only on the phone
+   (no edit, no reminder change — only whole-event delete). Deleting it
+   as a test was REJECTED: delete ops are ID-only (no cards involved),
+   so an attendee-event delete exercises zero new code paths beyond the
+   already-verified plain delete, while destroying irreplaceable
+   invite-shaped test data. Attendee-safe updates stay offline-verified
+   (decrypt-back + token-preservation tests), which is the right place
+   given the UI wall.
+   COMPLETE-CALENDAR ROUND 2026-09-08 (local only): attendee-safe updates
+   (`Attendees` token rows modeled + re-sent verbatim — RSVP can no longer
+   be wiped; only `PersonalEvents`/undecryptable rows defer), reminder
+   upload (phone alarms merged with row Type-0 entries, defaults-equal →
+   inherit-null, unknown-defaults → verbatim; `""` color reverts to member
+   color), out-of-window deletes (`list_by_uid` + engine augment merging
+   hits pre-plan), author-matched signing (address-email map, lenient
+   match, first-key fallback). Shim exports `notifications`/`color`/`uid`
+   + common-subset RRULE; SDK `moc` + `g++ -c` OK. Workspace 79+3+46 =
+   128 green. Calendar create/update/delete fully live-verified; checkbox
+   stays open pending contacts parity. Remaining known v1 gaps: phone
+   attendee-identity edits (download-wins), exotic-rule phone edits
+   (server keeps rule), multi-address signer is best-match only.
    LIVE 2001 LESSON 2026-09-08 (first update attempt): server rejected
    with `Invalid event data (Provide data signed using the address key)`
    — root cause OUR bug, not crypto format: `unlock_address_keys`

@@ -66,6 +66,8 @@ pub struct SyncEngine {
     keys_debug: Option<String>,
     derived_passwords: Arc<Mutex<Option<std::collections::HashMap<String, String>>>>,
     decrypt_errors: Arc<Mutex<u32>>,
+    contact_conflicts: Arc<Mutex<Vec<crate::contact_plan::ContactConflict>>>,
+    contact_anchors: Arc<Mutex<std::collections::HashMap<String, i64>>>,
 }
 
 impl SyncEngine {
@@ -97,6 +99,8 @@ impl SyncEngine {
             keys_debug: None,
             derived_passwords: Arc::new(Mutex::new(None)),
             decrypt_errors: Arc::new(Mutex::new(0)),
+            contact_conflicts: Arc::new(Mutex::new(Vec::new())),
+            contact_anchors: Arc::new(Mutex::new(std::collections::HashMap::new())),
         }
     }
 
@@ -149,7 +153,7 @@ impl SyncEngine {
             return;
         }
 
-        let unlocked_keys = match self.unlock_keys(&config) {
+        let (mut unlocked_keys, user_end) = match self.unlock_keys(&config) {
             Ok(keys) => keys,
             Err(e) => {
                 eprintln!("Key unlock failed (will sync without decryption): {e}");
@@ -164,6 +168,7 @@ impl SyncEngine {
                 return;
             }
         };
+        let user_end = user_end.min(unlocked_keys.len());
 
         // Notify if no keys could be unlocked but keys were expected – likely password changed or derived map stale
         if unlocked_keys.is_empty() {
@@ -182,6 +187,29 @@ impl SyncEngine {
 
         match self.fetch_contacts() {
             Ok(contacts) => {
+                // Upsync phase 1 (uploads) before download processing.
+                // Fail-closed: Err aborts before any local apply (status
+                // error; uploads retry next cycle).
+                let outcome = match Self::run_contact_upload_phase(
+                    self.contacts_client.as_ref(),
+                    &config,
+                    &mut unlocked_keys,
+                    user_end,
+                    contacts,
+                ) {
+                    Ok(outcome) => outcome,
+                    Err(e) => {
+                        self.set_status(SyncStatus {
+                            state: "error".into(),
+                            error: Some(format!("Contacts upsync upload failed: {e}")),
+                            ..Default::default()
+                        });
+                        return;
+                    }
+                };
+                *self.contact_conflicts.lock().unwrap() = outcome.conflicts;
+                *self.contact_anchors.lock().unwrap() = outcome.anchors;
+                let contacts = outcome.contacts;
                 let total = contacts.len() as u32;
 
                 let mut unlocked_keys_mut = unlocked_keys;
@@ -380,26 +408,35 @@ impl SyncEngine {
         }
     }
 
+    /// Unlock user + address keys. Returns the keys with the USER-key
+    /// prefix length: contact sealing encrypts/signs with user keys
+    /// (`keys[..user_end]`, WebClients import flow), while decryption tries
+    /// everything.
     fn unlock_keys(
         &mut self,
         config: &SyncConfig,
-    ) -> Result<Vec<UnlockedKey>, proton_api::ProtonError> {
+    ) -> Result<(Vec<UnlockedKey>, usize), proton_api::ProtonError> {
         let access_token = match &self.access_token {
             Some(t) => t.clone(),
             None => {
                 self.keys_debug = Some("no_access_token".into());
-                return Ok(Vec::new());
+                return Ok((Vec::new(), 0));
             }
         };
         let uid = match &self.uid {
             Some(u) => u.clone(),
             None => {
                 self.keys_debug = Some("no_uid".into());
-                return Ok(Vec::new());
+                return Ok((Vec::new(), 0));
             }
         };
 
-        let keys_client = KeysClient::new(access_token, uid);
+        let keys_client = match &config.api_base_url {
+            Some(base) if !base.is_empty() => {
+                KeysClient::new_with_base_url(base.clone(), access_token, uid)
+            }
+            _ => KeysClient::new(access_token, uid),
+        };
 
         let user = match keys_client.get_user() {
             Ok(u) => u,
@@ -510,6 +547,7 @@ impl SyncEngine {
             }
         }
 
+        let user_end = unlocked_keys.len();
         for addr in &addresses {
             for key in &addr.Keys {
                 if key.PrivateKey.is_empty() {
@@ -626,7 +664,7 @@ impl SyncEngine {
         if !derived_map.is_empty() {
             *self.derived_passwords.lock().unwrap() = Some(derived_map);
         }
-        Ok(unlocked_keys)
+        Ok((unlocked_keys, user_end))
     }
 
     /// Decrypt an address-key Token with any unlocked user key.
@@ -697,7 +735,7 @@ impl SyncEngine {
                     drop(tm);
                     self.access_token = Some(token.clone());
                     self.uid = Some(uid.clone());
-                    self.contacts_client = Some(ContactsClient::new(token, uid));
+                    self.contacts_client = Some(Self::contacts_client_for(config, token, uid));
                     return Ok(());
                 }
                 Err(_) => {
@@ -741,8 +779,252 @@ impl SyncEngine {
 
         self.access_token = Some(access_token.clone());
         self.uid = Some(uid.clone());
-        self.contacts_client = Some(ContactsClient::new(access_token, uid));
+        self.contacts_client = Some(Self::contacts_client_for(config, access_token, uid));
         Ok(())
+    }
+
+    fn contacts_client_for(
+        config: &SyncConfig,
+        access_token: String,
+        uid: String,
+    ) -> ContactsClient {
+        match &config.api_base_url {
+            Some(base) if !base.is_empty() => {
+                ContactsClient::new_with_base_url(base.clone(), access_token, uid)
+            }
+            _ => ContactsClient::new(access_token, uid),
+        }
+    }
+}
+
+/// Outcome of the contacts upload phase: reconciled server rows plus
+/// shim outputs (conflicts to notify, anchors to persist).
+// (Second `impl SyncEngine` block below holds the upload phase; multiple
+// inherent impl blocks are legal Rust and keep the diff reviewable.)
+pub struct ContactUploadOutcome {
+    pub contacts: Vec<proton_api::Contact>,
+    pub conflicts: Vec<crate::contact_plan::ContactConflict>,
+    pub anchors: std::collections::HashMap<String, i64>,
+}
+
+/// Fail-closed engine error for one upload batch kind.
+fn contact_api_err(what: &str, e: impl std::fmt::Display) -> proton_api::ProtonError {
+    proton_api::ProtonError::Api {
+        code: 0,
+        message: format!("contacts upsync {what} upload failed: {e}"),
+    }
+}
+
+/// Per-op codes of a batch create must ALL succeed (fail-closed otherwise).
+fn check_create_response(
+    resp: &proton_api::CreateContactsResponse,
+) -> Result<(), proton_api::ProtonError> {
+    for entry in &resp.Responses {
+        if entry.Response.Code != 1000 {
+            return Err(proton_api::ProtonError::Api {
+                code: 0,
+                message: format!(
+                    "contacts upsync create upload failed: code {} {}",
+                    entry.Response.Code,
+                    entry.Response.Error.as_deref().unwrap_or("")
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+impl SyncEngine {
+    /// Upsync upload phase for contacts (phase 1). Plans from the
+    /// shim-fed inventory + listed rows + known-UID map, executes creates
+    /// (chunked ≤10, the web-client batch limit), updates (rebuilt cards),
+    /// deletes (single batch call), then re-lists when anything uploaded
+    /// (fresh server truth incl. new IDs; fail-closed on error). Without a
+    /// fed inventory the plan is empty and the input returns untouched.
+    /// Unsealable rows defer (log + skip, never fail the phase).
+    fn run_contact_upload_phase(
+        client: Option<&ContactsClient>,
+        config: &SyncConfig,
+        unlocked_keys: &mut [UnlockedKey],
+        user_end: usize,
+        contacts: Vec<proton_api::Contact>,
+    ) -> Result<ContactUploadOutcome, proton_api::ProtonError> {
+        use crate::contact_plan as cp;
+        let inventory = config.contact_inventory.clone().unwrap_or_default();
+        let known: std::collections::HashSet<String> =
+            config.contact_known_uids.clone().unwrap_or_default();
+        let local_uids: std::collections::HashSet<String> = inventory
+            .iter()
+            .filter_map(|item| item.proton_uid.clone())
+            .collect();
+        let anchors = cp::merge_contact_anchors(
+            config
+                .contact_anchors
+                .as_ref()
+                .unwrap_or(&std::collections::HashMap::new()),
+            &contacts,
+            &local_uids,
+        );
+        if inventory.is_empty() && known.is_empty() {
+            return Ok(ContactUploadOutcome {
+                contacts,
+                conflicts: Vec::new(),
+                anchors,
+            });
+        }
+        let client = client
+            .ok_or_else(|| proton_api::ProtonError::Auth("No contacts client for upload".into()))?;
+        let plan = cp::plan_contacts(&contacts, &inventory, &known);
+        let items: std::collections::HashMap<&str, &cp::ContactItem> = inventory
+            .iter()
+            .map(|item| (item.qcontact_id.as_str(), item))
+            .collect();
+        let rows: std::collections::HashMap<&str, &proton_api::Contact> =
+            contacts.iter().map(|c| (c.UID.as_str(), c)).collect();
+        let user_len = user_end.min(unlocked_keys.len());
+        let user_keys = &mut unlocked_keys[..user_len];
+        let mut content_changed = false;
+        let mut deferred = 0u32;
+        // Creates first (fresh UIDs; chunked ≤10 per the web batch limit).
+        let mut create_jobs: Vec<(String, proton_api::vcard::ParsedContact)> = Vec::new();
+        for op in plan.uploads.iter().filter_map(|op| match op {
+            cp::ContactUploadOp::Create { qcontact_id } => Some(qcontact_id),
+            _ => None,
+        }) {
+            match items.get(op.as_str()).and_then(|item| item.fields.clone()) {
+                Some(fields) => create_jobs.push((op.clone(), fields)),
+                None => {
+                    deferred += 1;
+                    eprintln!("upsync_deferred contact create {op} no-fields");
+                }
+            }
+        }
+        for chunk in create_jobs.chunks(10) {
+            let mut cards_batch = Vec::with_capacity(chunk.len());
+            for (_, fields) in chunk {
+                let nanos = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0);
+                let fresh_uid = format!("proton-sync-contact-{nanos}");
+                match proton_api::contact_seal::build_contact_create_cards(
+                    fields, &fresh_uid, user_keys,
+                ) {
+                    Ok(Some(cards)) => cards_batch.push(cards),
+                    Ok(None) => {
+                        deferred += 1;
+                        eprintln!("upsync_deferred contact create unsealable");
+                    }
+                    Err(e) => {
+                        deferred += 1;
+                        eprintln!("upsync_deferred contact create: {e}");
+                    }
+                }
+            }
+            if cards_batch.is_empty() {
+                continue;
+            }
+            let resp = client
+                .create(proton_api::CreateContactsRequest {
+                    Contacts: cards_batch,
+                    Overwrite: 0,
+                    Labels: 0,
+                })
+                .map_err(|e| contact_api_err("create", e))?;
+            check_create_response(&resp)?;
+            content_changed = true;
+            eprintln!("upsync_created contacts n={}", resp.Responses.len());
+        }
+        // Updates: rebuild from listed rows + phone snapshots.
+        let mut updated = 0u32;
+        for op in plan.uploads.iter().filter_map(|op| match op {
+            cp::ContactUploadOp::Update { proton_uid } => Some(proton_uid),
+            _ => None,
+        }) {
+            let (Some(row), Some(fields)) = (
+                rows.get(op.as_str()),
+                items
+                    .values()
+                    .find_map(|item| {
+                        (item.proton_uid.as_deref() == Some(op.as_str()))
+                            .then_some(item.fields.as_ref())
+                    })
+                    .flatten(),
+            ) else {
+                deferred += 1;
+                eprintln!("upsync_deferred contact update {op} no-row-or-fields");
+                continue;
+            };
+            let cards = row.Cards.clone().unwrap_or_default();
+            match proton_api::contact_seal::build_contact_update_cards(
+                &cards, fields, &row.UID, user_keys,
+            ) {
+                Ok(Some(sealed)) => {
+                    client
+                        .update(&row.ID, proton_api::UpdateContactRequest { Cards: sealed })
+                        .map_err(|e| contact_api_err("update", e))?;
+                    updated += 1;
+                }
+                Ok(None) => {
+                    deferred += 1;
+                    eprintln!("upsync_deferred contact update {op} unsealable");
+                }
+                Err(e) => {
+                    deferred += 1;
+                    eprintln!("upsync_deferred contact update {op}: {e}");
+                }
+            }
+        }
+        if updated > 0 {
+            content_changed = true;
+            eprintln!("upsync_updated contacts n={updated}");
+        }
+        // Deletes: single batch call (IDs resolved from the listing),
+        // filtered locally afterwards (exact IDs known — no re-list).
+        let delete_ids: Vec<String> = plan
+            .uploads
+            .iter()
+            .filter_map(|op| match op {
+                cp::ContactUploadOp::Delete { proton_uid } => {
+                    rows.get(proton_uid.as_str()).map(|row| row.ID.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        let mut contacts = contacts;
+        if !delete_ids.is_empty() {
+            client
+                .delete(&delete_ids)
+                .map_err(|e| contact_api_err("delete", e))?;
+            eprintln!("upsync_deleted contacts n={}", delete_ids.len());
+            let gone: std::collections::HashSet<String> = delete_ids.into_iter().collect();
+            contacts.retain(|c| !gone.contains(&c.ID));
+        }
+        if deferred > 0 {
+            eprintln!("upsync_deferred contacts total={deferred}");
+        }
+        // Reconcile: re-list only when creates/updates landed (fresh truth
+        // incl. new IDs; fail-closed on error). Deletes already filtered.
+        let contacts = if content_changed {
+            client
+                .list_all()
+                .map_err(|e| contact_api_err("re-list", e))?
+        } else {
+            contacts
+        };
+        let anchors = cp::merge_contact_anchors(
+            config
+                .contact_anchors
+                .as_ref()
+                .unwrap_or(&std::collections::HashMap::new()),
+            &contacts,
+            &local_uids,
+        );
+        Ok(ContactUploadOutcome {
+            contacts,
+            conflicts: plan.conflicts,
+            anchors,
+        })
     }
 
     fn fetch_contacts(&mut self) -> Result<Vec<proton_api::Contact>, proton_api::ProtonError> {
@@ -812,6 +1094,21 @@ impl SyncEngine {
         *self.decrypt_errors.lock().unwrap()
     }
 
+    /// Server-wins contact conflicts this run (`[]` when none).
+    pub fn get_contact_conflicts_json(&self) -> String {
+        serde_json::to_string(&*self.contact_conflicts.lock().unwrap()).unwrap_or_default()
+    }
+
+    /// Merged contact anchors (`{}` when nothing known — caller must not
+    /// overwrite a good cache with it).
+    pub fn get_contact_anchors_json(&self) -> String {
+        let map = self.contact_anchors.lock().unwrap();
+        if map.is_empty() {
+            return String::new();
+        }
+        serde_json::to_string(&*map).unwrap_or_default()
+    }
+
     pub fn get_keys_debug(&self) -> Option<String> {
         self.keys_debug.clone()
     }
@@ -866,5 +1163,238 @@ mod tests {
         let out = SyncEngine::auth_error_status(&current, &err);
         assert_eq!(out.state, "error");
         assert!(out.error.unwrap_or_default().contains("bad password"));
+    }
+
+    fn cycle_cfg(server_url: String) -> SyncConfig {
+        SyncConfig {
+            username: "u".into(),
+            refresh_token: Some("rt".into()),
+            uid: Some("uid".into()),
+            access_token: Some("at".into()),
+            api_base_url: Some(server_url),
+            ..Default::default()
+        }
+    }
+
+    fn mock_key_mocks(server: &mut mockito::Server, guards: &mut Vec<mockito::Mock>) {
+        macro_rules! mock_get {
+            ($re:expr, $code:expr, $body:expr) => {
+                guards.push(
+                    server
+                        .mock("GET", mockito::Matcher::Regex($re.into()))
+                        .with_status($code)
+                        .with_header("content-type", "application/json")
+                        .with_body($body)
+                        .create(),
+                );
+            };
+        }
+        mock_get!(
+            r"/core/v4/users.*",
+            200,
+            r#"{"User":{"ID":"u","Name":"t","Keys":[]}}"#
+        );
+        mock_get!(r"/core/v4/keys/salts.*", 200, r#"{"KeySalts":[]}"#);
+        mock_get!(r"/core/v4/addresses.*", 200, r#"{"Addresses":[]}"#);
+    }
+
+    #[test]
+    fn test_contact_delete_cycle_end_to_end_mock() {
+        // Offline cycle (mockito): known UID missing locally but on server
+        // → batch DELETE → re-list drops it → anchors pruned. No crypto
+        // needed on this path (ID-only ops).
+        let mut server = mockito::Server::new();
+        let mut guards = Vec::new();
+        mock_key_mocks(&mut server, &mut guards);
+        // NOTE: no `$` anchor — mockito matches the regex against
+        // path+query, and the list call carries ?Page=&PageSize=.
+        // Created BEFORE the /c1 mock so the single-contact route (also
+        // matching this pattern) wins by reverse-creation precedence.
+        guards.push(
+            server
+                .mock("GET", mockito::Matcher::Regex(r"/contacts/v4".into()))
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                .with_body(
+                    r#"{"Contacts":[{"ID":"c1","Name":"Gone","UID":"u1","ModifyTime":100}],"Total":1}"#,
+                )
+                .create(),
+        );
+        guards.push(
+            server
+                .mock("GET", mockito::Matcher::Regex(r"/contacts/v4/c1".into()))
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                .with_body(r#"{"Contact":{"ID":"c1","Name":"Gone","UID":"u1","ModifyTime":100}}"#)
+                .create(),
+        );
+        let delete = server
+            .mock("DELETE", mockito::Matcher::Regex(r"/contacts/v4$".into()))
+            .match_body(mockito::Matcher::JsonString(r#"{"IDs":["c1"]}"#.into()))
+            .with_status(200)
+            .with_body("{}")
+            .create();
+
+        let mut c = cycle_cfg(server.url());
+        c.contact_known_uids = Some(["u1".to_string()].into_iter().collect());
+        c.contact_inventory = Some(Vec::new());
+
+        let mut engine = SyncEngine::new(c.clone());
+        engine.start_sync(c);
+        assert_eq!(engine.status().state, "complete");
+        delete.assert();
+        // Re-listed download lacks c1; anchors pruned (gone everywhere).
+        assert_eq!(engine.get_contacts_json(), "[]");
+        assert_eq!(engine.get_contact_anchors_json(), String::new());
+        let _held = guards;
+    }
+
+    /// Fresh unlocked test user key, armored TSK (passwordless).
+    fn armored_test_key() -> (String, String) {
+        use sequoia_openpgp::{cert::CertBuilder, serialize::Serialize};
+        let (cert, _) = CertBuilder::new()
+            .add_signing_subkey()
+            .add_transport_encryption_subkey()
+            .generate()
+            .expect("test key generation");
+        let mut raw = Vec::new();
+        cert.as_tsk()
+            .armored()
+            .export(&mut raw)
+            .expect("test cert armor");
+        let text = String::from_utf8(raw).unwrap();
+        (text.replace('\n', "\\n"), text)
+    }
+
+    #[test]
+    fn test_contact_create_update_cycle_mock() {
+        // Creates seal fresh cards + updates rebuild server cards, all with
+        // REAL generated keys through the password unlock path. PUT/POST
+        // bodies carry randomized ciphertext — asserted by route + the
+        // proton-api decrypt-back tests, not byte-exact here.
+        let (user_esc, user_raw) = armored_test_key();
+        let (addr_esc, _) = armored_test_key();
+        let mut server = mockito::Server::new();
+        let mut guards = Vec::new();
+        macro_rules! mock_get {
+            ($re:expr, $code:expr, $body:expr) => {
+                guards.push(
+                    server
+                        .mock("GET", mockito::Matcher::Regex($re.into()))
+                        .with_status($code)
+                        .with_header("content-type", "application/json")
+                        .with_body($body)
+                        .create(),
+                );
+            };
+        }
+        mock_get!(
+            r"/core/v4/users.*",
+            200,
+            format!(
+                r#"{{"User":{{"ID":"u","Name":"t","Keys":[{{"ID":"k1abcdef01","PrivateKey":"{user_esc}","Token":"","Signature":""}}]}}}}"#
+            )
+        );
+        mock_get!(
+            r"/core/v4/keys/salts.*",
+            200,
+            r#"{"KeySalts":[{"ID":"k1abcdef01","KeySalt":""},{"ID":"ak1abcdef01","KeySalt":""}]}"#
+        );
+        mock_get!(
+            r"/core/v4/addresses.*",
+            200,
+            format!(
+                r#"{{"Addresses":[{{"ID":"a1","Email":"t@x","Keys":[{{"ID":"ak1abcdef01","PrivateKey":"{addr_esc}","Token":"","Signature":""}}]}}]}}"#
+            )
+        );
+        mock_get!(r"/calendar/v1$", 200, r#"{"Code":1000,"Calendars":[]}"#);
+        // Server row to update: signed uid/fn + sealed name card. Sealed
+        // here with the same generated user key the engine will unlock.
+        // Blobs are JSON-escaped (armored PGP contains raw newlines).
+        let mut user_key = proton_api::UnlockedKey::from_armored(&user_raw, b"").unwrap();
+        let (enc_data_raw, enc_sig_raw) = proton_api::contact_seal::seal_contact_card(
+            "BEGIN:VCARD\r\nVERSION:4.0\r\nUID:u1\r\nN:Old;Name;;;\r\nEND:VCARD",
+            std::slice::from_mut(&mut user_key),
+        )
+        .unwrap();
+        let enc_data = enc_data_raw.replace('\n', "\\n");
+        let enc_sig = enc_sig_raw.replace('\n', "\\n");
+        let row_e1 = format!(
+            r#"{{"ID":"c1","Name":"Old","UID":"u1","ModifyTime":100,
+            "Cards":[{{"Type":2,"Data":"BEGIN:VCARD\r\nVERSION:4.0\r\nUID:u1\r\nFN:Old Name\r\nEND:VCARD","Signature":"s"}},
+            {{"Type":3,"Data":"{enc_data}","Signature":"{enc_sig}"}}]}}"#,
+        );
+        guards.push(
+            server
+                .mock("GET", mockito::Matcher::Regex(r"/contacts/v4".into()))
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                .with_body(format!("{{\"Contacts\":[{row_e1}],\"Total\":1}}"))
+                .create(),
+        );
+        guards.push(
+            server
+                .mock("GET", mockito::Matcher::Regex(r"/contacts/v4/c1".into()))
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                .with_body(format!("{{\"Contact\":{row_e1}}}"))
+                .create(),
+        );
+        let post = server
+            .mock(
+                "POST",
+                mockito::Matcher::Regex(r"/contacts/v4".into()),
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"Responses": [{"Index": 0, "Response": {"Code": 1000, "Error": null, "Contact": {"ID": "new1", "Name": "Fresh", "UID": "newu"}}}]}"#,
+            )
+            .create();
+        let put = server
+            .mock("PUT", mockito::Matcher::Regex(r"/contacts/v4/c1".into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"Contact":{"ID":"c1","Name":"Edited","UID":"u1","ModifyTime":101}}"#)
+            .create();
+
+        let fields_upd = proton_api::vcard::ParsedContact {
+            first_name: "Edited".into(),
+            ..Default::default()
+        };
+        let fields_new = proton_api::vcard::ParsedContact {
+            display_name: "Fresh".into(),
+            ..Default::default()
+        };
+        let mut c = cycle_cfg(server.url());
+        // Password + empty salts unlock the generated (unencrypted) keys
+        // via the plain-password fallback, like production derived keys.
+        c.password = "testpw".into();
+        c.contact_inventory = Some(vec![
+            crate::contact_plan::ContactItem {
+                qcontact_id: "q1".into(),
+                proton_uid: Some("u1".into()),
+                modified: true,
+                last_synced_mtime: Some(100),
+                fields: Some(fields_upd),
+            },
+            crate::contact_plan::ContactItem {
+                qcontact_id: "q2".into(),
+                proton_uid: None,
+                modified: true,
+                last_synced_mtime: None,
+                fields: Some(fields_new),
+            },
+        ]);
+        let mut anchors = std::collections::HashMap::new();
+        anchors.insert("u1".to_string(), 100);
+        c.contact_anchors = Some(anchors);
+
+        let mut engine = SyncEngine::new(c.clone());
+        engine.start_sync(c);
+        assert_eq!(engine.status().state, "complete");
+        post.assert();
+        put.assert();
+        let _held = guards;
     }
 }

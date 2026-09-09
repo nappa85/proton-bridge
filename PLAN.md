@@ -92,6 +92,41 @@ Sync (buteo OOPP, proton_bridge_shim.cpp, NoUserInteractionPolicy):
 - **Token-based address keys**: FIXED 2026-09-06 — `Token` is decrypted with
   the unlocked user keys (go-proton-api `Key::Unlock`), verified live on
   device (`addrkey_…_ok_via_token` with `pw_len=0`)
+- [ ] **Contacts upsync** (filed 2026-09-08, after calendar upsync verified
+  end-to-end — follow the same template: inventory/planner/batcher/
+  fail-closed executor/selective handling, but contacts-specific):
+  engine is download-only with full replacement (local creates wiped,
+  edits overwritten, deletes resurrected; `ContactsClient`
+  create/update/delete exist but are never called). Researched 2026-09-08
+  (WebClients `contacts/encrypt.ts` + `ContactImporting.tsx`, authoritative):
+  cards seal with the USER primary keypair (encrypt to user-public, sign
+  with user-private — opposite of calendar's address-key rule); split is
+  Type 2 signed (version/prodid/fn/uid/email/key-fields, uid+fn auto-added)
+  + Type 3 armored (everything else) + Type 0 cleartext (only with
+  categories);   batch create ≤10, rate limit 100 req/10s. Change tracking
+  via Proton-ID↔QContactId map + lastModified snapshots in QSettings
+  (QtContacts has no mKCal-style tombstones; shim already stores Guid +
+  SyncTarget per contact).
+  PROGRESS 2026-09-08: `build_vcard` serializer + WebClients split
+  (signed uid/fn/emails, encrypted rest, no cleartext without categories;
+  FN fallback, 75-octet folding, round-trip tests green); contact seal op
+  DONE (`contact_seal.rs`: whole-message armored encrypt to USER-public +
+  detached sign with USER-private, decrypt-back through the existing read
+  path). Lesson: encryption and signing need DIFFERENT capabilities
+  (ECDH subkey encrypts, EdDSA signs) — every (enc, sign) pair combo is
+  tried, first working wins. PLANNER DONE (`contact_plan.rs`: ID-map
+  diffing for deletes — QtContacts has no tombstones; ModifyTime anchors;
+  server-wins conflicts; 10 offline tests). ENGINE WIRED (creates chunked
+  ≤10 with per-op code checks, update rebuilds with server-photo carry,
+  deletes single-batch + local filter, re-list only for creates/updates,
+  fail-closed; mockito delete + create/update cycles with real generated
+  keys). FFI in/out done. SHIM exports inventory (full field mirror,
+  photos omitted v1) + persists ID map/snapshots/anchors (SDK `moc` +
+  `g++ -c` OK — incl. fixes: `QContactGender::GenderType` has no Other,
+  `QContactUrl::url()` is QString, cbindgen header needs forced rebuild).
+  Found + fixed live: `CreateContactResult.Contact` is NESTED on the wire
+  (WebClients reference), our `#[flatten]` never matched. NEXT: deploy +
+  live gate (scratch contact create → edit → delete).
 - **Two-way sync**: Currently download-only (Proton → phone). No upload of local changes
 - **Incremental sync**: No sync token support; full fetch every time
 - **Contact dedup**: No duplicate detection across Proton + local contacts

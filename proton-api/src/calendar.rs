@@ -453,6 +453,44 @@ impl CalendarClient {
         self.list_all_events_untyped(cal_id, start, end)
     }
 
+    /// Server-side UID filter: all rows sharing one iCal UID (master +
+    /// exception rows), `More`-paginated (proton-cal `GetByUID`). No window
+    /// params — independent of `Type`. Used by upsync to resolve tombstones
+    /// the windowed listing missed (out-of-window deletes).
+    pub fn list_by_uid(&self, cal_id: &str, uid: &str) -> Result<Vec<CalendarEvent>> {
+        let mut out = Vec::new();
+        let mut page = 0u32;
+        loop {
+            let params = vec![
+                ("UID", uid.to_string()),
+                ("Page", page.to_string()),
+                ("PageSize", CALENDAR_PAGE_SIZE.to_string()),
+            ];
+            let (status, body) = self.fetch_events_raw(cal_id, &params)?;
+            if status != 200 {
+                return Err(ProtonError::Auth(format!(
+                    "UID events query failed {status}: {}",
+                    body.chars().take(200).collect::<String>()
+                )));
+            }
+            let v: serde_json::Value = serde_json::from_str(&body)?;
+            let (evs, more) = Self::parse_events_envelope(&v, page);
+            let n = evs.len();
+            out.extend(evs);
+            if std::env::var("LIVE_TRACE").is_ok() {
+                eprintln!("trace uid cal={cal_id} page={page} rows={n} more={more}");
+            }
+            if !more {
+                break;
+            }
+            page += 1;
+            if page > 100 {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
     /// Untyped full listing with client-side window filtering.
     /// Recurring masters (RRule present) are always included: per api.md they
     /// must never be window-filtered by their own StartTime/EndTime, which
@@ -1584,6 +1622,41 @@ mod tests {
         assert_eq!(s.DefaultPartDayNotifications.unwrap().len(), 2);
         _v2.assert();
         _settings.assert();
+    }
+
+    #[test]
+    fn test_list_by_uid_pages_and_parses() {
+        // Server-side UID filter (master + exception rows, no window
+        // params): two pages joined via the More cursor.
+        let mut server = mockito::Server::new();
+        let _p0 = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"/calendar/v1/cal1/events.*".into()),
+            )
+            .match_query(mockito::Matcher::UrlEncoded("UID".into(), "u1".into()))
+            .match_query(mockito::Matcher::UrlEncoded("Page".into(), "0".into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"Code":1000,"Events":[{"ID":"e1","UID":"u1"}],"More":1}"#)
+            .create();
+        let _p1 = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"/calendar/v1/cal1/events.*".into()),
+            )
+            .match_query(mockito::Matcher::UrlEncoded("UID".into(), "u1".into()))
+            .match_query(mockito::Matcher::UrlEncoded("Page".into(), "1".into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"Code":1000,"Events":[{"ID":"e2","UID":"u1"}],"More":0}"#)
+            .create();
+        let c = CalendarClient::new_with_base_url(server.url(), "at".into(), "uid".into());
+        let evs = c.list_by_uid("cal1", "u1").unwrap();
+        let ids: Vec<&str> = evs.iter().map(|e| e.ID.as_str()).collect();
+        assert_eq!(ids, vec!["e1", "e2"]);
+        _p0.assert();
+        _p1.assert();
     }
 
     #[test]

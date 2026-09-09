@@ -128,9 +128,10 @@ pub struct AuthTokens {
     pub uid: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Contact {
     pub ID: String,
+    #[serde(default)]
     pub Name: String,
     #[serde(default)]
     pub UID: String,
@@ -222,10 +223,13 @@ pub struct CreateContactResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateContactResult {
-    #[serde(flatten)]
-    pub Contact: Contact,
     pub Code: i32,
     pub Error: Option<String>,
+    /// Echoed contact, nested under its own key (WebClients reference shape;
+    /// absent on per-op failure). NOTE: NOT flattened — an earlier flatten
+    /// layout never matched the wire and was caught by mock tests.
+    #[serde(default)]
+    pub Contact: Option<Contact>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -488,6 +492,21 @@ pub struct CalendarEvent {
     pub IsOrganizer: Option<i64>,
     #[serde(default, deserialize_with = "deserialize_opt_i64")]
     pub Permissions: Option<i64>,
+    /// Clear attendee rows: opaque token + live RSVP status (0 needs-action,
+    /// 1 tentative, 2 declined, 3 accepted). Identities live encrypted in
+    /// the AttendeesEvents card and join by Token (api.md). Re-sent verbatim
+    /// on update — omitting them wipes RSVP state server-side.
+    #[serde(default, deserialize_with = "deserialize_vec_default")]
+    pub Attendees: Vec<AttendeeToken>,
+}
+
+/// One clear attendee row (see `CalendarEvent::Attendees`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AttendeeToken {
+    #[serde(default, deserialize_with = "deserialize_string_default")]
+    pub Token: String,
+    #[serde(default, deserialize_with = "deserialize_i64_default")]
+    pub Status: i64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

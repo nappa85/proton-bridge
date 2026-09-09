@@ -41,4 +41,16 @@ pub struct SyncConfig {
     /// API base override for tests (mockito). `None` = production.
     #[serde(default)]
     pub api_base_url: Option<String>,
+    /// Local contacts inventory for the upsync cycle
+    /// (`contact_plan::ContactItem` JSON). `None` (or empty) =
+    /// download-only, byte-identical behavior to before wiring.
+    #[serde(default)]
+    pub contact_inventory: Option<Vec<crate::contact_plan::ContactItem>>,
+    /// Known Proton contact UIDs (persisted ID-map keys) for delete
+    /// detection via diffing (QtContacts has no tombstones).
+    #[serde(default)]
+    pub contact_known_uids: Option<std::collections::HashSet<String>>,
+    /// Per-UID sync anchors: Proton UID → server `ModifyTime`.
+    #[serde(default)]
+    pub contact_anchors: Option<std::collections::HashMap<String, i64>>,
 }

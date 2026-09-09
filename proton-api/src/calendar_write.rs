@@ -551,6 +551,18 @@ pub struct LocalFields {
     /// keep the server rule, creates defer (never flatten a series).
     #[serde(default)]
     pub has_recurrence: bool,
+    /// Phone reminder state for dirty rows: alarm list as `{Trigger, Type}`
+    /// row-shaped entries (Type 1 display). `None` = untouched (verbatim
+    /// re-send). Explicit `[]` = user cleared all. The engine merges back
+    /// the row's server-sent (Type 0) entries and forces inherit (`null`)
+    /// when the result equals the effective calendar defaults.
+    #[serde(default)]
+    pub notifications: Option<Vec<serde_json::Value>>,
+    /// Phone event color (`#RRGGBB`, `""` when the phone has none set).
+    /// `None` = untouched. Empty reverts to the calendar's own color
+    /// (web-client behavior); off-palette values keep the server value.
+    #[serde(default)]
+    pub color: Option<String>,
 }
 
 /// Format a DATE-TIME (UTC `…Z`) or DATE (all-day) property body AFTER the
@@ -574,6 +586,21 @@ pub fn format_ical_dt(unix: i64, all_day: bool) -> Option<String> {
 pub fn format_ical_date_end_exclusive(inclusive_unix: i64) -> Option<String> {
     let dt = chrono::DateTime::from_timestamp(inclusive_unix, 0)? + chrono::Duration::days(1);
     Some(format!("{}", dt.format(";VALUE=DATE:%Y%m%d")))
+}
+
+/// Engine-resolved overrides for an update body. `None` struct = verbatim
+/// re-send of the row values (no phone edits to these fields).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UpdateOverrides {
+    /// `None` = re-send row tri-state; `Some(None)` = force `null`
+    /// (inherit); `Some(Some(list))` = force the array (explicit none when
+    /// empty). The engine merges phone display alarms with the row's
+    /// server-sent (Type 0) entries and nulls out unchanged defaults.
+    pub notifications: Option<Option<Vec<serde_json::Value>>>,
+    /// Canonical palette hex replacing the row color (`None` = re-send).
+    /// Reverting to the calendar color is an explicit hex, never null
+    /// (server ignores null on update — api.md).
+    pub color: Option<String>,
 }
 
 /// Next `SEQUENCE` after an edit (RFC 5546 + api.md): bump only on
