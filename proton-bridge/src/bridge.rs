@@ -609,6 +609,21 @@ pub extern "C" fn proton_calendar_destroy_engine(e: *mut ProtonCalendarEngine) {
         }
     }
 }
+
+/// Truncate-rotate a debug log file once it exceeds 1 MiB, keeping the
+/// last 256 KiB (see `proton_api::diag::rotate_log_if_needed`). The shim
+/// calls this at every sync-plugin init so the world-readable
+/// `/tmp/proton-sync-debug.log` can never grow unbounded. Returns true
+/// only when a rotation happened; null/empty path is false.
+#[no_mangle]
+pub extern "C" fn proton_bridge_rotate_log(path: *const c_char) -> bool {
+    let p = unsafe { cstr_to_string(path) };
+    if p.is_empty() {
+        return false;
+    }
+    proton_api::diag::rotate_log_if_needed(std::path::Path::new(&p), 1024 * 1024, 256 * 1024)
+        .unwrap_or(false)
+}
 #[no_mangle]
 pub extern "C" fn proton_calendar_start_sync(e: *mut ProtonCalendarEngine) -> bool {
     if e.is_null() {

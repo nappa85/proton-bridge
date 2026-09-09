@@ -443,3 +443,41 @@ deferred=0`, 2 contacts saved. Zero ops, and `known` converged 4→2 —
 the ID map self-pruned the deleted UIDs on the previous cycle, exactly
 as designed (no `stale_map_entries` residue). Contacts upsync is fully
 live-verified: update / create / delete / steady-state.
+
+## 10. Debug-log cleanup – 2026-09-09 (local only, no device/live)
+
+PLAN TODO, my pick as next item. One mechanism both layers
+(`PROTON_VERBOSE`, non-empty ≠ `"0"`; device toggle without root:
+`systemctl --user set-environment PROTON_VERBOSE=1` + msyncd restart —
+the oopp-runner inherits the environment). Rust `diag::verbose()` +
+`vlog!` (`proton-api/src/diag.rs`): 11 routine contacts-upsync journal
+lines gated, error lines always on, calendar `LIVE_TRACE`/`LIVE_DIAG`
+precedent kept as-is. Shim `proton_verbose()` +
+`proton_log_verbose()`: full `Contact JSON:` rows (PII + photo
+data-URIs) verbose-only; IDs-only traces, counts, errors, `keys_debug`
+always. Size cap: `rotate_log_if_needed` (1 MiB → 256 KiB tail +
+marker, line-boundary cut, UTF-8-safe) via FFI
+`proton_bridge_rotate_log`, called at both plugin inits. Verified:
+fmt + clippy clean, 171 tests (+4 diag), stderr silent-by-default /
+traced-with-flag proven on the mock cycle test, full
+`make-pkg-bundle.sh --no-deploy` green. Staged sha256
+`147ae55fce8da30109ae29baa2e8c960c102d1b4ffa573a907865c304292fe1a`
+(supersedes `384e9d9d…`). Live behavior change to expect after deploy:
+`Contact JSON:` lines vanish from the file log by default (re-enable
+with the flag); everything the gate relied on (`plan`/`ran` trace,
+anchors, counts) still logs. Phone gate pending (deploy + one sync,
+default + verbose).
+
+### Live 2026-09-09 12:16–12:19 UTC — VERIFIED BOTH MODES, TODO CLOSED
+
+User deployed `147ae55f…` (sha verified on phone). Default-mode syncs
+(12:16 UI-triggered, 12:17 remote-triggered): steady `c=0 u=0 d=0`,
+`Saved 2`, trace/counts intact, zero `Contact JSON:` lines. Verbose
+run (12:19): `Contact JSON:` lines return. Lesson recorded: the
+oopp-runner inherits msyncd's environment at msyncd start, so
+`set-environment` alone does nothing — the documented sequence is
+`set-environment` + `systemctl --user restart msyncd` (still no root).
+Environment cleaned afterwards (`unset-environment` + restart,
+verified zero `PROTON` entries) with a final steady sync. Rotation
+(1 MiB cap) not triggerable live (log is ~130 KiB) — offline-tested
+only. Debug-log TODO closed.

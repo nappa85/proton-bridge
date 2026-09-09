@@ -198,16 +198,34 @@ Sync (buteo OOPP, proton_bridge_shim.cpp, NoUserInteractionPolicy):
   URL as a link / "Open in browser" button (`Qt.openUrlExternally`,
   user-initiated). Note: 9001 only gates SRP password logins
   (creation/credential-update), never the refresh-token sync path.
-- [ ] **Debug-log cleanup / opt-in flag** (filed 2026-09-07): today every
-  sync appends verbosely to `/tmp/proton-sync-debug.log` (shim `proton_log`
-  on every run incl. full row JSON, `diag` bodies, Rust `eprintln` traces)
-  with no size cap, no rotation, no off switch — always-on logging on a
-  user device. Direction: gate verbose output behind an opt-in flag
-  (QSettings `proton/debug` or env, default errors-only), keep the
-  fail-closed error lines + `keys_debug` summary always, cap total size
-  (truncate/rotate), keep existing secret scrubbing (`diag.rs`). Note:
-  the log file itself is already world-readable (`-rw-r--r--`), so remote
-  diagnosis over SSH works as-is; only the calendar DB still needs root.
+- [x] **Debug-log cleanup / opt-in flag** (filed 2026-09-07, DONE
+  2026-09-09 local-only): single mechanism both layers — `PROTON_VERBOSE`
+  env (non-empty, not `"0"`). Rust: `diag::verbose()` + `vlog!` macro
+  (`proton-api/src/diag.rs`); all 11 routine contacts-upsync journal
+  lines gated, genuine error lines (`Key unlock failed`, derive/photo/
+  fetch failures) always show, calendar `LIVE_TRACE`/`LIVE_DIAG` sites
+  untouched, `examples/` host tools untouched. Shim: `proton_verbose()`
+  + `proton_log_verbose()`; full `Contact JSON:` rows (PII + photo
+  data-URIs — the biggest entry) verbose-only, everything else
+  (errors, counts, IDs-only upsync inputs, `keys_debug` summary) always
+  logs. Size cap: `diag::rotate_log_if_needed` (tested: missing/small/
+  exact-cap/line-boundary-tail) via FFI `proton_bridge_rotate_log`
+  (cbindgen header regenerated), called at both plugin inits — 1 MiB
+  cap, 256 KiB tail + marker. Device toggle needs no root:
+  `systemctl --user set-environment PROTON_VERBOSE=1` (+ msyncd
+  restart; `unset-environment` to revert). Verified: fmt + clippy
+  `-D warnings` clean, 171 tests (103+3+65), stderr proven silent by
+  default / traced with the flag, `make-pkg-bundle.sh --no-deploy`
+  green. Staged `packaging/buteo-plugin/libproton-client.so` sha256
+  `147ae55fce8da30109ae29baa2e8c960c102d1b4ffa573a907865c304292fe1a`
+  (supersedes `384e9d9d…` — deploy only this; note it also carries the
+  §9 single-card + delete-Code work already live-verified). VERIFIED
+  LIVE 2026-09-09 (deployed, sha-checked): default-mode syncs log zero
+  `Contact JSON:` with trace/counts intact; verbose run restores them.
+  Env cleaned + msyncd restarted after. Lesson: the oopp-runner
+  inherits msyncd's env at msyncd start — `set-environment` requires a
+  msyncd restart to take effect. Rotation not triggerable live (~130
+  KiB log) — offline-tested only.)
 - [ ] **UI i18n** (DEFERRED 2026-09-07 by user decision — do after settings
   UI strings stabilize; they changed twice in two days and each change
   invalidates translations): audit 2026-09-07 found all static strings in
@@ -229,8 +247,8 @@ Sync (buteo OOPP, proton_bridge_shim.cpp, NoUserInteractionPolicy):
   fallback — custom `qsTrId` without shipped `.qm` renders empty). Also in
   scope: `proton.provider` name/description (XML, not QML). Out of scope:
   dynamic server/plugin error messages (`_errorMessage`, English by
-   nature). Cheap first step when revived: commit English-source `.ts`
-   template only.
+  nature). Cheap first step when revived: commit English-source `.ts`
+  template only.
 - [ ] **Docs rewrite: findings → objective documentation** (filed 2026-09-09
   by user decision — final TODO, do after all sync work stabilizes):
   convert `PLAN.md` / `ARCHITECTURE.md` / `FINDINGS_OTP.md` /
@@ -245,6 +263,75 @@ Sync (buteo OOPP, proton_bridge_shim.cpp, NoUserInteractionPolicy):
   `contacts-sync.md`, `calendar-sync.md`, `build-deploy.md`), rewrite
   each from the current files, then delete the `FINDINGS_*.md` journals
   (history stays in git).
+- [ ] **Calendar personal-part route** (filed 2026-09-09, open since
+  `FINDINGS_CALENDAR.md` §12): reminder-only edits currently do a full
+  reseal + whole-object replace. Direction: `PUT
+  .../events/{id}/personal` for notification-only changes (cheaper, no
+  re-encryption, no SEQUENCE implications); invite/RSVP flows belong to
+  the same route family once researched.
+- [ ] **RSVP sync-back + invitation sending** (filed 2026-09-09):
+  ORGANIZER/ATTENDEE identities are parsed and stored, attendee token
+  rows are re-sent verbatim on update, but phone-side RSVP changes and
+  new invitations never upload. Needs the write-path contract for
+  attendee mutations (proton-cal `docs/api.md` + WebClients invite
+  flows) before any code.
+- [ ] **Contacts photo upload** (filed 2026-09-09): photos are dropped on
+  create and only carried over on update (server copy wins). The
+  "Multiple photos" entry above covers the People-app single-avatar
+  limit, not upload. Direction: seal `PHOTO` data-URI lines into the
+  encrypted card on create/update; verify size limits against the API
+  first (contact cards have no documented per-card cap — probe with the
+  mock shape, then one live photo contact).
+- [ ] **Contacts key-field edits** (filed 2026-09-09): server cards
+  carrying `KEY` / `X-PM-*` (per-email crypto settings) defer updates
+  forever via the unknown-props guard — those contacts are read-only
+  from the phone. Direction: research the WebClients per-email settings
+  model (`contact_types.go` `GetSettings`/`SetSettings` + `encrypt.ts`
+  group handling) and either preserve-and-re-emit the groups on rebuild
+  or keep deferring deliberately with user-visible notice.
+- [ ] **Calendar out-of-window deletes** (filed 2026-09-09): tombstones
+  for events outside the synced window can't resolve to server IDs
+  (the UID-augment covers updates, not deletes). Direction: extend the
+  `list_by_uid` augment to the delete path or document as a permanent
+  v1 limitation (delete old events from Proton web).
+- [ ] **Typed windowed listing anomaly** (filed 2026-09-09, runs 1–10 in
+  `FINDINGS_CALENDAR.md` §7): identical typed queries intermittently
+  return 200-empty while untyped succeeds; cause unexplained, typed code
+  retained mock-tested beside the untyped primary. Direction: either a
+  focused live session to isolate it (same token/session, overlapping
+  windows, per-query logging already exists) or delete the typed path
+  outright so it stops looking like a supported alternative.
+- [ ] **Deferred-update visibility** (filed 2026-09-09): conflict
+  notifications are wired (`proton_bridge_shim.cpp:496`), but deferred
+  counts/reasons are file-log-only, and the download still overwrites a
+  deferred local edit so the next snapshot looks clean. Direction:
+  include deferred counts + first reason in the conflict notification
+  and/or keep the local row dirty until its content actually uploads.
+- [ ] **Rate-limit pacing + create-retry duplication** (filed 2026-09-09,
+  both engines): updates fire one PUT per row with no
+  `API_SAFE_INTERVAL` pacing (bulk edits could 429 — WebClients spaces
+  100 req/10s); a create POST success followed by a re-list failure
+  retries next cycle with a fresh UID → duplicate (same-content
+  updates/deletes are retry-safe). Direction: 100 ms spacing between
+  upload PUTs/POST-chunks; persist the fresh UID against `qcontact_id`
+  (or accept duplicates as documented v1 behavior — product call).
+- [ ] **FIDO2 feasibility re-research** (filed 2026-09-09 by user
+  challenge): `FINDINGS_OTP.md` §8 currently claims a FIDO2 second
+  factor is infeasible on SailfishOS (no platform authenticator, no
+  CTAP transport, no ceremony host) and fails loudly instead. The user
+  points out the fingerprint reader exists and works, so the "no
+  platform authenticator" link needs re-examination. Direction:
+  research-first, no code: (1) what fingerprint stack SailfishOS
+  exposes (daemon/API, and whether third-party apps can use it at all
+  vs device-lock-only); (2) what a WebAuthn platform-authenticator
+  path would additionally need (CTAP2 authenticator binding, client
+  ceremony host, RP-ID `proton.me` origin rules); (3) what Proton's
+  FIDO2 2FA endpoint expects from a non-web client (docs + Bridge,
+  which is TOTP-only, + web-client assertion shape); (4) roaming-key
+  alternatives (USB-C/NFC CTAP2 via async I/O, dedicated app vs
+  plugin). Outcome is a verdict + design sketch, or a confirmed
+  infeasible with the exact missing link named — either way §8 gets
+  corrected.
 
 ## Key Technical Details
 

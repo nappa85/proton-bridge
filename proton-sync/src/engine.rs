@@ -964,7 +964,7 @@ impl SyncEngine {
                 None => {
                     deferred += 1;
                     defer_reasons.push(format!("create:{op}:no-fields"));
-                    eprintln!("upsync_deferred contact create {op} no-fields");
+                    proton_api::vlog!("upsync_deferred contact create {op} no-fields");
                 }
             }
         }
@@ -982,12 +982,12 @@ impl SyncEngine {
                     Ok(None) => {
                         deferred += 1;
                         defer_reasons.push("create:unsealable".to_string());
-                        eprintln!("upsync_deferred contact create unsealable");
+                        proton_api::vlog!("upsync_deferred contact create unsealable");
                     }
                     Err(e) => {
                         deferred += 1;
                         defer_reasons.push(format!("create:seal-error:{e}"));
-                        eprintln!("upsync_deferred contact create: {e}");
+                        proton_api::vlog!("upsync_deferred contact create: {e}");
                     }
                 }
             }
@@ -1004,7 +1004,7 @@ impl SyncEngine {
             check_create_response(&resp)?;
             content_changed = true;
             created += resp.Responses.len() as u32;
-            eprintln!("upsync_created contacts n={}", resp.Responses.len());
+            proton_api::vlog!("upsync_created contacts n={}", resp.Responses.len());
         }
         // Updates: rebuild from listed rows + phone snapshots.
         let mut updated = 0u32;
@@ -1024,7 +1024,7 @@ impl SyncEngine {
             ) else {
                 deferred += 1;
                 defer_reasons.push(format!("update:{op}:no-row-or-fields"));
-                eprintln!("upsync_deferred contact update {op} no-row-or-fields");
+                proton_api::vlog!("upsync_deferred contact update {op} no-row-or-fields");
                 continue;
             };
             let cards = row.Cards.clone().unwrap_or_default();
@@ -1041,18 +1041,18 @@ impl SyncEngine {
                     deferred += 1;
                     let why = proton_api::contact_seal::diagnose_update_block(&cards, user_keys);
                     defer_reasons.push(format!("update:{op}:{why}"));
-                    eprintln!("upsync_deferred contact update {op} {why}");
+                    proton_api::vlog!("upsync_deferred contact update {op} {why}");
                 }
                 Err(e) => {
                     deferred += 1;
                     defer_reasons.push(format!("update:{op}:seal-error:{e}"));
-                    eprintln!("upsync_deferred contact update {op}: {e}");
+                    proton_api::vlog!("upsync_deferred contact update {op}: {e}");
                 }
             }
         }
         if updated > 0 {
             content_changed = true;
-            eprintln!("upsync_updated contacts n={updated}");
+            proton_api::vlog!("upsync_updated contacts n={updated}");
         }
         // Deletes: single batch call (IDs resolved from the listing),
         // filtered locally afterwards (exact IDs known — no re-list).
@@ -1079,19 +1079,19 @@ impl SyncEngine {
         if !delete_ids.is_empty() {
             if ambiguous_local_rows {
                 trace.push("contact_upsync deletes_held ambiguous_local_rows".to_string());
-                eprintln!("upsync_held contact deletes (ambiguous local rows)");
+                proton_api::vlog!("upsync_held contact deletes (ambiguous local rows)");
             } else {
                 client
                     .delete(&delete_ids)
                     .map_err(|e| contact_api_err("delete", e))?;
                 deleted = delete_ids.len() as u32;
-                eprintln!("upsync_deleted contacts n={deleted}");
+                proton_api::vlog!("upsync_deleted contacts n={deleted}");
                 let gone: std::collections::HashSet<String> = delete_ids.into_iter().collect();
                 contacts.retain(|c| !gone.contains(&c.ID));
             }
         }
         if deferred > 0 {
-            eprintln!("upsync_deferred contacts total={deferred}");
+            proton_api::vlog!("upsync_deferred contacts total={deferred}");
         }
         trace.push(format!(
             "contact_upsync ran created={created} updated={updated} deleted={deleted} deferred={deferred}"

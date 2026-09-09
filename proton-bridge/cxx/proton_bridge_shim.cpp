@@ -20,6 +20,23 @@ static void proton_log(const QString &msg) {
     qDebug() << msg;
 }
 
+// Verbose gate (2026-09-09): routine content-heavy lines only log when
+// PROTON_VERBOSE is set (non-empty, not "0") — same rule as Rust
+// `proton_api::diag::verbose()`. The oopp-runner inherits msyncd's
+// environment, so flip without root via:
+//   systemctl --user set-environment PROTON_VERBOSE=1 && systemctl --user restart msyncd
+// Errors, one-line summaries and IDs-only traces always log.
+static bool proton_verbose() {
+    const QByteArray v = qgetenv("PROTON_VERBOSE");
+    return !v.isEmpty() && v != "0";
+}
+
+static void proton_log_verbose(const QString &msg) {
+    if (proton_verbose()) {
+        proton_log(msg);
+    }
+}
+
 // Merges DerivedPasswords maps from every known source into one JSON object.
 // Different logins stored single-key maps in different QSettings groups
 // ([accountId]={addr}, [Uid]={user}); first-hit-wins shadowed one key and
@@ -120,6 +137,8 @@ ProtonContactsPlugin::~ProtonContactsPlugin()
 
 bool ProtonContactsPlugin::init()
 {
+    // Cap the world-readable debug log (1 MiB → keep 256 KiB tail).
+    proton_bridge_rotate_log("/tmp/proton-sync-debug.log");
     proton_log(QStringLiteral("ProtonContactsPlugin::init() profileName=") + getProfileName());
 
     m_accountId = iProfile.key(QStringLiteral("accountid"));
@@ -588,7 +607,9 @@ bool ProtonContactsPlugin::writeContactsToQtPIM(const QByteArray &json)
 
     for (const QJsonValue &val : contacts) {
         QJsonObject obj = val.toObject();
-        proton_log(QStringLiteral("Contact JSON: ") + QJsonDocument(obj).toJson(QJsonDocument::Compact).left(2000));
+        // Full row JSON (names, addresses, photo data-URIs): verbose-only.
+        // The one-line "Saved N contacts" + keys_debug summary always log.
+        proton_log_verbose(QStringLiteral("Contact JSON: ") + QJsonDocument(obj).toJson(QJsonDocument::Compact).left(2000));
 
         QtContacts::QContact contact;
         contact.setCollectionId(collection.id());
@@ -1118,6 +1139,8 @@ ProtonCalendarPlugin::~ProtonCalendarPlugin() {
     }
 }
 bool ProtonCalendarPlugin::init() {
+    // Cap the world-readable debug log (1 MiB → keep 256 KiB tail).
+    proton_bridge_rotate_log("/tmp/proton-sync-debug.log");
     proton_log(QStringLiteral("ProtonCalendarPlugin::init() profile=") + getProfileName());
     // Storage backend is mKCal + KCalendarCore (the documented Sailfish stack;
     // QtOrganizer is not shipped on this image). Probe open here so failures
