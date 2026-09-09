@@ -289,11 +289,21 @@ Sync (buteo OOPP, proton_bridge_shim.cpp, NoUserInteractionPolicy):
   model (`contact_types.go` `GetSettings`/`SetSettings` + `encrypt.ts`
   group handling) and either preserve-and-re-emit the groups on rebuild
   or keep deferring deliberately with user-visible notice.
-- [ ] **Calendar out-of-window deletes** (filed 2026-09-09): tombstones
-  for events outside the synced window can't resolve to server IDs
-  (the UID-augment covers updates, not deletes). Direction: extend the
-  `list_by_uid` augment to the delete path or document as a permanent
-  v1 limitation (delete old events from Proton web).
+- [x] **Calendar out-of-window deletes** (filed 2026-09-09, CORRECTED +
+  DONE 2026-09-09 local-only): audit found the filed claim ("can't
+  upload") stale — the UID augment already covered (pid, uid)
+  tombstones. The true residual hole was pid-less tombstones (id-map
+  entry lost) silently orphaning while their rows survived server-side.
+  Fixed: engine augment also UID-lists uid-only tombstones (ID-deduped
+  merges) + planner resolves them (master → series delete via existing
+  batch expansion, `#rid` standalone → surviving occurrence only,
+  rid-miss/no-rows → orphan path unchanged). Details + tests in
+  `FINDINGS_CALENDAR.md` §13. Verified: fmt + clippy clean, 177 tests
+  (103+3+71), full bundle green. Staged
+  `packaging/buteo-plugin/libproton-client.so` sha256
+  `364ef3d0d45ce2a2920039374c1919ec208544dc3092b6f67b181fccfb2db41a`
+  (supersedes `147ae55f…` — deploy only this). Live delta: none on
+  happy path; phone gate is deploy + steady sync.
 - [ ] **Typed windowed listing anomaly** (filed 2026-09-09, runs 1–10 in
   `FINDINGS_CALENDAR.md` §7): identical typed queries intermittently
   return 200-empty while untyped succeeds; cause unexplained, typed code
@@ -316,22 +326,17 @@ Sync (buteo OOPP, proton_bridge_shim.cpp, NoUserInteractionPolicy):
   upload PUTs/POST-chunks; persist the fresh UID against `qcontact_id`
   (or accept duplicates as documented v1 behavior — product call).
 - [ ] **FIDO2 feasibility re-research** (filed 2026-09-09 by user
-  challenge): `FINDINGS_OTP.md` §8 currently claims a FIDO2 second
-  factor is infeasible on SailfishOS (no platform authenticator, no
-  CTAP transport, no ceremony host) and fails loudly instead. The user
-  points out the fingerprint reader exists and works, so the "no
-  platform authenticator" link needs re-examination. Direction:
-  research-first, no code: (1) what fingerprint stack SailfishOS
-  exposes (daemon/API, and whether third-party apps can use it at all
-  vs device-lock-only); (2) what a WebAuthn platform-authenticator
-  path would additionally need (CTAP2 authenticator binding, client
-  ceremony host, RP-ID `proton.me` origin rules); (3) what Proton's
-  FIDO2 2FA endpoint expects from a non-web client (docs + Bridge,
-  which is TOTP-only, + web-client assertion shape); (4) roaming-key
-  alternatives (USB-C/NFC CTAP2 via async I/O, dedicated app vs
-  plugin). Outcome is a verdict + design sketch, or a confirmed
-  infeasible with the exact missing link named — either way §8 gets
-  corrected.
+  challenge — RESEARCHED 2026-09-09, verdict in `FINDINGS_OTP.md` §9):
+  the fingerprint reader canNOT become an authenticator (live fpd
+  introspection: enroll/match-only API, no keys/signing — fingerprint is
+  UV *inside* an authenticator, not one; software-authenticator path not
+  recommended). But the server needs no browser (challenge arrives in
+  auth-info, assertion POSTs to `core/v4/auth/2fa`), so **roaming USB-HID
+  keys via native CTAP2** (`webauthn-authenticator-rs` et al.) are
+  feasible in principle — sketch + build risks + key-matrix caveat in
+  §9c. Do not start without a real USB-C key in hand (host CLI probe
+  first, then port). Default stays: loud failure + TOTP-coexistence
+  guidance.
 
 ## Key Technical Details
 

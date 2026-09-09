@@ -285,10 +285,29 @@ pub fn execute_uploads(
     summary
 }
 
+/// Standalone-exception suffix (`<uid>#<rid>`, unix RecurrenceID) of a
+/// stored mKCal UID, if present and numeric. `None` = master row (or an
+/// unparsable suffix, which degrades to master semantics). The
+/// `contains('#')` guard matters: a purely numeric event UID must not
+/// parse as its own rid.
+fn exception_rid(mkcal_uid: &str) -> Option<i64> {
+    if !mkcal_uid.contains('#') {
+        return None;
+    }
+    mkcal_uid.rsplit('#').next()?.parse().ok()
+}
+
 /// Build the cycle plan from server rows + local inventory.
 pub fn plan_sync(server: &[proton_api::CalendarEvent], local: &[LocalItem]) -> SyncPlan {
     let server_by_id: HashMap<&str, &proton_api::CalendarEvent> =
         server.iter().map(|r| (r.ID.as_str(), r)).collect();
+    // Raw-iCal-UID index for uid-only tombstones (no Proton ID): the engine
+    // UID-augment merges out-of-window hits into `server`, so a tombstone
+    // whose id-map entry was lost still resolves when its rows exist.
+    let mut server_by_uid: HashMap<&str, Vec<&proton_api::CalendarEvent>> = HashMap::new();
+    for row in server {
+        server_by_uid.entry(row.UID.as_str()).or_default().push(row);
+    }
     let mut creates = Vec::new();
     let mut updates = Vec::new();
     let mut deletes = Vec::new();
@@ -297,11 +316,41 @@ pub fn plan_sync(server: &[proton_api::CalendarEvent], local: &[LocalItem]) -> S
 
     for item in local {
         match (&item.proton_id, item.deleted) {
-            // Created AND deleted locally between syncs: never existed
-            // server-side. Nothing to upload; tombstone purgable.
+            // Tombstone without a Proton ID: usually created+deleted between
+            // syncs (orphan — purge silently). BUT when the raw UID still
+            // matches server rows (id-map entry lost, rows out of window and
+            // UID-augmented back in), the user deleted something real: emit
+            // one Delete and let `assemble_delete_batch` expand the series
+            // (same semantics as a stamped tombstone). A `#rid` standalone
+            // tombstone whose occurrence is already gone server-side falls
+            // back to the orphan path (nothing to upload).
             (None, true) => {
-                plan.orphan_local_deletes += 1;
-                plan.purgeable_tombstones.push(item.mkcal_uid.clone());
+                let resolved = item.uid.as_deref().and_then(|uid| {
+                    let rows = server_by_uid.get(uid)?;
+                    if rows.is_empty() {
+                        return None;
+                    }
+                    match exception_rid(&item.mkcal_uid) {
+                        // Standalone occurrence: delete iff its row survives.
+                        Some(rid) => rows
+                            .iter()
+                            .find(|r| r.RecurrenceID == Some(rid))
+                            .map(|r| r.ID.clone()),
+                        // Master (or unparsable suffix): one op, the batch
+                        // assembler expands the whole UID series.
+                        None => rows.first().map(|r| r.ID.clone()),
+                    }
+                });
+                match resolved {
+                    Some(proton_id) => {
+                        deletes.push(UploadOp::Delete { proton_id });
+                        plan.purgeable_tombstones.push(item.mkcal_uid.clone());
+                    }
+                    None => {
+                        plan.orphan_local_deletes += 1;
+                        plan.purgeable_tombstones.push(item.mkcal_uid.clone());
+                    }
+                }
             }
             // Local-only row → create (dirty flag irrelevant: never synced
             // means the whole content uploads).
@@ -312,9 +361,10 @@ pub fn plan_sync(server: &[proton_api::CalendarEvent], local: &[LocalItem]) -> S
             // Already gone server-side → desired end state reached: NO
             // upload (unknown-ID deletes have undefined server semantics
             // and a per-op error would fail the phase closed for nothing),
-            // tombstone still purgeable. Out-of-window rows share this
-            // path — deleting never-listed old events via the phone is a
-            // known v1 limitation (documented in §12).
+            // tombstone still purgeable. Out-of-window rows reach here with
+            // their rows UID-augmented back into `server` (tombstones carry
+            // both pid and raw uid); only a tombstone with NEITHER a
+            // resolvable pid NOR a uid hit cannot upload (documented §12).
             (Some(pid), true) => {
                 plan.purgeable_tombstones.push(item.mkcal_uid.clone());
                 if server_by_id.contains_key(pid.as_str()) {
@@ -396,6 +446,30 @@ mod tests {
             fields: None,
             calendar_id: None,
             uid: None,
+        }
+    }
+
+    /// Tombstone whose id-map entry was lost: no Proton ID, raw iCal UID only.
+    fn tombstone_uid(mkcal_uid: &str, uid: &str) -> LocalItem {
+        LocalItem {
+            mkcal_uid: mkcal_uid.into(),
+            proton_id: None,
+            deleted: true,
+            modified: false,
+            last_synced_mtime: None,
+            fields: None,
+            calendar_id: None,
+            uid: Some(uid.into()),
+        }
+    }
+
+    fn exception_row(id: &str, uid: &str, mtime: i64, rid: i64) -> proton_api::CalendarEvent {
+        proton_api::CalendarEvent {
+            ID: id.into(),
+            UID: uid.into(),
+            LastEditTime: mtime,
+            RecurrenceID: Some(rid),
+            ..Default::default()
         }
     }
 
@@ -554,6 +628,70 @@ mod tests {
             vec!["e1".to_string(), "e2".to_string()]
         );
         assert!(ids_for_uid(&rows, "missing").is_empty());
+    }
+
+    #[test]
+    fn test_exception_rid_parsing() {
+        assert_eq!(
+            exception_rid("proton-cal-105-abc#1789502400"),
+            Some(1789502400)
+        );
+        assert_eq!(exception_rid("n1#200"), Some(200));
+        assert_eq!(exception_rid("n1"), None);
+        // A purely numeric event UID must not parse as its own rid.
+        assert_eq!(exception_rid("12345"), None);
+        assert_eq!(exception_rid("abc#xyz"), None);
+    }
+
+    #[test]
+    fn test_uid_only_master_tombstone_deletes_series() {
+        // Id-map entry lost, rows UID-augmented back in: one Delete (the
+        // batch assembler expands the series), tombstone purgeable, NOT an
+        // orphan — the user deleted something real.
+        let server = vec![row("e1", "u1", 100), exception_row("e2", "u1", 100, 200)];
+        let plan = plan_sync(&server, &[tombstone_uid("n1", "u1")]);
+        assert_eq!(
+            plan.uploads,
+            vec![UploadOp::Delete {
+                proton_id: "e1".into()
+            }]
+        );
+        assert_eq!(plan.orphan_local_deletes, 0);
+        assert_eq!(plan.purgeable_tombstones, vec!["n1".to_string()]);
+    }
+
+    #[test]
+    fn test_uid_only_exception_tombstone_deletes_occurrence() {
+        // `<uid>#<rid>` tombstone scopes to the surviving occurrence row.
+        let server = vec![row("e1", "u1", 100), exception_row("e2", "u1", 100, 200)];
+        let plan = plan_sync(&server, &[tombstone_uid("n1#200", "u1")]);
+        assert_eq!(
+            plan.uploads,
+            vec![UploadOp::Delete {
+                proton_id: "e2".into()
+            }]
+        );
+        assert_eq!(plan.orphan_local_deletes, 0);
+    }
+
+    #[test]
+    fn test_uid_only_rid_miss_falls_back_to_orphan() {
+        // Occurrence already gone server-side (EXDATE'd on web): nothing to
+        // upload — purge silently, never delete the surviving series.
+        let server = vec![row("e1", "u1", 100), exception_row("e2", "u1", 100, 200)];
+        let plan = plan_sync(&server, &[tombstone_uid("n1#999", "u1")]);
+        assert!(plan.uploads.is_empty());
+        assert_eq!(plan.orphan_local_deletes, 1);
+        assert_eq!(plan.purgeable_tombstones, vec!["n1#999".to_string()]);
+    }
+
+    #[test]
+    fn test_uid_only_tombstone_without_rows_stays_orphan() {
+        // Genuine create-then-delete between syncs: unchanged behavior.
+        let plan = plan_sync(&[], &[tombstone_uid("n1", "u9")]);
+        assert!(plan.uploads.is_empty());
+        assert_eq!(plan.orphan_local_deletes, 1);
+        assert_eq!(plan.purgeable_tombstones, vec!["n1".to_string()]);
     }
 
     #[test]

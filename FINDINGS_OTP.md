@@ -198,10 +198,99 @@ After the same SRP login with `Enabled==2`, the client must run a WebAuthn
 
 ### What we do instead
 
-`AuthClient::login` detects FIDO2-only (`Enabled==2`, TOTP flag unset, both
-modern and legacy shapes) and returns a guiding error — enable TOTP in
-Proton settings (it coexists with the security key, `Enabled==3`, which
-already works through our TOTP path) — instead of proceeding with a locked
-session that 403s confusingly downstream. Covered by
-`test_fido2_only_excludes_totp_variants` + the extended FIDO2-only test.
+ `AuthClient::login` detects FIDO2-only (`Enabled==2`, TOTP flag unset, both
+ modern and legacy shapes) and returns a guiding error — enable TOTP in
+ Proton settings (it coexists with the security key, `Enabled==3`, which
+ already works through our TOTP path) — instead of proceeding with a locked
+ session that 403s confusingly downstream. Covered by
+ `test_fido2_only_excludes_totp_variants` + the extended FIDO2-only test.
+
+---
+
+## 9. FIDO2 re-research – 2026-09-09 (user challenge, no code)
+
+User challenge to §8: the fingerprint reader exists and works, so "no
+platform authenticator" needs re-examination. All fetched + probed live
+(phone read-only) 2026-09-09. Verdict: §8's **conclusion stands but its
+reason was imprecise** — and a *different* FIDO2 path (roaming keys,
+not the fingerprint reader) is feasible in principle. Details:
+
+### 9a. The fingerprint reader cannot become an authenticator (proven)
+
+Live introspection of the on-device daemon (`org.sailfishos.fingerprint1`,
+`sailfish-fpd-1.6.0` + `sailfish-fpd-slave-binder`, system bus) shows the
+whole API: `Enroll` / `Identify` / `Verify` / `GetAll` / `Remove` /
+`GetState` / `SetUser` + match signals (`Verified`, `Identified`,
+`EnrollProgressChanged`). That is boolean template matching for device
+lock — no key generation, no signing, no challenge, no RP-ID scoping, no
+attestation. A FIDO *authenticator* is key custody + assertion signing +
+protocol; the fingerprint is only ever *user verification inside* one
+(the touch/face that unlocks the key). Conflating the two is the whole
+mistake. Building a platform authenticator on Sailfish would mean writing
+a software authenticator from scratch (per-RP keys in app storage, no TEE
+/ StrongBox-style API for third parties, weak assurance) plus the CTAP2
+client below — large work for poor security. Not recommended; the
+"enable TOTP alongside" guidance stays.
+
+### 9b. The server side needs no browser (proven from references)
+
+- Current WebClients `api/auth.ts`: `auth2FA({ TwoFactorCode } |
+  { FIDO2: AuthenticationCredentialsPayload })` → `POST core/v4/auth/2fa`
+  (NOTE: `core/v4`, not the `/auth/v4/2fa` our TOTP path uses and verified
+  live — §2's "legacy path" note was about TOTP codes only; both routes
+  exist, FIDO2 per the current client goes to `core/v4`. Do not "fix" the
+  working TOTP route.)
+- `webauthn/interface.ts`: the FIDO2 body is a standard assertion
+  (`AuthenticationOptions` echo + `ClientData` + `AuthenticatorData` +
+  `Signature` + `CredentialID`, int-array JSON).
+- go-proton-api `manager_auth_types.go` (native client, types only — no
+  ceremony implemented anywhere, Bridge is TOTP-only): the login *and*
+  auth-info responses already carry `TwoFA.FIDO2.AuthenticationOptions`
+  (challenge + allowCredentials) and `RegisteredKeys`. I.e. the
+  challenge comes from `POST /core/v4/auth/info` **pre-login, no session
+  needed** — a native ceremony never touches a browser.
+
+### 9c. Roaming keys over USB HID: feasible sketch (not started)
+
+Phone facts (read-only): no `/dev/hidraw*` now (no key plugged — nodes
+appear on hotplug *if* the kernel exposes them; unconfirmed without a
+key), but `libudev`/`libgudev` are present for discovery. `nfcd` is
+NDEF-only (no CTAP-over-NFC — that transport is closed); BLE
+unexplored, skip. Transport deep-dive 2026-09-09 (how Linux does it —
+no FIDO kernel module or daemon exists anywhere): the kernel `usbhid`
+driver claims the key's HID interface and exposes raw reports at
+`/dev/hidrawN`; browsers/tools open the node directly, permissions come
+from udev rules (distro `70-u2f.rules`: `TAG+="uaccess"` or a group).
+Phone: `CONFIG_HIDRAW=y` + `CONFIG_USB_HID=y` built-in (kernel side
+DONE), `defaultuser` is in the `input` group, but NO hidraw/uaccess
+udev rule ships — so the transport gap is exactly one udev rule file
+(shippable in our RPM, root install like our other system files),
+e.g. scoped `GROUP="input"` (or `uaccess` if logind seat tracking
+works) on FIDO vid/pids — untestable until a key is plugged in (port
+OTG/host mode itself also unconfirmed). SW side, all Rust and
+cross-compilable in principle:
+`webauthn-authenticator-rs` (Kanidm, maintained, CTAP 2.0/2.1 +
+USB-HID backend, `perform_auth_with_request` maps challenge →
+assertion) or Mozilla `authenticator-rs` (Firefox's, U2F-over-USB
+mature, CTAP2 on an unstable branch — matters because Proton also
+accepts U2F-only keys, which the Kanidm crate does NOT support:
+CTAP2-only). Design if ever pursued: (1) parse
+`AuthenticationOptions` from auth-info; (2) CTAP2 GetAssertion on the
+plugged key (QML tap/PIN prompts replace the OTP field for
+`Enabled==2` accounts); (3) submit via `core/v4/auth/2fa {FIDO2}` (or
+the go-proton-api embedded-`AuthReq` shape — needs one live probe to
+pick); (4) registration ceremony as a second milestone. Build risks to
+price: `hidapi` C dep under cross, `crypto`/OpenSSL features vs our
+rustls-only policy, `/dev/hidraw` permissions on Sailfish, U2F-vs-FIDO2
+key matrix. Requires a real USB-C key in hand (host-side probe with the
+crate's CLI first, then port) — do not start without one.
+
+### 9d. What stays as-is
+
+Loud FIDO2-only failure + TOTP-coexistence guidance (unchanged default).
+Sailfish Browser (Gecko ESR78+, WebAuthn API present since FF60,
+Firefox-on-Linux does its own CTAP/USB) *might* complete a
+security-key ceremony on account.proton.me with a plugged USB key —
+untested, browser-only, irrelevant to the native login flow; noted so
+nobody re-derives it.
 

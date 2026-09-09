@@ -541,7 +541,11 @@ impl CalendarSyncEngine {
         // covers 2 years, so a tombstone whose ID is missing may still
         // exist server-side. UID-list it (server-side filter, no window)
         // and merge hits into `fetched` so the planner below sees them.
-        // Without a UID there is nothing to query by — planner skips.
+        // Tombstones WITHOUT a Proton ID (id-map entry lost) resolve the
+        // same way: a UID hit proves the user deleted something real (the
+        // planner turns it into a series delete); no hit keeps the orphan
+        // path. Merged hits dedupe by row ID — a UID query can return rows
+        // the window already listed (partially in-window series).
         if !inventory.is_empty() {
             let listed: HashSet<String> = fetched
                 .iter()
@@ -552,23 +556,34 @@ impl CalendarSyncEngine {
                     && i.uid.as_deref().is_some_and(|u| !u.is_empty())
                     && i.proton_id
                         .as_deref()
-                        .is_some_and(|pid| !listed.contains(pid))
+                        .is_none_or(|pid| !listed.contains(pid))
             }) {
-                let (Some(pid), Some(ruid)) = (item.proton_id.as_ref(), item.uid.as_ref()) else {
+                let ruid = item.uid.clone().unwrap_or_default();
+                if ruid.is_empty() {
                     continue;
-                };
+                }
+                let pid = item.proton_id.clone();
                 for (cal, events) in fetched.iter_mut() {
-                    if events.iter().any(|e| &e.ID == pid) {
-                        break;
+                    if let Some(pid) = pid.as_deref() {
+                        if events.iter().any(|e| e.ID == pid) {
+                            break;
+                        }
                     }
-                    match cal_client.list_by_uid(&cal.ID, ruid) {
-                        Ok(mut found) if !found.is_empty() => {
+                    match cal_client.list_by_uid(&cal.ID, &ruid) {
+                        Ok(found) if !found.is_empty() => {
+                            let fresh: Vec<proton_api::CalendarEvent> = found
+                                .into_iter()
+                                .filter(|e| !events.iter().any(|x| x.ID == e.ID))
+                                .collect();
+                            if fresh.is_empty() {
+                                continue;
+                            }
                             self.set_debug(format!(
                                 "upsync_uid cal={} uid-rows={}",
                                 &cal.ID[..8.min(cal.ID.len())],
-                                found.len()
+                                fresh.len()
                             ));
-                            events.append(&mut found);
+                            events.extend(fresh);
                             break;
                         }
                         _ => {}
@@ -2107,6 +2122,124 @@ mod tests {
         engine.start_sync(c);
         assert_eq!(engine.status().state, "complete");
         put.assert(); // UID hit merged → delete uploaded
+        let purgeable: Vec<String> = serde_json::from_str(&engine.purgeable_json()).unwrap();
+        assert_eq!(purgeable, vec!["n9".to_string()]);
+        let _held = guards;
+    }
+
+    #[test]
+    fn test_uid_augment_resolves_pidless_tombstone() {
+        // Id-map entry lost (proton_id None) but raw UID present: the
+        // extended augment still UID-lists the hit, the planner resolves
+        // the delete from the merged rows, and the same PUT fires. Without
+        // the extension this tombstone would purge as a silent orphan
+        // while e9 survived server-side.
+        let mut server = mockito::Server::new();
+        let mut guards = Vec::new();
+        macro_rules! mock_get {
+            ($re:expr, $code:expr, $body:expr) => {
+                guards.push(
+                    server
+                        .mock("GET", mockito::Matcher::Regex($re.into()))
+                        .with_status($code)
+                        .with_header("content-type", "application/json")
+                        .with_body($body)
+                        .create(),
+                );
+            };
+        }
+        mock_get!(
+            r"/core/v4/users.*",
+            200,
+            r#"{"User":{"ID":"u","Name":"t","Keys":[]}}"#
+        );
+        mock_get!(r"/core/v4/keys/salts.*", 200, r#"{"KeySalts":[]}"#);
+        mock_get!(r"/core/v4/addresses.*", 200, r#"{"Addresses":[]}"#);
+        mock_get!(
+            r"/calendar/v1$",
+            200,
+            r#"{"Code":1000,"Calendars":[{"ID":"cal1","Name":"C"}]}"#
+        );
+        let now = chrono::Utc::now().timestamp();
+        guards.push(
+            server
+                .mock(
+                    "GET",
+                    mockito::Matcher::Regex(r"/calendar/v1/cal1/events.*".into()),
+                )
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                .with_body(format!(
+                    "{{\"Code\":1000,\"Events\":[{{\"ID\":\"e1\",\"UID\":\"u1\",\"CalendarID\":\"cal1\",\"StartTime\":{now},\"EndTime\":{},\"LastEditTime\":100,\"FullDay\":0,\"SharedEvents\":[{{\"Type\":2,\"Data\":\"BEGIN:VEVENT\\nUID:u1\\nSUMMARY:Keep\\nEND:VEVENT\",\"Signature\":\"s\"}}]}}],\"More\":0}}",
+                    now + 3600
+                ))
+                .create(),
+        );
+        // UID fallback route returns the missing row (out-of-window hit).
+        guards.push(
+            server
+                .mock(
+                    "GET",
+                    mockito::Matcher::Regex(r"/calendar/v1/cal1/events.*".into()),
+                )
+                .match_query(mockito::Matcher::UrlEncoded("UID".into(), "u9".into()))
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                .with_body(format!(
+                    "{{\"Code\":1000,\"Events\":[{{\"ID\":\"e9\",\"UID\":\"u9\",\"CalendarID\":\"cal1\",\"StartTime\":{now},\"EndTime\":{},\"LastEditTime\":50,\"FullDay\":0,\"SharedEvents\":[{{\"Type\":2,\"Data\":\"BEGIN:VEVENT\\nUID:u9\\nSUMMARY:Gone\\nEND:VEVENT\",\"Signature\":\"s\"}}]}}],\"More\":0}}",
+                    now + 3600
+                ))
+                .create(),
+        );
+        mock_get!(r"/calendar/v2/cal1/bootstrap.*", 404, "{}");
+        mock_get!(
+            r"/calendar/v1/cal1/members.*",
+            200,
+            r#"{"Members":[{"ID":"m1","Email":"t@x","Name":"T"}]}"#
+        );
+        mock_get!(r"/calendar/v1/cal1/keys.*", 200, r#"{"Keys":[]}"#);
+        mock_get!(
+            r"/calendar/v1/cal1/passphrase.*",
+            200,
+            r#"{"Passphrase":null}"#
+        );
+        mock_get!(
+            r"/calendar/v1/cal1/settings.*",
+            200,
+            r#"{"Code":1000,"CalendarSettings":{}}"#
+        );
+        let put = server
+            .mock(
+                "PUT",
+                mockito::Matcher::Regex(r"/calendar/v1/cal1/events/sync.*".into()),
+            )
+            .match_body(mockito::Matcher::JsonString(
+                r#"{"MemberID":"m1","Events":[{"ID":"e9"}]}"#.into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"Code":1001,"Responses":[]}"#)
+            .create();
+
+        let mut c = cfg();
+        c.refresh_token = Some("rt".into());
+        c.uid = Some("uid".into());
+        c.access_token = Some("at".into());
+        c.api_base_url = Some(server.url());
+        c.local_inventory = Some(vec![crate::upsync::LocalItem {
+            mkcal_uid: "n9".into(),
+            proton_id: None,
+            deleted: true,
+            modified: false,
+            last_synced_mtime: None,
+            fields: None,
+            calendar_id: Some("cal1".into()),
+            uid: Some("u9".into()),
+        }]);
+        let mut engine = CalendarSyncEngine::new(c.clone());
+        engine.start_sync(c);
+        assert_eq!(engine.status().state, "complete");
+        put.assert(); // pid-less UID hit merged → delete uploaded
         let purgeable: Vec<String> = serde_json::from_str(&engine.purgeable_json()).unwrap();
         assert_eq!(purgeable, vec!["n9".to_string()]);
         let _held = guards;

@@ -986,3 +986,33 @@ design layer only; nothing uploads yet.
    reminder-only edits (cheaper than full reseal) + invite/RSVP flows.
 4. [ ] Live gate: fresh OTP session + a scratch test event (create → edit →
    exception → series-delete) before wiring into the sync engine.
+
+## 13. Pid-less tombstone deletes – 2026-09-09 (local only, no device/live)
+
+Audit of the "out-of-window deletes can't upload" TODO found it stale:
+the UID augment (`run_upload_phase` + `list_by_uid`, mock-tested) already
+covers tombstones carrying (proton_id, uid). The TRUE residual hole was
+narrower: a tombstone with a raw UID but NO Proton ID (id-map entry lost
+— custom prop shed + `proton_id_map` miss) planned as a silent orphan
+(`orphan_local_deletes`) even when its rows existed server-side, so the
+server event survived a phone delete forever. Fixed, mirroring the
+existing series-delete semantics: the engine augment now also UID-lists
+pid-less tombstones (hits deduped by row ID — a UID query can return
+rows the window already listed), and `plan_sync` resolves them from the
+merged rows — master tombstone → one Delete (the batch assembler expands
+the UID series as usual), `<uid>#<rid>` standalone → the surviving
+occurrence row only (`exception_rid` helper; numeric-UID guard included),
+rid-miss or no rows → orphan path unchanged. One Delete op suffices in
+all cases (`assemble_delete_batch` expands via `ids_for_uid`, same as
+stamped tombstones). Verified: fmt + clippy `-D warnings` clean,
+177 workspace tests green (+6: 5 planner incl. rid parsing/series/
+miss/empty cases, 1 mockito engine cycle asserting the exact
+`{"MemberID":"m1","Events":[{"ID":"e9"}]}` PUT for a pid-less
+tombstone), `make-pkg-bundle.sh --no-deploy` green. Staged
+`packaging/buteo-plugin/libproton-client.so` sha256
+`364ef3d0d45ce2a2920039374c1919ec208544dc3092b6f67b181fccfb2db41a`
+(supersedes `147ae55f…`; also carries no other changes). Live
+behavioral delta after deploy: none on the happy path (same plans for
+all previously-covered shapes); only id-map-loss tombstones change
+(delete instead of silent orphan). Phone gate: deploy + steady sync
+(zero ops expected), no OTP needed.
