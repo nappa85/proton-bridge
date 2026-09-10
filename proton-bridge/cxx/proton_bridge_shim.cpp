@@ -512,12 +512,16 @@ void ProtonContactsPlugin::pollStatus()
 
         // Upsync outputs (only meaningful on `complete`, which is where we
         // are): anchors persist wholesale (null/empty never clobbers),
-        // conflicts notify server-wins.
+        // conflicts notify server-wins, pending persists wholesale too
+        // (empty clears — a confirmed cycle must drop stale retry UIDs).
         char *contactAnchors = proton_bridge_get_contact_anchors_json(m_engine);
         if (contactAnchors) {
             persistContactsAnchors(QString::fromUtf8(contactAnchors));
             proton_bridge_free_string(contactAnchors);
         }
+        char *contactPending = proton_bridge_get_contact_pending_json(m_engine);
+        persistContactsPending(contactPending ? QString::fromUtf8(contactPending) : QString());
+        if (contactPending) proton_bridge_free_string(contactPending);
         char *contactConflicts = proton_bridge_get_contact_conflicts_json(m_engine);
         if (contactConflicts) {
             QJsonDocument doc = QJsonDocument::fromJson(QByteArray(contactConflicts));
@@ -553,6 +557,12 @@ void ProtonContactsPlugin::pollStatus()
         QString keysDebug = keysDbg ? QString::fromUtf8(keysDbg) : QString();
         if (keysDbg) proton_bridge_free_string(keysDbg);
         proton_log(QStringLiteral("Keys debug on error: ") + keysDebug);
+        // The error path is exactly when posted-but-unconfirmed creates
+        // exist (e.g. re-list failed after successful POSTs): persist the
+        // pending retry UIDs wholesale so the next cycle reuses them.
+        char *contactPending = proton_bridge_get_contact_pending_json(m_engine);
+        persistContactsPending(contactPending ? QString::fromUtf8(contactPending) : QString());
+        if (contactPending) proton_bridge_free_string(contactPending);
         // Emit authentication failure so Settings shows “Account not signed in” and user can re-enter credentials
         auto code = Buteo::SyncResults::AUTHENTICATION_FAILURE;
         sendProtonNotification(QStringLiteral("Proton Contacts sync failed"), errMsg);
@@ -922,6 +932,7 @@ QJsonArray ProtonContactsPlugin::exportContactsInventory() {
     };
     QVariantMap anchors = readMap(QStringLiteral("contacts_anchors"));
     QVariantMap lastMod = readMap(QStringLiteral("contacts_last_modified"));
+    QVariantMap pending = readMap(QStringLiteral("contacts_pending"));
     settings.endGroup();
 
     QtContacts::QContactCollectionFilter collectionFilter;
@@ -949,6 +960,11 @@ QJsonArray ProtonContactsPlugin::exportContactsInventory() {
         if (!guid.isEmpty() && !dirty) {
             out.append(o); // clean synced row: no fields needed
             continue;
+        }
+        // Never-synced row: carry the stable retry UID (if the previous
+        // cycle posted but never confirmed) so the next POST reuses it.
+        if (guid.isEmpty() && pending.contains(qid)) {
+            o.insert(QStringLiteral("pending_uid"), pending.value(qid).toString());
         }
         // Dirty or never-synced: full snapshot (mirror of the write path).
         QJsonObject f;
@@ -1042,6 +1058,18 @@ void ProtonContactsPlugin::persistContactsAnchors(const QString &anchorsJson) {
     QSettings settings(QStringLiteral("proton"), QStringLiteral("sync-tokens"));
     settings.beginGroup(m_accountId);
     settings.setValue(QStringLiteral("contacts_anchors"), anchorsJson);
+    settings.endGroup();
+}
+
+void ProtonContactsPlugin::persistContactsPending(const QString &pendingJson) {
+    // Wholesale overwrite (never merge): empty clears confirmed/stale
+    // entries. Cap logged length like the anchors line.
+    if (!pendingJson.isEmpty()) {
+        proton_log(QStringLiteral("Persisted contacts pending: %1").arg(pendingJson.left(2000)));
+    }
+    QSettings settings(QStringLiteral("proton"), QStringLiteral("sync-tokens"));
+    settings.beginGroup(m_accountId);
+    settings.setValue(QStringLiteral("contacts_pending"), pendingJson);
     settings.endGroup();
 }
 

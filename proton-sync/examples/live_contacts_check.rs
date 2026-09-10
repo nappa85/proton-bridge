@@ -135,6 +135,7 @@ fn main() {
         modified: true,
         last_synced_mtime: None,
         fields: Some(fields),
+        pending_uid: None,
     }]);
     create_cfg.contact_known_uids = Some(HashSet::new());
     create_cfg.contact_anchors = Some(HashMap::new());
@@ -170,6 +171,7 @@ fn main() {
         modified: true,
         last_synced_mtime: Some(row.ModifyTime),
         fields: Some(fields2),
+        pending_uid: None,
     }]);
     update_cfg.contact_known_uids = Some([proton_uid.clone()].into_iter().collect());
     let mut anchors = HashMap::new();

@@ -96,6 +96,11 @@ private:
     void persistContactsAnchors(const QString &anchorsJson);
     QString loadContactsAnchors();
     QStringList loadContactsKnownUids();
+    // Posted-but-unconfirmed creates ({qcontact_id: stable_uid}) for retry
+    // idempotency. Persisted wholesale on EVERY run outcome (complete AND
+    // error — the error path is exactly when entries exist); an empty
+    // value clears stale entries, never merges.
+    void persistContactsPending(const QString &pendingJson);
 
     ProtonSyncEngine *m_engine = nullptr;
     QTimer *m_timer = nullptr;

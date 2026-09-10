@@ -425,6 +425,32 @@ pub extern "C" fn proton_bridge_get_contact_anchors_json(
     }
 }
 
+/// Posted-but-unconfirmed creates (`{qcontact_id: stable_uid}` JSON, null
+/// when none). Valid after ANY run outcome — especially errors, where the
+/// shim must still persist it wholesale as `contacts_pending` (never
+/// merge: an empty return clears stale entries).
+#[no_mangle]
+pub extern "C" fn proton_bridge_get_contact_pending_json(
+    engine: *mut ProtonSyncEngine,
+) -> *mut c_char {
+    if engine.is_null() {
+        return std::ptr::null_mut();
+    }
+    let engine_ref = unsafe { &*engine };
+    let guard = engine_ref.inner.lock().unwrap();
+    match guard.as_ref() {
+        Some(e) => {
+            let s = e.get_contact_pending_json();
+            if s.is_empty() {
+                std::ptr::null_mut()
+            } else {
+                CString::new(s).unwrap().into_raw()
+            }
+        }
+        None => std::ptr::null_mut(),
+    }
+}
+
 // ---- Calendar engine FFI (single .so, separate engine) ----
 // Mirrors the contacts engine: derived passwords in, events JSON out.
 pub struct ProtonCalendarEngine {

@@ -36,6 +36,13 @@ pub struct ContactItem {
     /// Full phone field snapshot (dirty or never-synced rows only).
     #[serde(default)]
     pub fields: Option<proton_api::vcard::ParsedContact>,
+    /// Stable retry UID from the previous cycle (`contacts_pending` map):
+    /// the last attempt posted but never confirmed, so the next POST
+    /// reuses it instead of minting a fresh UID (retry idempotency —
+    /// a retry either succeeds or UID-conflicts into adoption, never
+    /// duplicates). Absent on old shims and first attempts.
+    #[serde(default)]
+    pub pending_uid: Option<String>,
 }
 
 /// One upload operation, in execution order (creates → updates → deletes).
@@ -183,6 +190,7 @@ mod tests {
             modified,
             last_synced_mtime: anchor,
             fields: None,
+            pending_uid: None,
         }
     }
 
@@ -325,6 +333,32 @@ mod tests {
         assert_eq!(v["proton_uid"], "u1");
         let back: ContactItem = serde_json::from_value(v).unwrap();
         assert_eq!(back, item);
+    }
+
+    #[test]
+    fn test_pending_uid_contract_compat_both_ways() {
+        // New shim → new engine: pending_uid round-trips (stable retry UID
+        // for posted-but-unconfirmed creates).
+        let mut item = item("q9", None, true, None);
+        item.fields = Some(proton_api::vcard::ParsedContact::default());
+        item.pending_uid = Some("proton-web-aaa".into());
+        let v = serde_json::to_value(&item).unwrap();
+        assert_eq!(v["pending_uid"], "proton-web-aaa");
+        let back: ContactItem = serde_json::from_value(v).unwrap();
+        assert_eq!(back.pending_uid.as_deref(), Some("proton-web-aaa"));
+        // Old shim → new engine: absent key parses (no half-fed breakage),
+        // and the planner still creates regardless of the missing key.
+        let old_json =
+            r#"{"qcontact_id":"q9","proton_uid":null,"modified":true,"last_synced_mtime":null}"#;
+        let old: ContactItem = serde_json::from_str(old_json).expect("old JSON parses");
+        assert_eq!(old.pending_uid, None);
+        let plan = plan_contacts(&[], std::slice::from_ref(&old), &known(&[]));
+        assert_eq!(
+            plan.uploads,
+            vec![ContactUploadOp::Create {
+                qcontact_id: "q9".into()
+            }]
+        );
     }
 
     #[test]

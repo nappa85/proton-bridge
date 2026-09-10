@@ -337,14 +337,30 @@ Sync (buteo OOPP, proton_bridge_shim.cpp, NoUserInteractionPolicy):
   deferred local edit so the next snapshot looks clean. Direction:
   include deferred counts + first reason in the conflict notification
   and/or keep the local row dirty until its content actually uploads.
-- [ ] **Rate-limit pacing + create-retry duplication** (filed 2026-09-09,
-  both engines): updates fire one PUT per row with no
-  `API_SAFE_INTERVAL` pacing (bulk edits could 429 — WebClients spaces
-  100 req/10s); a create POST success followed by a re-list failure
-  retries next cycle with a fresh UID → duplicate (same-content
-  updates/deletes are retry-safe). Direction: 100 ms spacing between
-  upload PUTs/POST-chunks; persist the fresh UID against `qcontact_id`
-  (or accept duplicates as documented v1 behavior — product call).
+- [x] **Rate-limit pacing + create-retry duplication** (filed 2026-09-09,
+  DONE 2026-09-09 local-only, contacts engine): retries are now
+  idempotent instead of merely documented. Each create seals under a
+  STABLE UID (`pending_uid` from the shim's `contacts_pending` map, else
+  fresh): a retry either succeeds (first POST never landed) or hits the
+  UID-conflict per-op error (Overwrite=0 throws — `OVERWRITE` enum) and
+  is ADOPTED from a fresh listing; unresolvable conflicts fail closed;
+  missing per-op Index fails closed (strict wire shape). Posted-but-
+  unconfirmed (qid→uid) jobs expose via new FFI
+  `proton_bridge_get_contact_pending_json`, persisted wholesale by the
+  shim on EVERY outcome (complete clears, error keeps — the error path
+  is exactly when entries exist) and fed back as `pending_uid` for
+  guid-less rows (contract `#[serde(default)]`, both-directions
+  compatible). Pacing: 100 ms between update PUTs / create chunks
+  (`CONTACT_UPLOAD_PACING_MS`, WebClients `API_SAFE_INTERVAL`).
+  Verified: fmt + clippy clean, 189 tests (108+5+76: retry-reuse with
+  same-UID POST proof, conflict-adopt, unresolvable-fails-closed,
+  getter default, contract compat), full bundle green. Staged
+  `packaging/buteo-plugin/libproton-client.so` sha256
+  `609dc594a35bc1b03c7624bfe29ff7f15090a8eac6322572af4195f263a6a721`
+  (supersedes `0fd5770e…` — deploy only this). Live delta: none on
+  happy path (same UIDs/PUTs); phone gate is deploy + steady sync.
+  Calendar keeps the documented caveat (engine differs; separate TODO
+  if wanted).
 - [ ] **FIDO2 feasibility re-research** (filed 2026-09-09 by user
   challenge — RESEARCHED 2026-09-09, verdict in `FINDINGS_OTP.md` §9):
   the fingerprint reader canNOT become an authenticator (live fpd

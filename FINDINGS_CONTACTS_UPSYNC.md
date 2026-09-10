@@ -513,3 +513,36 @@ QML hand-reviewed only (no qmllint on host/SDK — CI gate on push);
 phone gate whenever a 9001 occurs naturally (untriggerable on
 demand). Future: embedded-WebView proof capture or Proton device flow;
 retry-with-proof headers.
+
+## 12. Create idempotency – 2026-09-09 (local only, no device/live)
+
+Retries no longer duplicate: creates seal under a STABLE UID
+(`pending_uid` from the shim `contacts_pending` map, else fresh
+`proton-web-`); a retry succeeds cleanly or UID-conflicts (Overwrite=0
+throws per `OVERWRITE`) into list-and-adopt; unresolvable conflicts and
+missing per-op Indexes fail closed. Posted-but-unconfirmed jobs expose
+via FFI `proton_bridge_get_contact_pending_json`, persisted wholesale
+on every outcome (error keeps, complete clears) and fed back for
+guid-less rows; contract `#[serde(default)]` both-directions safe. Plus
+100 ms pacing between update PUTs / create chunks (`API_SAFE_INTERVAL`).
+Same-UID proof: the signed Type-2 card carries the UID in plaintext, so
+the retry test asserts both POSTs contain it. 189 workspace tests
+green, bundle green, staged `609dc594…`.
+
+### Incident: disk-full file destruction + recovery (same day, local)
+
+`/home` hit 100% mid-session (Steam 254G + podman storage 50G — user
+data, untouched; `docker builder prune` freed 76G of reclaimable build
+cache). A large file write failed halfway and left
+`proton-sync/src/engine.rs` at 0 bytes. Recovery, no data loss:
+full-file `read` outputs were extracted from opencode's session DB
+(`~/.local/share/opencode/opencode.db`, `part` table) and reassembled
+(all 1817 lines, verified), then the day's engine edits were replayed
+with per-write verification. Lessons: keep `/home` clear of 100%
+(builds link large static binaries — sequoia); treat every tool write
+as unverified until read back or compiled (a buffered write can report
+success then fail at flush); the session DB is a usable last-resort
+backup for read outputs. Also fixed while here: two tests sharing one
+temp dir (parallel race), mockito `$`-anchored GET mocks (matches
+path+query — never match), and an unrealistic single-entry chunk mock
+(real wire returns one response per contact).

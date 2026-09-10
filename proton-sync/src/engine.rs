@@ -68,6 +68,7 @@ pub struct SyncEngine {
     decrypt_errors: Arc<Mutex<u32>>,
     contact_conflicts: Arc<Mutex<Vec<crate::contact_plan::ContactConflict>>>,
     contact_anchors: Arc<Mutex<std::collections::HashMap<String, i64>>>,
+    contact_pending: Arc<Mutex<std::collections::HashMap<String, String>>>,
 }
 
 impl SyncEngine {
@@ -101,6 +102,7 @@ impl SyncEngine {
             decrypt_errors: Arc::new(Mutex::new(0)),
             contact_conflicts: Arc::new(Mutex::new(Vec::new())),
             contact_anchors: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            contact_pending: Arc::new(Mutex::new(std::collections::HashMap::new())),
         }
     }
 
@@ -189,16 +191,24 @@ impl SyncEngine {
             Ok(contacts) => {
                 // Upsync phase 1 (uploads) before download processing.
                 // Fail-closed: Err aborts before any local apply (status
-                // error; uploads retry next cycle).
+                // error; uploads retry next cycle). Posted-but-unconfirmed
+                // creates still land in the pending map either way so the
+                // shim can persist retry UIDs even on error.
+                let mut pending = std::collections::HashMap::new();
                 let outcome = match Self::run_contact_upload_phase(
                     self.contacts_client.as_ref(),
                     &config,
                     &mut unlocked_keys,
                     user_end,
                     contacts,
+                    &mut pending,
                 ) {
-                    Ok(outcome) => outcome,
+                    Ok(outcome) => {
+                        *self.contact_pending.lock().unwrap() = outcome.pending_creates.clone();
+                        outcome
+                    }
                     Err(e) => {
+                        *self.contact_pending.lock().unwrap() = pending;
                         self.set_status(SyncStatus {
                             state: "error".into(),
                             error: Some(format!("Contacts upsync upload failed: {e}")),
@@ -813,12 +823,23 @@ impl SyncEngine {
 /// into `keys_debug` — the shim logs that to the file log on every run, so
 /// upload decisions are diagnosable without the (volatile, root-only)
 /// system journal. IDs only, never field contents.
+/// `pending_creates` (`shim` persists it on error for stable retry UIDs).
+#[derive(Debug)]
 pub struct ContactUploadOutcome {
     pub contacts: Vec<proton_api::Contact>,
     pub conflicts: Vec<crate::contact_plan::ContactConflict>,
     pub anchors: std::collections::HashMap<String, i64>,
     pub trace: String,
+    /// Posted-but-unconfirmed creates (qcontact_id → stable UID) for the
+    /// shim to persist when the phase fails after posting (re-list
+    /// failure). Empty on every successful return (re-list confirms).
+    pub pending_creates: std::collections::HashMap<String, String>,
 }
+
+/// Pacing between upload requests (WebClients `API_SAFE_INTERVAL`:
+/// 100 requests per 10 seconds). Sleeps only trigger on multi-op cycles;
+/// single-edit syncs are unaffected.
+const CONTACT_UPLOAD_PACING_MS: u64 = 100;
 
 /// Fail-closed engine error for one upload batch kind.
 fn contact_api_err(what: &str, e: impl std::fmt::Display) -> proton_api::ProtonError {
@@ -826,25 +847,6 @@ fn contact_api_err(what: &str, e: impl std::fmt::Display) -> proton_api::ProtonE
         code: 0,
         message: format!("contacts upsync {what} upload failed: {e}"),
     }
-}
-
-/// Per-op codes of a batch create must ALL succeed (fail-closed otherwise).
-fn check_create_response(
-    resp: &proton_api::CreateContactsResponse,
-) -> Result<(), proton_api::ProtonError> {
-    for entry in &resp.Responses {
-        if entry.Response.Code != 1000 {
-            return Err(proton_api::ProtonError::Api {
-                code: 0,
-                message: format!(
-                    "contacts upsync create upload failed: code {} {}",
-                    entry.Response.Code,
-                    entry.Response.Error.as_deref().unwrap_or("")
-                ),
-            });
-        }
-    }
-    Ok(())
 }
 
 impl SyncEngine {
@@ -872,6 +874,7 @@ impl SyncEngine {
         unlocked_keys: &mut [UnlockedKey],
         user_end: usize,
         contacts: Vec<proton_api::Contact>,
+        pending_out: &mut std::collections::HashMap<String, String>,
     ) -> Result<ContactUploadOutcome, proton_api::ProtonError> {
         use crate::contact_plan as cp;
         // File-log trace fragments (IDs only, never contents) — folded into
@@ -921,6 +924,7 @@ impl SyncEngine {
                 conflicts: Vec::new(),
                 anchors,
                 trace: trace.join("|"),
+                pending_creates: std::collections::HashMap::new(),
             });
         }
         let client = client
@@ -953,14 +957,29 @@ impl SyncEngine {
         let user_keys = &mut unlocked_keys[..user_len];
         let mut content_changed = false;
         let mut deferred = 0u32;
-        // Creates first (fresh UIDs; chunked ≤10 per the web batch limit).
-        let mut create_jobs: Vec<(String, proton_api::vcard::ParsedContact)> = Vec::new();
+        // Creates first (chunked ≤10 per the web batch limit). Each job
+        // seals under a STABLE uid: `pending_uid` carried from the previous
+        // cycle when the last attempt posted but never confirmed (re-list
+        // failure), else a fresh `proton-web-` UID. Stable UIDs make
+        // retries idempotent: a retry either succeeds cleanly (the first
+        // POST never landed) or hits the UID-conflict per-op error (it
+        // did) and is ADOPTED below — never duplicated, never stuck.
+        // `pending_out` collects posted-but-unconfirmed (qid → uid) jobs
+        // for the shim to persist even when the phase later fails.
+        let mut create_jobs: Vec<(String, String, proton_api::vcard::ParsedContact)> = Vec::new();
         for op in plan.uploads.iter().filter_map(|op| match op {
             cp::ContactUploadOp::Create { qcontact_id } => Some(qcontact_id),
             _ => None,
         }) {
             match items.get(op.as_str()).and_then(|item| item.fields.clone()) {
-                Some(fields) => create_jobs.push((op.clone(), fields)),
+                Some(fields) => {
+                    let uid = items
+                        .get(op.as_str())
+                        .and_then(|item| item.pending_uid.clone())
+                        .filter(|u| !u.is_empty())
+                        .unwrap_or_else(proton_api::generate_contact_uid);
+                    create_jobs.push((op.clone(), uid, fields));
+                }
                 None => {
                     deferred += 1;
                     defer_reasons.push(format!("create:{op}:no-fields"));
@@ -969,14 +988,22 @@ impl SyncEngine {
             }
         }
         let mut created = 0u32;
+        let mut adopted = 0u32;
+        // (qid, stable-uid, per-op code, per-op error) for non-1000 posts.
+        let mut conflict_uids: Vec<(String, String, i32, String)> = Vec::new();
+        let mut first_chunk = true;
         for chunk in create_jobs.chunks(10) {
+            // Rate pacing (WebClients API_SAFE_INTERVAL: 100 req/10s).
+            if !first_chunk {
+                std::thread::sleep(std::time::Duration::from_millis(CONTACT_UPLOAD_PACING_MS));
+            }
+            first_chunk = false;
             let mut cards_batch = Vec::with_capacity(chunk.len());
-            for (_, fields) in chunk {
-                let fresh_uid = proton_api::generate_contact_uid();
-                match proton_api::contact_seal::build_contact_create_cards(
-                    fields, &fresh_uid, user_keys,
-                ) {
+            let mut sealed_meta: Vec<(String, String)> = Vec::with_capacity(chunk.len());
+            for (qid, uid, fields) in chunk {
+                match proton_api::contact_seal::build_contact_create_cards(fields, uid, user_keys) {
                     Ok(Some(cards)) => {
+                        sealed_meta.push((qid.clone(), uid.clone()));
                         cards_batch.push(proton_api::CreateContactCards { Cards: cards })
                     }
                     Ok(None) => {
@@ -1001,10 +1028,64 @@ impl SyncEngine {
                     Labels: 0,
                 })
                 .map_err(|e| contact_api_err("create", e))?;
-            check_create_response(&resp)?;
+            // Partition per-op outcomes by Index (chunk order). Code 1000
+            // posts confirm (pending re-list); anything else is a
+            // UID-conflict candidate for adoption; a missing Index is a
+            // protocol violation and fails closed like before.
+            for (i, (qid, uid)) in sealed_meta.iter().enumerate() {
+                match resp.Responses.iter().find(|r| r.Index == i as i32) {
+                    Some(entry) if entry.Response.Code == 1000 => {
+                        created += 1;
+                        pending_out.insert(qid.clone(), uid.clone());
+                    }
+                    Some(entry) => {
+                        conflict_uids.push((
+                            qid.clone(),
+                            uid.clone(),
+                            entry.Response.Code,
+                            entry.Response.Error.clone().unwrap_or_default(),
+                        ));
+                    }
+                    None => {
+                        return Err(proton_api::ProtonError::Api {
+                            code: 0,
+                            message: format!(
+                                "contacts upsync create upload failed: \
+                                 response missing Index {i}"
+                            ),
+                        });
+                    }
+                }
+            }
+            proton_api::vlog!("upsync_created contacts chunk n={}", sealed_meta.len());
+        }
+        // Conflict-adopt: a UID-conflict per-op error proves an earlier
+        // POST landed (Overwrite=0 throws instead of overwriting). List and
+        // adopt rows carrying those UIDs; anything still missing fails
+        // closed (the old whole-batch error behavior).
+        if !conflict_uids.is_empty() {
+            let reconciled = client
+                .list_all()
+                .map_err(|e| contact_api_err("conflict-adopt-list", e))?;
+            for (qid, uid, code, err) in &conflict_uids {
+                if reconciled.iter().any(|c| &c.UID == uid) {
+                    adopted += 1;
+                    pending_out.remove(qid);
+                    proton_api::vlog!("upsync_adopted contact {qid} uid-conflict");
+                } else {
+                    return Err(proton_api::ProtonError::Api {
+                        code: 0,
+                        message: format!(
+                            "contacts upsync create upload failed: \
+                             code {code} {err} (uid unresolvable, failing closed)"
+                        ),
+                    });
+                }
+            }
             content_changed = true;
-            created += resp.Responses.len() as u32;
-            proton_api::vlog!("upsync_created contacts n={}", resp.Responses.len());
+        }
+        if created > 0 {
+            content_changed = true;
         }
         // Updates: rebuild from listed rows + phone snapshots.
         let mut updated = 0u32;
@@ -1032,6 +1113,13 @@ impl SyncEngine {
                 &cards, fields, &row.UID, user_keys,
             ) {
                 Ok(Some(sealed)) => {
+                    // Rate pacing (WebClients API_SAFE_INTERVAL: bulk edits
+                    // must not trip the 100 req/10s limit).
+                    if updated > 0 {
+                        std::thread::sleep(std::time::Duration::from_millis(
+                            CONTACT_UPLOAD_PACING_MS,
+                        ));
+                    }
                     client
                         .update(&row.ID, proton_api::UpdateContactRequest { Cards: sealed })
                         .map_err(|e| contact_api_err("update", e))?;
@@ -1094,7 +1182,7 @@ impl SyncEngine {
             proton_api::vlog!("upsync_deferred contacts total={deferred}");
         }
         trace.push(format!(
-            "contact_upsync ran created={created} updated={updated} deleted={deleted} deferred={deferred}"
+            "contact_upsync ran created={created} updated={updated} deleted={deleted} deferred={deferred} adopted={adopted}"
         ));
         if !defer_reasons.is_empty() {
             trace.push(format!(
@@ -1104,10 +1192,15 @@ impl SyncEngine {
         }
         // Reconcile: re-list only when creates/updates landed (fresh truth
         // incl. new IDs; fail-closed on error). Deletes already filtered.
+        // A successful re-list confirms every posted create, so the pending
+        // map (retry UIDs for the shim) drains here; any re-list failure
+        // keeps it for the next cycle via the Err path below.
         let contacts = if content_changed {
-            client
+            let fresh = client
                 .list_all()
-                .map_err(|e| contact_api_err("re-list", e))?
+                .map_err(|e| contact_api_err("re-list", e))?;
+            pending_out.clear();
+            fresh
         } else {
             contacts
         };
@@ -1124,6 +1217,7 @@ impl SyncEngine {
             conflicts: plan.conflicts,
             anchors,
             trace: trace.join("|"),
+            pending_creates: pending_out.clone(),
         })
     }
 
@@ -1203,6 +1297,19 @@ impl SyncEngine {
     /// overwrite a good cache with it).
     pub fn get_contact_anchors_json(&self) -> String {
         let map = self.contact_anchors.lock().unwrap();
+        if map.is_empty() {
+            return String::new();
+        }
+        serde_json::to_string(&*map).unwrap_or_default()
+    }
+
+    /// Posted-but-unconfirmed creates (`{qcontact_id: stable_uid}`) for
+    /// the shim to persist (`contacts_pending`) and feed back as
+    /// `pending_uid` next cycle. Empty (this getter returns `""`) when
+    /// nothing is unconfirmed — the shim must overwrite its cache
+    /// wholesale, never merge, so stale entries vanish.
+    pub fn get_contact_pending_json(&self) -> String {
+        let map = self.contact_pending.lock().unwrap();
         if map.is_empty() {
             return String::new();
         }
@@ -1486,6 +1593,7 @@ mod tests {
                 modified: true,
                 last_synced_mtime: Some(100),
                 fields: Some(fields_upd),
+                pending_uid: None,
             },
             crate::contact_plan::ContactItem {
                 qcontact_id: "q2".into(),
@@ -1493,6 +1601,7 @@ mod tests {
                 modified: true,
                 last_synced_mtime: None,
                 fields: Some(fields_new),
+                pending_uid: None,
             },
         ]);
         let mut anchors = std::collections::HashMap::new();
@@ -1596,6 +1705,7 @@ mod tests {
                 display_name: "Fresh".into(),
                 ..Default::default()
             }),
+            pending_uid: None,
         }]);
         c.contact_known_uids = Some(["u1".to_string()].into_iter().collect());
 
@@ -1649,6 +1759,7 @@ mod tests {
             modified: false,
             last_synced_mtime: None,
             fields: None,
+            pending_uid: None,
         }]);
 
         let mut engine = SyncEngine::new(c.clone());
@@ -1798,6 +1909,7 @@ mod tests {
                 first_name: "Edited".into(),
                 ..Default::default()
             }),
+            pending_uid: None,
         }]);
         let mut anchors = std::collections::HashMap::new();
         anchors.insert("u1".to_string(), 100);
@@ -1897,6 +2009,7 @@ mod tests {
                 }],
                 ..Default::default()
             }),
+            pending_uid: None,
         }]);
         c.contact_known_uids = Some(std::collections::HashSet::new());
 
@@ -1965,8 +2078,11 @@ mod tests {
             .expect(2)
             .with_status(200)
             .with_header("content-type", "application/json")
+            // One response entry per submitted contact (the real wire
+            // shape): 10 entries serve the 10-job chunk by Index, and the
+            // 1-job chunk reads Index 0 (extras ignored).
             .with_body(
-                r#"{"Responses": [{"Index": 0, "Response": {"Code": 1000, "Error": null, "Contact": {"ID": "new1", "Name": "Bulk", "UID": "newu"}}}]}"#,
+                r#"{"Responses": [{"Index": 0, "Response": {"Code": 1000, "Error": null, "Contact": {"ID": "new1", "Name": "Bulk", "UID": "newu"}}},{"Index": 1, "Response": {"Code": 1000, "Error": null}},{"Index": 2, "Response": {"Code": 1000, "Error": null}},{"Index": 3, "Response": {"Code": 1000, "Error": null}},{"Index": 4, "Response": {"Code": 1000, "Error": null}},{"Index": 5, "Response": {"Code": 1000, "Error": null}},{"Index": 6, "Response": {"Code": 1000, "Error": null}},{"Index": 7, "Response": {"Code": 1000, "Error": null}},{"Index": 8, "Response": {"Code": 1000, "Error": null}},{"Index": 9, "Response": {"Code": 1000, "Error": null}}]}"#,
             )
             .create();
 
@@ -1984,6 +2100,7 @@ mod tests {
                     }],
                     ..Default::default()
                 }),
+                pending_uid: None,
             })
             .collect();
         let mut c = cycle_cfg(server.url());
@@ -1996,5 +2113,215 @@ mod tests {
         assert_eq!(engine.status().state, "complete");
         posts.assert();
         let _held = guards;
+    }
+
+    // Direct phase driver (no auth): the upload phase takes unlocked keys
+    // + listed rows, so failure-path tests (POST-ok + re-list-fail) don't
+    // need mock sequencing — each phase gets a fresh mock server.
+    fn run_phase(
+        server_url: String,
+        key_raw: &str,
+        inventory: Vec<crate::contact_plan::ContactItem>,
+        listed: Vec<proton_api::Contact>,
+        pending: &mut std::collections::HashMap<String, String>,
+    ) -> Result<ContactUploadOutcome, proton_api::ProtonError> {
+        let client =
+            proton_api::ContactsClient::new_with_base_url(server_url, "at".into(), "uid".into());
+        let key = proton_api::UnlockedKey::from_armored(key_raw, b"").expect("test key unlocks");
+        let mut keys = vec![key];
+        let config = SyncConfig {
+            username: "u".into(),
+            contact_inventory: Some(inventory),
+            contact_known_uids: Some(std::collections::HashSet::new()),
+            contact_anchors: Some(std::collections::HashMap::new()),
+            ..Default::default()
+        };
+        SyncEngine::run_contact_upload_phase(Some(&client), &config, &mut keys, 1, listed, pending)
+    }
+
+    fn retry_fields() -> proton_api::vcard::ParsedContact {
+        proton_api::vcard::ParsedContact {
+            display_name: "Retry".into(),
+            phones: vec![proton_api::vcard::ParsedPhone {
+                number: "+3902000000".into(),
+                types: Vec::new(),
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn retry_item(pending_uid: Option<&str>) -> crate::contact_plan::ContactItem {
+        crate::contact_plan::ContactItem {
+            qcontact_id: "q1".into(),
+            proton_uid: None,
+            modified: true,
+            last_synced_mtime: None,
+            fields: Some(retry_fields()),
+            pending_uid: pending_uid.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn test_contact_create_retry_reuses_stable_uid_mock() {
+        // POST lands but re-list fails → Err + pending {q1: U}. Next cycle
+        // feeds pending_uid=U → the re-POST seals the SAME uid (asserted on
+        // the plaintext signed card) instead of minting a fresh one, so a
+        // retry can never duplicate.
+        let (_, key_raw) = armored_test_key();
+        let mut server1 = mockito::Server::new();
+        server1
+            .mock("POST", mockito::Matcher::Regex(r"/contacts/v4".into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"Responses": [{"Index": 0, "Response": {"Code": 1000, "Error": null, "Contact": {"ID": "c1", "Name": "Retry", "UID": "echo-ignored"}}}]}"#,
+            )
+            .create();
+        server1
+            .mock("GET", mockito::Matcher::Regex(r"/contacts/v4".into()))
+            .with_status(500)
+            .with_body("{}")
+            .create();
+
+        let mut pending = std::collections::HashMap::new();
+        let err = run_phase(
+            server1.url(),
+            &key_raw,
+            vec![retry_item(None)],
+            vec![],
+            &mut pending,
+        )
+        .expect_err("re-list must fail");
+        assert!(format!("{err}").contains("re-list"), "{err}");
+        assert_eq!(pending.len(), 1);
+        let uid = pending["q1"].clone();
+        assert!(uid.starts_with("proton-web-"), "{uid}");
+
+        // Cycle 2 (fresh server = fresh mocks): the POST must carry U.
+        // (`UID:…` is plaintext in the signed Type-2 card.)
+        let mut server2 = mockito::Server::new();
+        let post2 = server2
+            .mock("POST", mockito::Matcher::Regex(r"/contacts/v4".into()))
+            .match_body(mockito::Matcher::Regex(format!("UID:{uid}")))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(format!(
+                "{{\"Responses\": [{{\"Index\": 0, \"Response\": {{\"Code\": 1000, \"Error\": null, \"Contact\": {{\"ID\": \"c1\", \"Name\": \"Retry\", \"UID\": \"{uid}\"}}}}}}]}}"
+            ))
+            .create();
+        server2
+            .mock("GET", mockito::Matcher::Regex(r"/contacts/v4".into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(format!(
+                "{{\"Contacts\":[{{\"ID\":\"c1\",\"Name\":\"Retry\",\"UID\":\"{uid}\",\"ModifyTime\":101}}],\"Total\":1}}"
+            ))
+            .create();
+        server2
+            .mock("GET", mockito::Matcher::Regex(r"/contacts/v4/c1".into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(format!(
+                "{{\"Contact\":{{\"ID\":\"c1\",\"Name\":\"Retry\",\"UID\":\"{uid}\",\"ModifyTime\":101}}}}"
+            ))
+            .create();
+        let mut pending2 = std::collections::HashMap::new();
+        let outcome = run_phase(
+            server2.url(),
+            &key_raw,
+            vec![retry_item(Some(&uid))],
+            vec![],
+            &mut pending2,
+        )
+        .expect("retry completes");
+        post2.assert(); // same UID re-POSTed, not a fresh one
+        assert!(pending2.is_empty(), "re-list confirms: nothing pending");
+        assert_eq!(outcome.anchors.get(&uid), Some(&101));
+    }
+
+    #[test]
+    fn test_contact_create_conflict_adopts_server_row_mock() {
+        // Overwrite=0 throws on UID conflict instead of overwriting: the
+        // per-op error proves an earlier POST landed, so adopting the
+        // listed row converges (no duplicate, no stuck error).
+        let mut server = mockito::Server::new();
+        server
+            .mock("POST", mockito::Matcher::Regex(r"/contacts/v4".into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"Responses": [{"Index": 0, "Response": {"Code": 2200, "Error": "UID conflict"}}]}"#,
+            )
+            .create();
+        server
+            .mock("GET", mockito::Matcher::Regex(r"/contacts/v4".into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"Contacts":[{"ID":"c9","Name":"Retry","UID":"u-adopt-1","ModifyTime":77}],"Total":1}"#,
+            )
+            .create();
+        server
+            .mock("GET", mockito::Matcher::Regex(r"/contacts/v4/c9".into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"Contact":{"ID":"c9","Name":"Retry","UID":"u-adopt-1","ModifyTime":77}}"#,
+            )
+            .create();
+        let (_, key_raw) = armored_test_key();
+        let mut pending = std::collections::HashMap::new();
+        let outcome = run_phase(
+            server.url(),
+            &key_raw,
+            vec![retry_item(Some("u-adopt-1"))],
+            vec![],
+            &mut pending,
+        )
+        .expect("conflict adopts");
+        assert!(outcome.trace.contains("adopted=1"), "{}", outcome.trace);
+        assert!(pending.is_empty());
+        assert_eq!(outcome.anchors.get("u-adopt-1"), Some(&77));
+    }
+
+    #[test]
+    fn test_contact_create_conflict_unresolvable_fails_closed_mock() {
+        // Conflict error but the UID is nowhere server-side: fail closed
+        // (the old whole-batch error), never silently swallow.
+        let mut server = mockito::Server::new();
+        server
+            .mock("POST", mockito::Matcher::Regex(r"/contacts/v4".into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"Responses": [{"Index": 0, "Response": {"Code": 2200, "Error": "UID conflict"}}]}"#,
+            )
+            .create();
+        server
+            .mock("GET", mockito::Matcher::Regex(r"/contacts/v4".into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"Contacts":[],"Total":0}"#)
+            .create();
+        let (_, key_raw) = armored_test_key();
+        let mut pending = std::collections::HashMap::new();
+        let err = run_phase(
+            server.url(),
+            &key_raw,
+            vec![retry_item(Some("u-ghost-1"))],
+            vec![],
+            &mut pending,
+        )
+        .expect_err("unresolvable conflict must fail");
+        assert!(format!("{err}").contains("unresolvable"), "{err}");
+    }
+
+    #[test]
+    fn test_contact_pending_getter_defaults_empty() {
+        let engine = SyncEngine::new(SyncConfig {
+            username: "u".into(),
+            ..Default::default()
+        });
+        assert_eq!(engine.get_contact_pending_json(), String::new());
     }
 }
