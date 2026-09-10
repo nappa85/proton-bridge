@@ -162,6 +162,7 @@ aarch64-meego-linux-gnu-g++ \
     /home/mersdk/packaging/buteo-plugin/libproton_bridge.a \
     -lbuteosyncfw5 \
     -lQt5Core \
+    -lQt5Gui \
     -lQt5Contacts \
     -lmkcal-qt5 \
     -lKF5CalendarCore \

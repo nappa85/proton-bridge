@@ -1,12 +1,15 @@
 #include "proton_bridge_shim.h"
+#include <QBuffer>
 #include <QDebug>
 #include <QThread>
 #include <QFile>
 #include <QDateTime>
+#include <QImage>
 #include <QRegularExpression>
 #include <QCoreApplication>
 #include <QDBusConnection>
 #include <QDBusMessage>
+#include <QUrl>
 
 static void proton_log(const QString &msg) {
     QFile f("/tmp/proton-sync-debug.log");
@@ -887,8 +890,10 @@ static QStringList contactPhoneSubTypesToTypes(const QList<int> &subTypes) {
 
 void ProtonContactsPlugin::persistContactsMaps(const QList<QtContacts::QContact> &saved) {
     // Assigned IDs are valid on the in-memory objects post-save; timestamps
-    // are re-fetched per row (the in-memory copies may predate storage).
-    QVariantMap idMap, lastMod;
+    // and avatars are re-fetched per row (the in-memory copies may predate
+    // storage — and the avatar string must be the STORED form so the export
+    // comparison below is like-for-like through QUrl).
+    QVariantMap idMap, lastMod, photos;
     for (const QtContacts::QContact &c : saved) {
         if (c.id().isNull()) continue;
         QString uid = c.detail<QtContacts::QContactGuid>().guid();
@@ -901,6 +906,14 @@ void ProtonContactsPlugin::persistContactsMaps(const QList<QtContacts::QContact>
         if (ts.lastModified().isValid()) {
             lastMod.insert(qid, ts.lastModified().toMSecsSinceEpoch());
         }
+        const QList<QtContacts::QContactAvatar> avatars =
+            fresh.details<QtContacts::QContactAvatar>();
+        if (!avatars.isEmpty()) {
+            const QString avatarStr = avatars.first().imageUrl().toString();
+            if (!avatarStr.isEmpty()) {
+                photos.insert(qid, avatarStr);
+            }
+        }
     }
     QSettings settings(QStringLiteral("proton"), QStringLiteral("sync-tokens"));
     settings.beginGroup(m_accountId);
@@ -908,15 +921,49 @@ void ProtonContactsPlugin::persistContactsMaps(const QList<QtContacts::QContact>
                       QString::fromUtf8(QJsonDocument::fromVariant(idMap).toJson(QJsonDocument::Compact)));
     settings.setValue(QStringLiteral("contacts_last_modified"),
                       QString::fromUtf8(QJsonDocument::fromVariant(lastMod).toJson(QJsonDocument::Compact)));
+    settings.setValue(QStringLiteral("contacts_photos"),
+                      QString::fromUtf8(QJsonDocument::fromVariant(photos).toJson(QJsonDocument::Compact)));
     settings.endGroup();
+}
+
+// Avatar (device photo) → data URI for the vCard PHOTO line. `data:`
+// URIs (download echoes) pass through; file paths (user-set avatars)
+// load + downscale (WebClients imports cap at CONTACT_IMG_SIZE=180;
+// 512px bounding + JPEG q85 here balances quality against card size).
+// Returns "" when there is nothing usable — the caller then omits the
+// photos key (serde default), keeping the server copy on update.
+static QString avatarToDataUri(const QString &avatarStr) {
+    if (avatarStr.isEmpty()) {
+        return QString();
+    }
+    if (avatarStr.startsWith(QLatin1String("data:"))) {
+        return avatarStr;
+    }
+    const QString localFile = QUrl(avatarStr).toLocalFile();
+    const QString path = localFile.isEmpty() ? avatarStr : localFile;
+    QImage image(path);
+    if (image.isNull()) {
+        return QString();
+    }
+    if (qMax(image.width(), image.height()) > 512) {
+        image = image.scaled(512, 512, Qt::KeepAspectRatio, Qt::SmoothTransformation);
+    }
+    QByteArray bytes;
+    QBuffer buffer(&bytes);
+    if (!buffer.open(QIODevice::WriteOnly) || !image.save(&buffer, "JPEG", 85)) {
+        return QString();
+    }
+    return QStringLiteral("data:image/jpeg;base64,") + QString::fromLatin1(bytes.toBase64());
 }
 
 // Local inventory for the contacts planner: one object per row in our
 // collection — {qcontact_id, proton_uid|null, modified, last_synced_mtime
 // |null, fields?} (exact `contact_plan::ContactItem` contract). `fields`
-// carries the full phone snapshot for dirty/never-synced rows only
-// (photos intentionally omitted: no photo upload v1, server photos are
-// preserved engine-side).
+// carries the full phone snapshot for dirty/never-synced rows only,
+// including `photos` (device avatar as data URI) when the avatar differs
+// from the persisted download baseline — untouched avatars stay omitted
+// so the server copy is carried engine-side (no re-upload churn, no
+// QUrl round-trip risk on echoes).
 QJsonArray ProtonContactsPlugin::exportContactsInventory() {
     QJsonArray out;
     QtContacts::QContactCollection collection = findOrCreateCollection();
@@ -933,6 +980,7 @@ QJsonArray ProtonContactsPlugin::exportContactsInventory() {
     QVariantMap anchors = readMap(QStringLiteral("contacts_anchors"));
     QVariantMap lastMod = readMap(QStringLiteral("contacts_last_modified"));
     QVariantMap pending = readMap(QStringLiteral("contacts_pending"));
+    QVariantMap photosBaseline = readMap(QStringLiteral("contacts_photos"));
     settings.endGroup();
 
     QtContacts::QContactCollectionFilter collectionFilter;
@@ -1044,6 +1092,26 @@ QJsonArray ProtonContactsPlugin::exportContactsInventory() {
         // Unspecified (or anything else) exports as "" = no gender detail
         // (the write path only ever stores Male/Female anyway).
         f.insert(QStringLiteral("gender"), genderStr);
+        // Device avatar: export only when it differs from the persisted
+        // download baseline (missing baseline = pre-feature row or fresh
+        // avatar → include; conversion failure → omit, server copy wins).
+        // Untouched avatars stay omitted: no re-upload churn and no QUrl
+        // echo-fidelity risk on the download round-trip.
+        const QList<QtContacts::QContactAvatar> avatarDetails =
+            c.details<QtContacts::QContactAvatar>();
+        if (!avatarDetails.isEmpty()) {
+            const QString avatarStr = avatarDetails.first().imageUrl().toString();
+            if (!avatarStr.isEmpty()
+                && (!photosBaseline.contains(qid)
+                    || photosBaseline.value(qid).toString() != avatarStr)) {
+                const QString dataUri = avatarToDataUri(avatarStr);
+                if (!dataUri.isEmpty()) {
+                    QJsonArray photosArr;
+                    photosArr.append(dataUri);
+                    f.insert(QStringLiteral("photos"), photosArr);
+                }
+            }
+        }
         o.insert(QStringLiteral("fields"), f);
         out.append(o);
     }

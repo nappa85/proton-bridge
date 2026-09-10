@@ -583,3 +583,27 @@ remote restarts. (2) A phone rename got download-overwritten before
 uploading (full-replacement server-wins working as designed — the edit
 was saved after the last sync that could have carried it); re-edit +
 immediate sync uploaded cleanly.
+
+## 14. Photo upload – 2026-09-10 (local only, no device/live)
+
+Last phone-originated data class that never went up. Design: seal side
+accepts (create keeps phone photos; update prefers phone over server
+carry, empty still carries, avatar deletion does not propagate —
+documented v1 gap); shim exports the avatar only when it differs from
+a new persisted download baseline (`contacts_photos`, read back
+post-save for a like-for-like compare — untouched avatars never
+re-upload, dodging both churn and QUrl echo-fidelity questions).
+`data:` URIs pass through; file paths load + downscale to 512px JPEG
+q85 (WebClients import precedent caps at 180; JPEG is QtGui built-in,
+`+lQt5Gui` only, base-system lib, no spec change); failures omit
+(server copy wins). 202 workspace tests green, bundle green, staged
+`1d2dc0ce…`. Phone gate: avatar on scratch contact → sync → photo on
+web; avatar removal → photo stays (v1 gap).
+
+### Live 2026-09-10 — PHOTO UPLOAD VERIFIED
+
+Deployed `1d2dc0ce…` (sha-checked). Avatar set on an existing contact →
+sync → `plan c=0 u=1 d=0` → `ran updated=1 deferred=0`, photo visible
+on Proton web. Upload path verified end to end (avatar export →
+downscale → data URI → sealed PHOTO → server). Remainder: avatar
+removal propagation (documented v1 gap — photo stays server-side).

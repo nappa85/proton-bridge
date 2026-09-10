@@ -186,6 +186,26 @@ Sync (buteo OOPP, proton_bridge_shim.cpp, NoUserInteractionPolicy):
 - **Incremental sync**: No sync token support; full fetch every time
 - **Contact dedup**: No duplicate detection across Proton + local contacts
 - **Multiple photos**: People app only supports one avatar; only first photo is used
+- [x] **Contacts photo upload** (filed 2026-09-09, DONE 2026-09-10
+  local-only): device avatars now upload. Seal side: creates keep phone
+  photos (no longer dropped), updates prefer phone photos over the
+  server carry (empty phone still carries; avatar *deletion* does not
+  propagate — v1 limitation). Shim side: dirty/never-synced rows export
+  the avatar, compared against a new persisted download baseline
+  (`contacts_photos`, read back post-save so the comparison is
+  QUrl-like-for-like) — untouched avatars stay omitted (no re-upload
+  churn, no echo-fidelity risk); `data:` URIs pass through, file paths
+  load + downscale to 512px bounding JPEG q85 (WebClients imports cap at
+  180 — JPEG codecs are QtGui built-in, no plugin dependency;
+  `+lQt5Gui` in the buteo link, base-system lib). Conversion failures
+  omit (server copy wins). Verified: fmt + clippy clean, 202 tests
+  (120+5+77: create-seals-photo, phone-wins, server-carry, escaping),
+  full bundle green. Staged `packaging/buteo-plugin/libproton-client.so`
+  sha256   `1d2dc0ceaacfe46f1c703e7275473fadff559bad380e890a3adbfdf433c6384c`
+  (supersedes `60c05ed7…` — deploy only this). VERIFIED LIVE 2026-09-10
+  (deployed, sha-checked): avatar set on existing contact → `updated=1`,
+  photo visible on Proton web. Phone gate remainder: avatar removal →
+  photo stays (documented v1 gap, untested).
 - **Password never persisted** (intentional): raw 20-char login password is transient `Password` param only for `derive_all_passwords` at `Verify`; `signon-secrets.db` `CREDENTIALS.password` stays dummy `"x"`, `handleAuthOk` never returns `Secret`. New `KeySalt` after manual Proton key rotation will need one more **Update credentials → OTP** to re-derive and re-store `DerivedPasswords`.
 - [x] **CAPTCHA / human-verification handling** (filed 2026-09-09, hit live
   from the host: SRP login → `422 Code 9001`; IMPLEMENTED 2026-09-09

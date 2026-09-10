@@ -200,10 +200,13 @@ pub fn diagnose_update_block(
 }
 
 /// Build sealed update cards for one server contact + full phone snapshot:
-/// server photos preserved (phone has no photo upload v1), UID preserved,
+/// server photos preserved when the phone carries none, UID preserved,
 /// per-email crypto settings carried (regrouped onto the rebuilt emails),
-/// phone fields win otherwise. Returns `None` (= deferred) on any guard
-/// above. Mirrors the calendar whole-object-replace discipline.
+/// phone fields win otherwise. Phone photos (avatar set on device) replace
+/// the server copy when present — deleting the phone avatar does NOT clear
+/// the server photo (v1 limitation, same as before). Returns `None`
+/// (= deferred) on any guard above. Mirrors the calendar
+/// whole-object-replace discipline.
 pub fn build_contact_update_cards(
     server_cards: &[crate::ContactCard],
     phone: &crate::vcard::ParsedContact,
@@ -214,10 +217,12 @@ pub fn build_contact_update_cards(
         return Ok(None);
     };
     let mut merged = phone.clone();
-    merged.photos = server_parsed
-        .iter()
-        .flat_map(|parsed| parsed.photos.clone())
-        .collect();
+    if merged.photos.is_empty() {
+        merged.photos = server_parsed
+            .iter()
+            .flat_map(|parsed| parsed.photos.clone())
+            .collect();
+    }
     let (mut signed_plain, enc_plain) = crate::vcard::build_vcard(&merged, contact_uid);
     // Carry crypto settings: same numbering as the rebuilt emails
     // (`item{i+1}` for the i-th phone email), bodies byte-identical.
@@ -254,13 +259,14 @@ pub fn build_contact_update_cards(
 
 /// Build sealed create cards from a phone snapshot (no server base).
 /// Same guards minus the server-dependent ones; UID is fresh from caller.
+/// Phone photos (device avatar, exported as data URIs by the shim) seal
+/// along — empty stays empty.
 pub fn build_contact_create_cards(
     phone: &crate::vcard::ParsedContact,
     uid: &str,
     user_keys: &mut [UnlockedKey],
 ) -> Result<Option<Vec<crate::ContactCard>>> {
-    let mut merged = phone.clone();
-    merged.photos = Vec::new(); // no photo upload v1 (documented gap)
+    let merged = phone.clone();
     let (signed_plain, enc_plain) = crate::vcard::build_vcard(&merged, uid);
     let signed_sig = detached_sign_any(&signed_plain, user_keys)?;
     let mut cards = vec![crate::ContactCard {
@@ -730,5 +736,95 @@ mod tests {
             diagnose_update_block(&exotic, std::slice::from_mut(&mut user)),
             "unknown-props:X-CUSTOM"
         );
+    }
+
+    const TEST_PHOTO: &str = "data:image/jpeg;base64,/9j/AAA";
+    const TEST_PHOTO_NEW: &str = "data:image/png;base64,iVBORw0";
+
+    #[test]
+    fn test_create_seals_phone_photo() {
+        // Device avatar uploads on create (previously dropped).
+        let mut user = test_user_identity();
+        let phone = crate::vcard::ParsedContact {
+            display_name: "Pic".into(),
+            phones: vec![crate::vcard::ParsedPhone {
+                number: "+3902000000".into(),
+                types: Vec::new(),
+            }],
+            photos: vec![TEST_PHOTO.into()],
+            ..Default::default()
+        };
+        let out = build_contact_create_cards(&phone, "pic-uid", std::slice::from_mut(&mut user))
+            .unwrap()
+            .expect("create seals");
+        let enc = decrypt_card(&out[1], &mut user);
+        assert_eq!(enc.photos, vec![TEST_PHOTO.to_string()]);
+    }
+
+    #[test]
+    fn test_update_phone_photo_wins_over_server() {
+        // Avatar set on device replaces the server copy; the data URI
+        // survives seal escaping verbatim (`;` and `,` escaped).
+        let mut user = test_user_identity();
+        let (enc_data, enc_sig) = seal_contact_card(
+            "BEGIN:VCARD\r\nVERSION:4.0\r\nUID:c\r\nPHOTO:data:image/jpeg\\;base64\\,/9j/OLD\r\nEND:VCARD",
+            std::slice::from_mut(&mut user),
+        )
+        .unwrap();
+        let cards = vec![
+            crate::ContactCard {
+                Type: 2,
+                Data: "BEGIN:VCARD\r\nVERSION:4.0\r\nUID:c\r\nFN:Pic\r\nEND:VCARD".into(),
+                Signature: "sig".into(),
+            },
+            crate::ContactCard {
+                Type: 3,
+                Data: enc_data,
+                Signature: enc_sig,
+            },
+        ];
+        let phone = crate::vcard::ParsedContact {
+            display_name: "Pic".into(),
+            photos: vec![TEST_PHOTO_NEW.into()],
+            ..Default::default()
+        };
+        let out = build_contact_update_cards(&cards, &phone, "c", std::slice::from_mut(&mut user))
+            .unwrap()
+            .expect("update seals");
+        let enc = decrypt_card(&out[1], &mut user);
+        assert_eq!(enc.photos, vec![TEST_PHOTO_NEW.to_string()]);
+    }
+
+    #[test]
+    fn test_update_empty_phone_keeps_server_photo() {
+        // Untouched avatar: server copy carried (previous behavior kept).
+        let mut user = test_user_identity();
+        let (enc_data, enc_sig) = seal_contact_card(
+            "BEGIN:VCARD\r\nVERSION:4.0\r\nUID:c\r\nPHOTO:data:image/jpeg\\;base64\\,/9j/OLD\r\nEND:VCARD",
+            std::slice::from_mut(&mut user),
+        )
+        .unwrap();
+        let cards = vec![
+            crate::ContactCard {
+                Type: 2,
+                Data: "BEGIN:VCARD\r\nVERSION:4.0\r\nUID:c\r\nFN:Pic\r\nEND:VCARD".into(),
+                Signature: "sig".into(),
+            },
+            crate::ContactCard {
+                Type: 3,
+                Data: enc_data,
+                Signature: enc_sig,
+            },
+        ];
+        let phone = crate::vcard::ParsedContact {
+            display_name: "Pic".into(),
+            ..Default::default()
+        };
+        let out = build_contact_update_cards(&cards, &phone, "c", std::slice::from_mut(&mut user))
+            .unwrap()
+            .expect("update seals");
+        let enc = decrypt_card(&out[1], &mut user);
+        assert_eq!(enc.photos.len(), 1);
+        assert!(enc.photos[0].contains("/9j/OLD"), "{}", enc.photos[0]);
     }
 }
