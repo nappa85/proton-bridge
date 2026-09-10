@@ -427,6 +427,52 @@ impl CalendarClient {
         Ok(resp.json()?)
     }
 
+    /// Reminder/color-only edit via the personal-part route (WebClients
+    /// `updatePersonalEventPart`, `CreateSinglePersonalEventData`): no
+    /// cards resealed, no key packets, no SEQUENCE implications — the
+    /// server patches just these two row columns. Returns the updated
+    /// row; any non-1000 envelope Code fails with the body attached
+    /// (contacts 4xx lesson: never blind). Covered by mockito tests;
+    /// live verification pending (needs a reminder edit on device).
+    pub fn put_personal(
+        &self,
+        cal_id: &str,
+        event_id: &str,
+        body: &crate::calendar_write::PersonalEventBody,
+    ) -> Result<CalendarEvent> {
+        let resp = self
+            .client
+            .put(format!(
+                "{}/calendar/v1/{}/events/{}/personal",
+                self.base_url, cal_id, event_id
+            ))
+            .header("Authorization", self.auth_header())
+            .header("x-pm-uid", &self.uid)
+            .header("x-pm-appversion", APP_VERSION)
+            .json(body)
+            .send()?;
+        let status = resp.status();
+        let text = resp.text().unwrap_or_default();
+        if !status.is_success() {
+            let short: String = text.chars().take(1000).collect();
+            return Err(crate::ProtonError::Api {
+                code: 0,
+                message: format!("calendar personal PUT failed {status}: {short}"),
+            });
+        }
+        let v: serde_json::Value =
+            serde_json::from_str(&text).map_err(crate::ProtonError::Serde)?;
+        let code = v.get("Code").and_then(|c| c.as_i64()).unwrap_or(0);
+        if code != 1000 && code != 1001 {
+            let short: String = text.chars().take(1000).collect();
+            return Err(crate::ProtonError::Api {
+                code: 0,
+                message: format!("calendar personal PUT rejected code {code}: {short}"),
+            });
+        }
+        serde_json::from_value(v["Event"].clone()).map_err(crate::ProtonError::Serde)
+    }
+
     pub fn get_event(&self, cal_id: &str, event_id: &str) -> Result<CalendarEvent> {
         let resp = self
             .client
@@ -1453,6 +1499,71 @@ mod tests {
         assert_eq!(evs.len(), 1);
         assert!(!more);
         assert_eq!(evs[0].ID, "e1");
+    }
+
+    #[test]
+    fn test_put_personal_mock_success() {
+        // Personal-part route: exact path, two-field body, envelope Code
+        // 1000 → updated row parsed.
+        let mut server = mockito::Server::new();
+        let put = server
+            .mock(
+                "PUT",
+                mockito::Matcher::Regex(r"/calendar/v1/cal1/events/e1/personal".into()),
+            )
+            .match_body(mockito::Matcher::JsonString(
+                r#"{"Notifications":[{"Trigger":"-PT1H","Type":1}],"Color":null}"#.into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"Code":1000,"Event":{"ID":"e1","UID":"u1","LastEditTime":200}}"#)
+            .create();
+        let c = CalendarClient::new_with_base_url(server.url(), "at".into(), "uid".into());
+        let body = crate::calendar_write::PersonalEventBody {
+            Notifications: serde_json::json!([{"Trigger": "-PT1H", "Type": 1}]),
+            Color: serde_json::Value::Null,
+        };
+        let row = c.put_personal("cal1", "e1", &body).unwrap();
+        assert_eq!(row.ID, "e1");
+        assert_eq!(row.LastEditTime, 200);
+        put.assert();
+    }
+
+    #[test]
+    fn test_put_personal_mock_rejection_keeps_body() {
+        // HTTP and envelope-code rejections both surface the body (never
+        // blind — the calendar 2001/2011 lesson).
+        for (status, body) in [
+            (
+                400,
+                r#"{"Code":2011,"Error":"These properties are not supported"}"#,
+            ),
+            (
+                200,
+                r#"{"Code":2001,"Error":"Provide data signed using the address key"}"#,
+            ),
+        ] {
+            let mut server = mockito::Server::new();
+            let _m = server
+                .mock(
+                    "PUT",
+                    mockito::Matcher::Regex(r"/calendar/v1/cal1/events/e1/personal".into()),
+                )
+                .with_status(status)
+                .with_header("content-type", "application/json")
+                .with_body(body)
+                .create();
+            let c = CalendarClient::new_with_base_url(server.url(), "at".into(), "uid".into());
+            let payload = crate::calendar_write::PersonalEventBody {
+                Notifications: serde_json::Value::Null,
+                Color: serde_json::Value::Null,
+            };
+            let err = c
+                .put_personal("cal1", "e1", &payload)
+                .expect_err("rejection must err");
+            let msg = format!("{err}");
+            assert!(msg.contains("2011") || msg.contains("2001"), "{msg}");
+        }
     }
 
     #[test]

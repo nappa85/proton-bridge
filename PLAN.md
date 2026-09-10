@@ -303,12 +303,29 @@ Sync (buteo OOPP, proton_bridge_shim.cpp, NoUserInteractionPolicy):
   `contacts-sync.md`, `calendar-sync.md`, `build-deploy.md`), rewrite
   each from the current files, then delete the `FINDINGS_*.md` journals
   (history stays in git).
-- [ ] **Calendar personal-part route** (filed 2026-09-09, open since
-  `FINDINGS_CALENDAR.md` §12): reminder-only edits currently do a full
-  reseal + whole-object replace. Direction: `PUT
-  .../events/{id}/personal` for notification-only changes (cheaper, no
-  re-encryption, no SEQUENCE implications); invite/RSVP flows belong to
-  the same route family once researched.
+- [x] **Calendar personal-part route** (filed 2026-09-09, DONE 2026-09-10
+  local-only): reminder-only phone edits now take `PUT
+  .../events/{id}/personal` (`CreateSinglePersonalEventData`, exact
+  WebClients shape) instead of a full reseal — no crypto ops, no
+  SEQUENCE churn, no 2001/2011 surface. Strict whitelist gating
+  (`content_matches_except_notifications`: all compared fields present
+  and exactly equal, non-recurring, no attendees/exdates/personal rows;
+  any doubt falls through to the existing replace), sharing one
+  Notifications/Color marshal with the sync body so the routes can't
+  diverge. Verified: fmt + clippy clean, 210 tests (127+5+78: marshal
+  tri-state, comparator accept/12-rejections/undecryptable, transport
+  success + both rejection shapes with bodies, engine cycle proving
+  personal-PUT-fires + zero reseal-PUTs), full bundle green. Staged
+  `packaging/buteo-plugin/libproton-client.so` sha256
+  `e46b3605d0b625fced6af81dbe3291a9eac0d4540bcf9abd7ef0093a50bf1a47`
+  (supersedes `1d2dc0ce…` — deploy only this). VERIFIED LIVE 2026-09-10
+  (deployed, sha-checked): reminder change on a plain event →
+  `upsync_personal`, web shows the 1-hour display reminder with the
+  inherited email gone — byte-identical outcome to the 09-08 full-reseal
+  verification of the same edit (custom list replaces inheritance in
+  Proton's model, on web too; the phone edits a single display alarm).
+  Parity proven, no semantic change. Phone gate remainder: a text/time
+  edit must still take the reseal path.
 - [ ] **RSVP sync-back + invitation sending** (filed 2026-09-09):
   ORGANIZER/ATTENDEE identities are parsed and stored, attendee token
   rows are re-sent verbatim on update, but phone-side RSVP changes and

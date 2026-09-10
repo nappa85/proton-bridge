@@ -171,9 +171,8 @@ pub fn seal_card(
 }
 
 use crate::calendar_write::{
-    escape_ical_text, format_ical_date_end_exclusive, format_ical_dt, marshal_color,
-    marshal_notifications, next_sequence, patch_card, CardPatch, LocalFields, SyncContentPart,
-    SyncEventBody,
+    escape_ical_text, format_ical_date_end_exclusive, format_ical_dt, next_sequence, patch_card,
+    CardPatch, LocalFields, SyncContentPart, SyncEventBody,
 };
 use crate::{CalendarEvent, CalendarEventPart};
 use base64::Engine;
@@ -462,18 +461,11 @@ pub fn build_update_body(
     };
     let no_overrides = crate::calendar_write::UpdateOverrides::default();
     let applied = overrides.unwrap_or(&no_overrides);
-    let notifications = match &applied.notifications {
-        None => marshal_notifications(
-            row.Notifications.is_some(),
-            &row.Notifications.clone().unwrap_or_default(),
-        ),
-        Some(None) => serde_json::Value::Null,
-        Some(Some(list)) => marshal_notifications(true, list),
-    };
-    let color = match &applied.color {
-        None => marshal_color(row.Color.as_deref().unwrap_or("")),
-        Some(hex) => marshal_color(hex),
-    };
+    let (notifications, color) = crate::calendar_write::marshal_notif_color(
+        row.Notifications.as_deref(),
+        row.Color.as_deref().unwrap_or(""),
+        applied,
+    );
     Ok(Some(SyncEventBody {
         Permissions: 1,
         SharedKeyPacket: None,
@@ -510,6 +502,92 @@ pub fn reseal_card(
 /// create path builds cards from fields; updates reuse decrypted text).
 fn wrap_fragment(inner_lines: &[String]) -> String {
     patch_card(&inner_lines.join("\n"), &CardPatch::default())
+}
+
+/// True when the phone snapshot differs from the server row in AT MOST
+/// its reminders — the personal-part route (`PUT …/events/{id}/personal`)
+/// can then apply the change without resealing any card (no SEQUENCE
+/// bump, no 2001/2011 rejection surface).
+///
+/// Deliberately strict (whitelist, fail toward the full reseal): every
+/// compared field must be PRESENT on the phone side and EXACTLY equal;
+/// any invite/recurrence/personal complexity, any undecryptable group,
+/// or any doubt at all returns false and the caller runs the existing
+/// whole-object replace. Attendee edits are invisible to this check on
+/// purpose — `LocalFields` carries none, so any attendee-shaped row
+/// takes the full path (which re-sends them verbatim, the documented
+/// download-wins behavior).
+pub fn content_matches_except_notifications(
+    row: &CalendarEvent,
+    fields: &LocalFields,
+    cal_keys: &mut [UnlockedKey],
+    addr_keys: &mut [UnlockedKey],
+) -> bool {
+    // Structural exclusions: invites, series, exceptions, personal rows.
+    if !row.PersonalEvents.is_empty()
+        || !row.AttendeesEvents.is_empty()
+        || !row.Attendees.is_empty()
+    {
+        return false;
+    }
+    if row.RRule.as_deref().is_some_and(|r| !r.is_empty())
+        || !row.Exdates.is_empty()
+        || row.RecurrenceID.is_some()
+    {
+        return false;
+    }
+    if fields.has_recurrence || fields.rrule.is_some() {
+        return false;
+    }
+    // Times vs the authoritative row columns (same all-day adjustment as
+    // the update path: phone all-day end is inclusive, row is exclusive).
+    let all_day = match fields.all_day {
+        Some(a) => a,
+        None => return false,
+    };
+    if all_day != row.FullDay.unwrap_or(false) {
+        return false;
+    }
+    match fields.start_unix {
+        Some(s) if s == row.StartTime => {}
+        _ => return false,
+    }
+    match fields.end_unix {
+        Some(e)
+            if (all_day && e.saturating_add(86400) == row.EndTime)
+                || (!all_day && e == row.EndTime) => {}
+        _ => return false,
+    }
+    // Texts vs the decrypted merged view (read-only decrypt; failure →
+    // full path, which defers the row itself when truly unreadable).
+    let (Some(summary), Some(description), Some(location)) =
+        (&fields.summary, &fields.description, &fields.location)
+    else {
+        return false;
+    };
+    let shared = match decrypt_group(&row.SharedEvents, &row.SharedKeyPacket, cal_keys, addr_keys) {
+        Some(g) => g,
+        None => return false,
+    };
+    let calendar = match decrypt_group(
+        &row.CalendarEvents,
+        &row.CalendarKeyPacket,
+        cal_keys,
+        addr_keys,
+    ) {
+        Some(g) => g,
+        None => return false,
+    };
+    let plains: Vec<String> = shared
+        .iter()
+        .chain(calendar.iter())
+        .map(|(_, plain)| plain.clone())
+        .collect();
+    let merged = match crate::calendar::merge_ical_fragments(&plains) {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    summary == &merged.summary && description == &merged.description && location == &merged.location
 }
 
 /// Build the sealed create body from local fields. Returns `None` (=
@@ -1281,5 +1359,141 @@ mod tests {
         .unwrap();
         assert_ne!(kp1, kp2);
         assert_ne!(data1, data2);
+    }
+
+    /// Signed-only row (no keys needed anywhere): texts/times match the
+    /// phone snapshot exactly.
+    fn plain_match_row() -> CalendarEvent {
+        CalendarEvent {
+            ID: "e1".into(),
+            UID: "u1".into(),
+            CalendarID: "cal1".into(),
+            StartTime: 1000,
+            EndTime: 4600,
+            FullDay: Some(false),
+            SharedEvents: vec![CalendarEventPart {
+                MemberID: String::new(),
+                Type: 2,
+                Data: "BEGIN:VEVENT\r\nUID:u1\r\nSUMMARY:Same\r\nDESCRIPTION:Same desc\r\nLOCATION:Same loc\r\nDTSTART:19700101T001640Z\r\nDTEND:19700101T011640Z\r\nEND:VEVENT"
+                    .into(),
+                Signature: "s".into(),
+                Author: String::new(),
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn plain_match_fields() -> LocalFields {
+        LocalFields {
+            summary: Some("Same".into()),
+            description: Some("Same desc".into()),
+            location: Some("Same loc".into()),
+            start_unix: Some(1000),
+            end_unix: Some(4600),
+            all_day: Some(false),
+            ..Default::default()
+        }
+    }
+
+    fn matches(row: &CalendarEvent, fields: &LocalFields) -> bool {
+        content_matches_except_notifications(row, fields, &mut Vec::new(), &mut Vec::new())
+    }
+
+    #[test]
+    fn test_content_match_accepts_identical() {
+        assert!(matches(&plain_match_row(), &plain_match_fields()));
+    }
+
+    #[test]
+    fn test_content_match_rejects_any_difference() {
+        let row = plain_match_row();
+        let fields = plain_match_fields();
+        // Each single divergence (text, time, flag, missing) → full path.
+        let mut f = fields.clone();
+        f.summary = Some("Changed".into());
+        assert!(!matches(&row, &f));
+        let mut f = fields.clone();
+        f.description = Some("Changed".into());
+        assert!(!matches(&row, &f));
+        let mut f = fields.clone();
+        f.location = Some("Changed".into());
+        assert!(!matches(&row, &f));
+        let mut f = fields.clone();
+        f.start_unix = Some(1001);
+        assert!(!matches(&row, &f));
+        let mut f = fields.clone();
+        f.end_unix = Some(4601);
+        assert!(!matches(&row, &f));
+        let mut f = fields.clone();
+        f.all_day = Some(true);
+        assert!(!matches(&row, &f));
+        let mut f = fields.clone();
+        f.summary = None;
+        assert!(!matches(&row, &f));
+        let mut f = fields.clone();
+        f.start_unix = None;
+        assert!(!matches(&row, &f));
+    }
+
+    #[test]
+    fn test_content_match_rejects_structural_rows() {
+        let row = plain_match_row();
+        let fields = plain_match_fields();
+        // Series, exceptions, exdates, attendees, personal rows, and phone
+        // recurrence signals all take the full reseal path.
+        let mut r = row.clone();
+        r.RRule = Some("FREQ=DAILY;COUNT=5".into());
+        assert!(!matches(&r, &fields));
+        let mut r = row.clone();
+        r.Exdates = vec![2000];
+        assert!(!matches(&r, &fields));
+        let mut r = row.clone();
+        r.RecurrenceID = Some(3000);
+        assert!(!matches(&r, &fields));
+        let mut r = row.clone();
+        r.Attendees = vec![crate::AttendeeToken {
+            Token: "t".into(),
+            Status: 0,
+        }];
+        assert!(!matches(&r, &fields));
+        let mut r = row.clone();
+        r.AttendeesEvents = vec![CalendarEventPart {
+            MemberID: String::new(),
+            Type: 2,
+            Data: "BEGIN:VEVENT\r\nUID:u1\r\nEND:VEVENT".into(),
+            Signature: String::new(),
+            Author: String::new(),
+        }];
+        assert!(!matches(&r, &fields));
+        let mut r = row.clone();
+        r.PersonalEvents = vec![CalendarEventPart {
+            MemberID: String::new(),
+            Type: 2,
+            Data: "BEGIN:VEVENT\r\nUID:u1\r\nEND:VEVENT".into(),
+            Signature: String::new(),
+            Author: String::new(),
+        }];
+        assert!(!matches(&r, &fields));
+        let mut f = fields.clone();
+        f.has_recurrence = true;
+        assert!(!matches(&row, &f));
+        let mut f = fields.clone();
+        f.rrule = Some(Some("FREQ=DAILY".into()));
+        assert!(!matches(&row, &f));
+    }
+
+    #[test]
+    fn test_content_match_rejects_undecryptable() {
+        // Encrypted card with no keys to unlock it: cannot verify
+        // "only" — full path (which defers the row itself).
+        let mut row = plain_match_row();
+        row.CalendarEvents = vec![CalendarEventPart {
+            MemberID: String::new(),
+            Type: 3,
+            Data: "bogus".into(),
+            Signature: String::new(),
+            Author: String::new(),
+        }];
+        assert!(!matches(&row, &plain_match_fields()));
     }
 }

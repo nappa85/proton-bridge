@@ -773,6 +773,49 @@ impl CalendarSyncEngine {
                 let addr_all = keys.address_only();
                 let (lo, hi) = sign_range.unwrap_or((0, addr_all.len()));
                 let sign_keys = &mut addr_all[lo..hi];
+                // Reminder-only fast path: identical content + a real
+                // notification change → personal PUT (no reseal, no
+                // SEQUENCE churn, no 2001/2011 surface). Anything else
+                // falls through to the whole-object replace below.
+                let personal_override = overrides.as_ref().filter(|o| o.notifications.is_some());
+                if let Some(o) = personal_override {
+                    if proton_api::calendar_seal::content_matches_except_notifications(
+                        &fresh,
+                        fields,
+                        &mut cal_keys,
+                        sign_keys,
+                    ) {
+                        let (notifications, color) =
+                            proton_api::calendar_write::marshal_notif_color(
+                                fresh.Notifications.as_deref(),
+                                fresh.Color.as_deref().unwrap_or(""),
+                                o,
+                            );
+                        match cal_client.put_personal(
+                            &cal.ID,
+                            proton_id,
+                            &proton_api::calendar_write::PersonalEventBody {
+                                Notifications: notifications,
+                                Color: color,
+                            },
+                        ) {
+                            Ok(_) => {
+                                relist.insert(cal.ID.clone());
+                                self.set_debug(format!(
+                                    "upsync_personal cal={} id={proton_id}",
+                                    &cal.ID[..8.min(cal.ID.len())]
+                                ));
+                            }
+                            Err(e) => {
+                                deferred += 1;
+                                self.set_debug(format!(
+                                    "upsync_deferred update {proton_id} personal: {e}"
+                                ));
+                            }
+                        }
+                        continue;
+                    }
+                }
                 match proton_api::calendar_seal::build_update_body(
                     &fresh,
                     fields,
@@ -1854,6 +1897,165 @@ mod tests {
         assert_eq!(purgeable, vec!["n9".to_string()]);
         let purgeable: Vec<String> = serde_json::from_str(&engine.purgeable_json()).unwrap();
         assert_eq!(purgeable, vec!["n9".to_string()]);
+        let _held = guards;
+    }
+
+    #[test]
+    fn test_update_reminder_only_uses_personal_route_mock() {
+        // Reminder-only phone edit: identical content + changed alarms →
+        // personal PUT (exact two-field body), and NO whole-object reseal
+        // (expect-zero on events/sync). REAL keys through the password
+        // unlock path (decrypt-for-compare is read-only).
+        let user_armored = armored_tsk();
+        let addr_armored = armored_tsk();
+        let mut server = mockito::Server::new();
+        let mut guards = Vec::new();
+        macro_rules! mock_get {
+            ($re:expr, $code:expr, $body:expr) => {
+                guards.push(
+                    server
+                        .mock("GET", mockito::Matcher::Regex($re.into()))
+                        .with_status($code)
+                        .with_header("content-type", "application/json")
+                        .with_body($body)
+                        .create(),
+                );
+            };
+        }
+        mock_get!(
+            r"/core/v4/users.*",
+            200,
+            format!(
+                r#"{{"User":{{"ID":"u","Name":"t","Keys":[{{"ID":"k1","PrivateKey":"{user_armored}","Token":"","Signature":""}}]}}}}"#
+            )
+        );
+        mock_get!(
+            r"/core/v4/keys/salts.*",
+            200,
+            r#"{"KeySalts":[{"ID":"k1","KeySalt":""},{"ID":"ak1","KeySalt":""}]}"#
+        );
+        mock_get!(
+            r"/core/v4/addresses.*",
+            200,
+            format!(
+                r#"{{"Addresses":[{{"ID":"a1","Email":"t@x","Keys":[{{"ID":"ak1","PrivateKey":"{addr_armored}","Token":"","Signature":""}}]}}]}}"#
+            )
+        );
+        mock_get!(
+            r"/calendar/v1$",
+            200,
+            r#"{"Code":1000,"Calendars":[{"ID":"cal1","Name":"C"}]}"#
+        );
+        let now = chrono::Utc::now().timestamp();
+        let row_e1 = format!(
+            r#"{{"ID":"e1","UID":"u1","CalendarID":"cal1","StartTime":{now},"EndTime":{end},"LastEditTime":100,"FullDay":0,"Notifications":null,
+            "SharedEvents":[{{"Type":2,"Data":"BEGIN:VEVENT\nUID:u1\nSUMMARY:Same\nDESCRIPTION:Same desc\nLOCATION:Same loc\nDTSTART:20300101T100000Z\nDTEND:20300101T110000Z\nEND:VEVENT","Signature":"s"}}]}}"#,
+            end = now + 3600,
+        );
+        guards.push(
+            server
+                .mock(
+                    "GET",
+                    mockito::Matcher::Regex(r"/calendar/v1/cal1/events.*".into()),
+                )
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                .with_body(format!(
+                    "{{\"Code\":1000,\"Events\":[{row_e1}],\"More\":0}}"
+                ))
+                .create(),
+        );
+        // Fresh GET for the update row (engine refetches to avoid TOCTOU).
+        guards.push(
+            server
+                .mock(
+                    "GET",
+                    mockito::Matcher::Regex(r"/calendar/v1/cal1/events/e1.*".into()),
+                )
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                .with_body(format!("{{\"Event\":{row_e1}}}"))
+                .create(),
+        );
+        mock_get!(r"/calendar/v2/cal1/bootstrap.*", 404, "{}");
+        mock_get!(
+            r"/calendar/v1/cal1/members.*",
+            200,
+            r#"{"Members":[{"ID":"m1","Email":"t@x","Name":"T"}]}"#
+        );
+        mock_get!(r"/calendar/v1/cal1/keys.*", 200, r#"{"Keys":[]}"#);
+        mock_get!(
+            r"/calendar/v1/cal1/passphrase.*",
+            200,
+            r#"{"Passphrase":null}"#
+        );
+        // Real (non-empty) calendar defaults: the -PT1H phone alarm
+        // differs from the inherited -PT15M → genuine notification change.
+        mock_get!(
+            r"/calendar/v1/cal1/settings.*",
+            200,
+            r#"{"Code":1000,"CalendarSettings":{"DefaultPartDayNotifications":[{"Trigger":"-PT15M","Type":1}],"DefaultFullDayNotifications":[]}}"#
+        );
+        // The personal PUT — exact two-field body, no cards involved.
+        let put_personal = server
+            .mock(
+                "PUT",
+                mockito::Matcher::Regex(r"/calendar/v1/cal1/events/e1/personal".into()),
+            )
+            .match_body(mockito::Matcher::JsonString(
+                r#"{"Notifications":[{"Trigger":"-PT1H","Type":1}],"Color":null}"#.into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                "{\"Code\":1000,\"Event\":{\"ID\":\"e1\",\"UID\":\"u1\",\"LastEditTime\":101}}",
+            )
+            .create();
+        // Any whole-object reseal fails the test (expect-zero + assert).
+        let no_reseal = server
+            .mock(
+                "PUT",
+                mockito::Matcher::Regex(r"/calendar/v1/cal1/events/sync.*".into()),
+            )
+            .expect(0)
+            .create();
+        guards.push(no_reseal);
+
+        let mut c = cfg();
+        c.refresh_token = Some("rt".into());
+        c.uid = Some("uid".into());
+        c.access_token = Some("at".into());
+        c.password = "testpw".into();
+        c.api_base_url = Some(server.url());
+        c.local_inventory = Some(vec![crate::upsync::LocalItem {
+            mkcal_uid: "n1".into(),
+            proton_id: Some("e1".into()),
+            deleted: false,
+            modified: true,
+            last_synced_mtime: Some(100),
+            fields: Some(proton_api::LocalFields {
+                summary: Some("Same".into()),
+                description: Some("Same desc".into()),
+                location: Some("Same loc".into()),
+                start_unix: Some(now),
+                end_unix: Some(now + 3600),
+                all_day: Some(false),
+                notifications: Some(vec![serde_json::json!({"Trigger": "-PT1H", "Type": 1})]),
+                ..Default::default()
+            }),
+            calendar_id: Some("cal1".into()),
+            uid: None,
+        }]);
+        let mut anchors = std::collections::HashMap::new();
+        anchors.insert("e1".to_string(), 100);
+        c.anchor_map = Some(anchors);
+
+        let mut engine = CalendarSyncEngine::new(c.clone());
+        engine.start_sync(c);
+        assert_eq!(engine.status().state, "complete");
+        put_personal.assert();
+        let dbg = engine.get_keys_debug().unwrap_or_default();
+        assert!(dbg.contains("upsync_personal"), "{dbg}");
         let _held = guards;
     }
 

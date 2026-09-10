@@ -130,6 +130,40 @@ pub fn marshal_color(color: &str) -> serde_json::Value {
     }
 }
 
+/// Shared Notifications/Color wire encoding for whole-object updates AND
+/// the personal-part route (both take the same tri-state values, see
+/// `UpdateOverrides`): `None` = re-send row values verbatim,
+/// `Some(None)` = force `null` (inherit), `Some(Some(list))` = force the
+/// array. One implementation so the two routes can never diverge.
+pub fn marshal_notif_color(
+    row_notifications: Option<&[serde_json::Value]>,
+    row_color: &str,
+    applied: &UpdateOverrides,
+) -> (serde_json::Value, serde_json::Value) {
+    let notifications = match &applied.notifications {
+        None => marshal_notifications(
+            row_notifications.is_some(),
+            row_notifications.unwrap_or(&[]),
+        ),
+        Some(None) => serde_json::Value::Null,
+        Some(Some(list)) => marshal_notifications(true, list),
+    };
+    let color = match &applied.color {
+        None => marshal_color(row_color),
+        Some(hex) => marshal_color(hex),
+    };
+    (notifications, color)
+}
+
+/// Personal-part body (`PUT …/events/{id}/personal`,
+/// `CreateSinglePersonalEventData`): reminder/color-only edits without
+/// resealing any card. Same value semantics as the sync body.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PersonalEventBody {
+    pub Notifications: serde_json::Value,
+    pub Color: serde_json::Value,
+}
+
 /// One clear `Attendees` row on an update body: token + live RSVP status
 /// (proton-cal `attendeeClear`; `Comment` preserved verbatim, null absent).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -901,5 +935,47 @@ mod tests {
         assert!(exception_sequence_ok(3, 3));
         assert!(exception_sequence_ok(3, 5));
         assert!(!exception_sequence_ok(3, 2));
+    }
+
+    #[test]
+    fn test_marshal_notif_color_tristate() {
+        use serde_json::{json, Value};
+        let row_notif = vec![json!({"Trigger": "-PT15M", "Type": 1})];
+        // Verbatim re-send (no overrides).
+        let (n, c) = marshal_notif_color(Some(&row_notif), "#EC3E7C", &UpdateOverrides::default());
+        assert_eq!(n, json!([{"Trigger": "-PT15M", "Type": 1}]));
+        assert_eq!(c, Value::String("#EC3E7C".into()));
+        // Absent row values → nulls (inherit).
+        let (n, c) = marshal_notif_color(None, "", &UpdateOverrides::default());
+        assert_eq!(n, Value::Null);
+        assert_eq!(c, Value::Null);
+        // Forced inherit + forced list + color swap.
+        let custom = vec![json!({"Trigger": "-PT1H", "Type": 1})];
+        let (n, _) = marshal_notif_color(
+            Some(&row_notif),
+            "",
+            &UpdateOverrides {
+                notifications: Some(Some(custom.clone())),
+                color: None,
+            },
+        );
+        assert_eq!(n, json!([{"Trigger": "-PT1H", "Type": 1}]));
+        let (n, _) = marshal_notif_color(
+            Some(&row_notif),
+            "",
+            &UpdateOverrides {
+                notifications: Some(None),
+                color: None,
+            },
+        );
+        assert_eq!(n, Value::Null);
+        // Personal body carries the same two keys PascalCase.
+        let body = PersonalEventBody {
+            Notifications: json!([{"Trigger": "-PT1H", "Type": 1}]),
+            Color: Value::Null,
+        };
+        let v = serde_json::to_value(&body).unwrap();
+        assert_eq!(v["Notifications"], json!([{"Trigger": "-PT1H", "Type": 1}]));
+        assert_eq!(v["Color"], Value::Null);
     }
 }

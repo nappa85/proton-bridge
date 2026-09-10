@@ -1016,3 +1016,40 @@ behavioral delta after deploy: none on the happy path (same plans for
 all previously-covered shapes); only id-map-loss tombstones change
 (delete instead of silent orphan). Phone gate: deploy + steady sync
 (zero ops expected), no OTP needed.
+
+## 14. Personal-part route – 2026-09-10 (local only, no device/live)
+
+Reminder-only phone edits took a full reseal + whole-object replace
+(SEQUENCE churn, 2001/2011 surface for changing nothing structural).
+Researched first: WebClients `updatePersonalEventPart`
+(`PUT calendar/v1/{calID}/events/{eventID}/personal`,
+`CreateSinglePersonalEventData{Notifications, Color}` — just two
+fields, no cards/keys) + `Api.ts` response shape. Implemented:
+`PersonalEventBody` + one shared Notifications/Color marshal used by
+BOTH routes (extracted from the update path — existing override tests
+prove no behavior change); `CalendarClient::put_personal` (HTTP +
+envelope-code failures keep the body, contacts-4xx lesson);
+`content_matches_except_notifications` strict whitelist (every compared
+field present and exactly equal — times vs authoritative row columns
+with the all-day adjustment, texts vs decrypted merged view;
+non-recurring, no attendees/exdates/recurrence/personal rows; any
+decrypt failure or doubt → existing replace); engine routes
+notification-change-only updates to it (distinct `upsync_personal`
+trace, same re-list discipline). 210 workspace tests green, bundle
+green, staged `e46b3605…`. Phone gate: reminder change on a plain
+event → `upsync_personal` + web shows it; text/time edits must still
+reseal.
+
+### Live 2026-09-10 — PERSONAL ROUTE VERIFIED (+ parity note)
+
+Deployed `e46b3605…` (sha-checked). Reminder change on a plain event →
+`upsync_personal cal=RfXFIcmY id=wFxf…`, 21 saved, web shows the 1-hour
+display reminder with the inherited email gone. That email loss is
+Proton-model-correct, NOT a regression: byte-identical to the 09-08
+full-reseal verification of the same edit (custom list replaces
+inheritance, including on Proton web itself; the phone edits a single
+display alarm and can never originate email). Explicit server-side
+email entries remain preserved via the Type-0 merge on later edits
+(unchanged code path). Personal route proven semantically identical to
+the reseal for reminder edits, minus crypto/SEQUENCE/rejection costs.
+Remainder: one text/time edit to prove the router still reseals those.
