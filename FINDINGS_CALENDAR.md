@@ -1053,3 +1053,22 @@ email entries remain preserved via the Type-0 merge on later edits
 (unchanged code path). Personal route proven semantically identical to
 the reseal for reminder edits, minus crypto/SEQUENCE/rejection costs.
 Remainder: one text/time edit to prove the router still reseals those.
+
+## 15. Calendar create idempotency – 2026-09-10 (local only, no device/live)
+
+Contacts-side retry work exposed the same hole here (fresh
+`proton-sync-{account}-{nanos}` UID per attempt → POST-ok + re-list-fail
+duplicates). proton-cal documents `Overwrite: 0` sends but NOT clash
+semantics, so the design assumes nothing: stable UIDs + per-op Index
+partition + adopt-via-`list_by_uid` on any non-1000 code +
+fail-closed otherwise + re-list-confirmed drain (out-of-window creates
+stay pending — convergent on dedupe, never worse than fresh). Branch
+analysis: upsert→converges, error+row→adopt, error+no-row→today's
+stuckness. Shim `calendar_pending` wholesale-persisted on both outcomes
++ exported for never-synced rows; FFI getter added. Tests found two
+mock-harness truths worth keeping: mockito 1.7 serves never-hit mocks
+first (catch-alls shadow query mocks until hit — `.expect(0)` marks
+satisfied), and the windowed re-list filters 1970 fixtures (use live
+timestamps). 214 workspace tests green, bundle green, staged
+`6dcb165a…`. Phone gate: deploy + steady sync (no behavior change
+without a failure).

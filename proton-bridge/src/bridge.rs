@@ -829,6 +829,30 @@ pub extern "C" fn proton_calendar_get_anchors_json(e: *mut ProtonCalendarEngine)
     }
 }
 
+/// Posted-but-unconfirmed creates (`{mKCal UID: stable event UID}` JSON,
+/// null when none). Valid after ANY run outcome — especially errors, where
+/// the shim must still persist it wholesale as `calendar_pending` (never
+/// merge: an empty return clears stale entries).
+#[no_mangle]
+pub extern "C" fn proton_calendar_get_pending_json(e: *mut ProtonCalendarEngine) -> *mut c_char {
+    if e.is_null() {
+        return std::ptr::null_mut();
+    }
+    let eref = unsafe { &*e };
+    let guard = eref.inner.lock().unwrap();
+    match guard.as_ref() {
+        Some(eng) => {
+            let s = eng.pending_json();
+            if s.is_empty() {
+                std::ptr::null_mut()
+            } else {
+                CString::new(s).unwrap().into_raw()
+            }
+        }
+        None => std::ptr::null_mut(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

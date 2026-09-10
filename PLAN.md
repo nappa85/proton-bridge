@@ -411,8 +411,25 @@ Sync (buteo OOPP, proton_bridge_shim.cpp, NoUserInteractionPolicy):
   `609dc594a35bc1b03c7624bfe29ff7f15090a8eac6322572af4195f263a6a721`
   (supersedes `0fd5770e…` — deploy only this). Live delta: none on
   happy path (same UIDs/PUTs); phone gate is deploy + steady sync.
-  Calendar keeps the documented caveat (engine differs; separate TODO
-  if wanted).
+- [x] **Calendar create idempotency** (filed 2026-09-09 as the calendar
+  half of the above, DONE 2026-09-10 local-only): same template —
+  stable event UIDs (`pending_uid` from the shim `calendar_pending`
+  map, else fresh `proton-sync-{account}-{nanos}`), per-op Index
+  partition instead of all-or-nothing, UID-conflict adopt via
+  `list_by_uid`, unresolvable-conflict fail-closed, re-list-confirmed
+  drain (out-of-window creates stay pending — convergent on dedupe,
+  never worse than fresh). Conflict semantics undocumented in proton-cal
+  (Overwrite: 0 sent, behavior on clash unknown) — the design is ≥
+  status quo in every branch (upsert→converges, error+row→adopt,
+  error+no-row→same stuckness as today). Shim persists wholesale on
+  complete AND error + exports for never-synced rows; FFI
+  `proton_calendar_get_pending_json`. Verified: fmt + clippy clean, 214
+  tests (127+5+82: retry-reuse with same-UID POST proof, adopt,
+  unresolvable-fails-closed, contract compat), full bundle green.
+  Staged `packaging/buteo-plugin/libproton-client.so` sha256
+  `6dcb165aa9309a3753448d748873f41399889f81ded19d8075f9bc1a9a327b6a`
+  (supersedes `e46b3605…` — deploy only this). Live delta: none on
+  happy path; phone gate is deploy + steady sync.
 - [ ] **FIDO2 feasibility re-research** (filed 2026-09-09 by user
   challenge — RESEARCHED 2026-09-09, verdict in `FINDINGS_OTP.md` §9):
   the fingerprint reader canNOT become an authenticator (live fpd

@@ -1453,6 +1453,12 @@ void ProtonCalendarPlugin::pollCalendarStatus() {
             persistUpsyncAnchors(QString::fromUtf8(anchors));
             proton_bridge_free_string(anchors);
         }
+        // Posted-but-unconfirmed creates persist wholesale on complete too
+        // (normally empty then — the drain above already cleared them — but
+        // write it regardless so stale entries can never linger).
+        char *pending = proton_calendar_get_pending_json(m_calEngine);
+        persistCalendarPending(pending ? QString::fromUtf8(pending) : QString());
+        if (pending) proton_bridge_free_string(pending);
         m_purgeableUids.clear();
         char *purgeable = proton_calendar_get_purgeable_json(m_calEngine);
         if (purgeable) {
@@ -1492,6 +1498,12 @@ void ProtonCalendarPlugin::pollCalendarStatus() {
         QString errMsg = QString::fromUtf8(reinterpret_cast<const char*>(status.error),
                                            strnlen(reinterpret_cast<const char*>(status.error), 256));
         proton_log(QStringLiteral("Calendar sync error: ") + errMsg);
+        // The error path is exactly when posted-but-unconfirmed creates
+        // exist (e.g. re-list failed after successful POSTs): persist the
+        // pending retry UIDs wholesale so the next cycle reuses them.
+        char *pending = proton_calendar_get_pending_json(m_calEngine);
+        persistCalendarPending(pending ? QString::fromUtf8(pending) : QString());
+        if (pending) proton_bridge_free_string(pending);
         sendProtonNotification(QStringLiteral("Proton Calendar sync failed"), errMsg);
         emit error(getProfileName(), errMsg, Buteo::SyncResults::AUTHENTICATION_FAILURE);
     }
@@ -2249,6 +2261,7 @@ QJsonArray ProtonCalendarPlugin::exportLocalInventory() {
     QVariantMap idMap = readMap(QStringLiteral("proton_id_map"));
     QVariantMap anchors = readMap(QStringLiteral("proton_anchors"));
     QVariantMap lastMod = readMap(QStringLiteral("proton_last_modified"));
+    QVariantMap pending = readMap(QStringLiteral("calendar_pending"));
     settings.endGroup();
 
     QString prefix = QStringLiteral("proton-calendar-%1-").arg(m_accountId);
@@ -2273,6 +2286,12 @@ QJsonArray ProtonCalendarPlugin::exportLocalInventory() {
             if (protonId.isEmpty()) protonId = idMap.value(ev->uid()).toString();
             o.insert(QStringLiteral("proton_id"),
                      protonId.isEmpty() ? QJsonValue() : QJsonValue(protonId));
+            // Stable retry UID (if the previous cycle posted but never
+            // confirmed): never-synced rows only, like the planner's
+            // Create ops.
+            if (protonId.isEmpty() && pending.contains(ev->uid())) {
+                o.insert(QStringLiteral("pending_uid"), pending.value(ev->uid()).toString());
+            }
             o.insert(QStringLiteral("deleted"), false);
             bool dirty = false;
             if (ev->lastModified().isValid() && lastMod.contains(ev->uid())) {
@@ -2397,6 +2416,17 @@ QString ProtonCalendarPlugin::loadUpsyncAnchors() {
     QString a = settings.value(QStringLiteral("proton_anchors")).toString();
     settings.endGroup();
     return a;
+}
+void ProtonCalendarPlugin::persistCalendarPending(const QString &pendingJson) {
+    // Wholesale overwrite (never merge): empty clears confirmed/stale
+    // entries. Cap logged length like the anchors line.
+    if (!pendingJson.isEmpty()) {
+        proton_log(QStringLiteral("Persisted calendar pending: %1").arg(pendingJson.left(500)));
+    }
+    QSettings settings(QStringLiteral("proton"), QStringLiteral("sync-tokens"));
+    settings.beginGroup(m_accountId);
+    settings.setValue(QStringLiteral("calendar_pending"), pendingJson);
+    settings.endGroup();
 }
 void ProtonCalendarPlugin::persistCalendarTokens(const QString &refreshToken, const QString &uid) {
     QSettings settings(QStringLiteral("proton"), QStringLiteral("sync-tokens"));

@@ -149,6 +149,10 @@ private:
     QString loadCalendarDefaults();
     void persistUpsyncAnchors(const QString &anchorsJson);
     QString loadUpsyncAnchors();
+    // Posted-but-unconfirmed creates ({mKCal UID: stable event UID}) for
+    // retry idempotency. Persisted wholesale on EVERY run outcome
+    // (complete AND error); empty clears stale entries, never merges.
+    void persistCalendarPending(const QString &pendingJson);
     void persistUpsyncMaps(const QJsonArray &events,
                            const mKCal::ExtendedCalendar::Ptr &cal);
     void purgeListedTombstones(const mKCal::ExtendedStorage::Ptr &storage,

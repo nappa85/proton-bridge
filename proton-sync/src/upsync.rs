@@ -65,6 +65,14 @@ pub struct LocalItem {
     /// missed (out-of-window deletes). Live rows don't need it.
     #[serde(default)]
     pub uid: Option<String>,
+    /// Stable retry UID from the previous cycle (shim `calendar_pending`
+    /// map): the last create attempt posted but never confirmed (re-list
+    /// failure), so the next POST reuses it instead of minting a fresh
+    /// one (retry idempotency — a retry either succeeds, upserts, or
+    /// UID-conflicts into adoption, never duplicates). Absent on old
+    /// shims and first attempts.
+    #[serde(default)]
+    pub pending_uid: Option<String>,
 }
 
 /// One upload operation (phase 1), in plan order.
@@ -446,6 +454,7 @@ mod tests {
             fields: None,
             calendar_id: None,
             uid: None,
+            pending_uid: None,
         }
     }
 
@@ -460,6 +469,7 @@ mod tests {
             fields: None,
             calendar_id: None,
             uid: Some(uid.into()),
+            pending_uid: None,
         }
     }
 
@@ -897,5 +907,27 @@ mod tests {
         assert_eq!(v["proton_id"], "e1");
         let back: LocalItem = serde_json::from_value(v).unwrap();
         assert_eq!(back, item);
+    }
+
+    #[test]
+    fn test_pending_uid_contract_compat_both_ways() {
+        // New shim → new engine: pending_uid round-trips (stable retry UID
+        // for posted-but-unconfirmed creates).
+        let mut item = local("n1", None, false, true, None);
+        item.pending_uid = Some("proton-sync-uid-1".into());
+        let v = serde_json::to_value(&item).unwrap();
+        assert_eq!(v["pending_uid"], "proton-sync-uid-1");
+        let back: LocalItem = serde_json::from_value(v).unwrap();
+        assert_eq!(back.pending_uid.as_deref(), Some("proton-sync-uid-1"));
+        // Old shim → new engine: absent key parses (no half-fed breakage).
+        let old_json = r#"{"mkcal_uid":"n1","proton_id":null,"deleted":false,"modified":true,"last_synced_mtime":null}"#;
+        let old: LocalItem = serde_json::from_str(old_json).expect("old JSON parses");
+        assert_eq!(old.pending_uid, None);
+        // The planner never reads pending_uid: identical creates either way.
+        let with_pending = plan_sync(&[], std::slice::from_ref(&item));
+        let without = plan_sync(&[], std::slice::from_ref(&old));
+        // (item has fields:None in both — planner needs fields only at
+        // execution; the op shape is what matters here.)
+        assert_eq!(with_pending.uploads.len(), without.uploads.len());
     }
 }
