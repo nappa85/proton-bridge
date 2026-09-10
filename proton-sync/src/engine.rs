@@ -1928,6 +1928,114 @@ mod tests {
     }
 
     #[test]
+    fn test_contact_labeled_update_uploads_mock() {
+        // Labeled (Type-0) server cards no longer defer: the phone edit
+        // seals with the carried cleartext part and the PUT fires with
+        // REAL generated keys through the password unlock path.
+        let (user_esc, user_raw) = armored_test_key();
+        let (addr_esc, _) = armored_test_key();
+        let mut server = mockito::Server::new();
+        let mut guards = Vec::new();
+        macro_rules! mock_get {
+            ($re:expr, $code:expr, $body:expr) => {
+                guards.push(
+                    server
+                        .mock("GET", mockito::Matcher::Regex($re.into()))
+                        .with_status($code)
+                        .with_header("content-type", "application/json")
+                        .with_body($body)
+                        .create(),
+                );
+            };
+        }
+        mock_get!(
+            r"/core/v4/users.*",
+            200,
+            format!(
+                r#"{{"User":{{"ID":"u","Name":"t","Keys":[{{"ID":"k1abcdef01","PrivateKey":"{user_esc}","Token":"","Signature":""}}]}}}}"#
+            )
+        );
+        mock_get!(
+            r"/core/v4/keys/salts.*",
+            200,
+            r#"{"KeySalts":[{"ID":"k1abcdef01","KeySalt":""},{"ID":"ak1abcdef01","KeySalt":""}]}"#
+        );
+        mock_get!(
+            r"/core/v4/addresses.*",
+            200,
+            format!(
+                r#"{{"Addresses":[{{"ID":"a1","Email":"t@x","Keys":[{{"ID":"ak1abcdef01","PrivateKey":"{addr_esc}","Token":"","Signature":""}}]}}]}}"#
+            )
+        );
+        let mut user_key = proton_api::UnlockedKey::from_armored(&user_raw, b"").unwrap();
+        let (enc_data_raw, enc_sig_raw) = proton_api::contact_seal::seal_contact_card(
+            "BEGIN:VCARD\r\nVERSION:4.0\r\nUID:u1\r\nN:Old;Name;;;\r\nEND:VCARD",
+            std::slice::from_mut(&mut user_key),
+        )
+        .unwrap();
+        let enc_data = enc_data_raw.replace('\n', "\\n");
+        let enc_sig = enc_sig_raw.replace('\n', "\\n");
+        // Import shape: signed + sealed + cleartext labels.
+        let row_e1 = format!(
+            r#"{{"ID":"c1","Name":"Old","UID":"u1","ModifyTime":100,
+            "Cards":[{{"Type":2,"Data":"BEGIN:VCARD\r\nVERSION:4.0\r\nUID:u1\r\nFN:Old Name\r\nEND:VCARD","Signature":"s"}},
+            {{"Type":3,"Data":"{enc_data}","Signature":"{enc_sig}"}},
+            {{"Type":0,"Data":"BEGIN:VCARD\r\nVERSION:4.0\r\nUID:u1\r\nFN:Old Name\r\nCATEGORIES:Friends\r\nEND:VCARD","Signature":null}}]}}"#,
+        );
+        guards.push(
+            server
+                .mock("GET", mockito::Matcher::Regex(r"/contacts/v4".into()))
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                .with_body(format!("{{\"Contacts\":[{row_e1}],\"Total\":1}}"))
+                .create(),
+        );
+        guards.push(
+            server
+                .mock("GET", mockito::Matcher::Regex(r"/contacts/v4/c1".into()))
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                .with_body(format!("{{\"Contact\":{row_e1}}}"))
+                .create(),
+        );
+        let put = server
+            .mock("PUT", mockito::Matcher::Regex(r"/contacts/v4/c1".into()))
+            .match_body(mockito::Matcher::Regex(r#""Cards":\["#.into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"Contact":{"ID":"c1","Name":"Edited","UID":"u1","ModifyTime":101}}"#)
+            .create();
+
+        let mut c = cycle_cfg(server.url());
+        c.password = "testpw".into();
+        c.contact_inventory = Some(vec![crate::contact_plan::ContactItem {
+            qcontact_id: "q1".into(),
+            proton_uid: Some("u1".into()),
+            modified: true,
+            last_synced_mtime: Some(100),
+            fields: Some(proton_api::vcard::ParsedContact {
+                first_name: "Edited".into(),
+                ..Default::default()
+            }),
+            pending_uid: None,
+        }]);
+        let mut anchors = std::collections::HashMap::new();
+        anchors.insert("u1".to_string(), 100);
+        c.contact_anchors = Some(anchors);
+
+        let mut engine = SyncEngine::new(c.clone());
+        engine.start_sync(c);
+        assert_eq!(engine.status().state, "complete");
+        put.assert();
+        let dbg = engine.get_keys_debug().unwrap_or_default();
+        assert!(
+            dbg.contains("ran created=0 updated=1 deleted=0 deferred=0"),
+            "{dbg}"
+        );
+        let _held = guards;
+    }
+
+    #[test]
     fn test_contact_keyed_update_uploads_mock() {
         // Per-email crypto settings no longer defer: the keyed server cards
         // seal (groups carried, regrouped) and the PUT fires with REAL

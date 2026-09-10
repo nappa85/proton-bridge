@@ -607,3 +607,33 @@ sync → `plan c=0 u=1 d=0` → `ran updated=1 deferred=0`, photo visible
 on Proton web. Upload path verified end to end (avatar export →
 downscale → data URI → sealed PHOTO → server). Remainder: avatar
 removal propagation (documented v1 gap — photo stays server-side).
+
+## 15. Categories/Type-0 preservation – 2026-09-10 (local only)
+
+Labeled (imported) contacts deferred every phone edit. Fix, same
+preserve pattern as key groups: `CATEGORIES` parsed (split on
+UNESCAPED commas from the raw library value — verified ical_vcard
+returns TEXT raw; unescape-first was double-processing, caught by
+test) + `PRODID`, re-emitted as Type-0 (VERSION + PRODID +
+comma-joined, no uid/fn per CLEAR_FIELDS; nothing when unlabeled).
+Wire fix bundled: explicit-null `Signature` on Type-0 reads no longer
+fails the contact parse, and writes omit it (Go reads absent as null).
+Guard: CATEGORIES is now known (preserved); exotics anywhere —
+including inside Type-0 — still defer and name themselves. 220
+workspace tests green, bundle green, staged `9179ed5d…`. Phone gate:
+label on web → phone edit → `updated=1`, labels intact.
+
+### Live 2026-09-10 — categories gate BLOCKED on fixtures (no code fault)
+
+The post-edit export lacked CATEGORIES, so: deleted the probe on web
+(sync applied the server delete, back to 2 contacts), re-imported the
+same vcf, exported immediately with zero phone involvement — still no
+CATEGORIES (only FN+PREF/N/UID/grouped EMAIL survice import). Verdict:
+the web import path (and/or export) drops labels before our code ever
+sees them; the earlier `updated=1` ran on a labelless card and proves
+nothing either way. Web has no label UI, so no Type-0 fixture can
+reach the account through supported paths. Implementation stays
+offline-proven (parse/emit/round-trip/seal/diagnose/engine-PUT, null
+Signature both directions) and activates on encounter. Lesson for
+future gates: validate the FIXTURE (import→export round trip) before
+burning phone cycles on the behavior.

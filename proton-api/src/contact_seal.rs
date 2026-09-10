@@ -102,8 +102,10 @@ fn detached_sign_any(plain: &str, user_keys: &mut [UnlockedKey]) -> Result<Strin
     Err(ProtonError::Crypto(last_err))
 }
 
-/// Decrypt all server cards, split by provenance. `None` on a Type-0
-/// cleartext card or any decrypt failure (fail-closed either way).
+/// Decrypt all server cards, split by provenance. `None` on any decrypt
+/// failure (fail-closed either way). Type-0 cleartext joins the signed
+/// side (read-only: labels parsed for preservation, guard-checked like
+/// everything else).
 fn split_server_plains(
     cards: &[crate::ContactCard],
     user_keys: &mut [UnlockedKey],
@@ -112,8 +114,7 @@ fn split_server_plains(
     let mut decrypted = Vec::new();
     for card in cards {
         match card.Type {
-            0 => return None,
-            2 => signed.push(card.Data.clone()),
+            0 | 2 => signed.push(card.Data.clone()),
             _ => {
                 decrypted.push(crate::crypto::decrypt_contact_card(&card.Data, user_keys).ok()?);
             }
@@ -135,19 +136,23 @@ fn blocking_unknowns(signed: &[String], decrypted: &[String]) -> Vec<String> {
     out
 }
 
+/// Decrypted server state for one update rebuild: parsed cards (photo
+/// carry), carried key groups (regrouped at seal), and carried cleartext
+/// lines (regrouped Type-0 part, or empty).
+struct DecryptedServerCards {
+    parsed: Vec<crate::vcard::ParsedContact>,
+    key_groups: Vec<crate::vcard::KeyGroup>,
+    clear: Vec<crate::vcard::ClearProp>,
+}
+
 /// Decrypt + parse all server cards of one contact for an update rebuild.
-/// Returns the parsed cards in order plus the carried per-email crypto
-/// settings (key groups from the signed cards, regrouped at seal time);
-/// `None` when a Type-0 cleartext card exists (nothing to merge it into —
-/// rebuild would drop it), any card fails to decrypt/parse, or blocking
-/// unknown props are present.
+/// Returns `None` when any card fails to decrypt/parse, or blocking
+/// unknown props are present. Type-0 cards no longer defer — their labels
+/// re-emit verbatim.
 fn decrypt_server_cards(
     cards: &[crate::ContactCard],
     user_keys: &mut [UnlockedKey],
-) -> Option<(
-    Vec<crate::vcard::ParsedContact>,
-    Vec<crate::vcard::KeyGroup>,
-)> {
+) -> Option<DecryptedServerCards> {
     let (signed, decrypted) = split_server_plains(cards, user_keys)?;
     if !blocking_unknowns(&signed, &decrypted).is_empty() {
         return None;
@@ -161,7 +166,19 @@ fn decrypt_server_cards(
     for plain in &signed {
         groups.extend(crate::vcard::extract_key_groups(plain));
     }
-    Some((parsed, groups))
+    let signed_all = signed.join("\r\n");
+    let mut clear = Vec::new();
+    for card in cards {
+        if card.Type != 0 {
+            continue;
+        }
+        clear.extend(crate::vcard::extract_cleartext(&signed_all, &card.Data));
+    }
+    Some(DecryptedServerCards {
+        parsed,
+        key_groups: groups,
+        clear,
+    })
 }
 
 /// Diagnose WHY an update rebuild deferred, for the file-log trace
@@ -172,13 +189,10 @@ pub fn diagnose_update_block(
     cards: &[crate::ContactCard],
     user_keys: &mut [UnlockedKey],
 ) -> String {
-    if cards.iter().any(|card| card.Type == 0) {
-        return "cleartext-card".to_string();
-    }
     let mut signed = Vec::with_capacity(cards.len());
     let mut decrypted = Vec::with_capacity(cards.len());
     for card in cards {
-        if card.Type == 2 {
+        if card.Type == 0 || card.Type == 2 {
             signed.push(card.Data.clone());
         } else {
             match crate::crypto::decrypt_contact_card(&card.Data, user_keys) {
@@ -213,28 +227,30 @@ pub fn build_contact_update_cards(
     contact_uid: &str,
     user_keys: &mut [UnlockedKey],
 ) -> Result<Option<Vec<crate::ContactCard>>> {
-    let Some((server_parsed, key_groups)) = decrypt_server_cards(server_cards, user_keys) else {
+    let Some(server) = decrypt_server_cards(server_cards, user_keys) else {
         return Ok(None);
     };
     let mut merged = phone.clone();
     if merged.photos.is_empty() {
-        merged.photos = server_parsed
+        merged.photos = server
+            .parsed
             .iter()
             .flat_map(|parsed| parsed.photos.clone())
             .collect();
     }
     let (mut signed_plain, enc_plain) = crate::vcard::build_vcard(&merged, contact_uid);
-    // Carry crypto settings: same numbering as the rebuilt emails
-    // (`item{i+1}` for the i-th phone email), bodies byte-identical.
-    // Addresses dropped from the phone snapshot lose their groups.
-    if !key_groups.is_empty() {
-        let email_to_group: std::collections::HashMap<String, String> = merged
-            .emails
-            .iter()
-            .enumerate()
-            .map(|(i, mail)| (mail.email.clone(), format!("item{}", i + 1)))
-            .collect();
-        let carried = crate::vcard::render_key_groups(&key_groups, &email_to_group);
+    // Rebuilt-email numbering shared by both carries below (`item{i+1}`
+    // for the i-th phone email).
+    let email_to_group: std::collections::HashMap<String, String> = merged
+        .emails
+        .iter()
+        .enumerate()
+        .map(|(i, mail)| (mail.email.clone(), format!("item{}", i + 1)))
+        .collect();
+    // Carry crypto settings: bodies byte-identical. Addresses dropped from
+    // the phone snapshot lose their groups.
+    if !server.key_groups.is_empty() {
+        let carried = crate::vcard::render_key_groups(&server.key_groups, &email_to_group);
         signed_plain = crate::vcard::append_vcard_lines(&signed_plain, &carried);
     }
     let signed_sig = detached_sign_any(&signed_plain, user_keys)?;
@@ -252,6 +268,15 @@ pub fn build_contact_update_cards(
             Type: 3,
             Data: enc_data,
             Signature: enc_sig,
+        });
+    }
+    // Labels ride a Type-0 cleartext part (WebClients emits one only with
+    // categories); the rebuilt signed card already carries the overlap.
+    if let Some(clear_plain) = crate::vcard::build_cleartext_card(&server.clear, &email_to_group) {
+        cards.push(crate::ContactCard {
+            Type: 0,
+            Data: clear_plain,
+            Signature: String::new(),
         });
     }
     Ok(Some(cards))
@@ -572,19 +597,29 @@ mod tests {
 
     #[test]
     fn test_update_defers_cleartext_and_unknown() {
+        // NOTE: plain categorized cleartext no longer defers (labels are
+        // preserved — see test_update_preserves_categories below); this
+        // test now covers a cleartext card carrying an EXOTIC prop (which
+        // the rebuild would drop) alongside the classic unknown case.
         let mut user = test_user_identity();
         let phone = crate::vcard::ParsedContact::default();
-        // Type-0 cleartext card would be dropped by the rebuild.
-        let clear = vec![crate::ContactCard {
+        let clear_exotic = vec![crate::ContactCard {
             Type: 0,
-            Data: "BEGIN:VCARD\r\nVERSION:4.0\r\nUID:c\r\nFN:x\r\nCATEGORIES:Friends\r\nEND:VCARD"
+            Data: "BEGIN:VCARD\r\nVERSION:4.0\r\nUID:c\r\nFN:x\r\nCATEGORIES:Friends\r\nX-CUSTOM:1\r\nEND:VCARD"
                 .into(),
             Signature: String::new(),
         }];
-        assert!(
-            build_contact_update_cards(&clear, &phone, "c", std::slice::from_mut(&mut user))
-                .unwrap()
-                .is_none()
+        assert!(build_contact_update_cards(
+            &clear_exotic,
+            &phone,
+            "c",
+            std::slice::from_mut(&mut user)
+        )
+        .unwrap()
+        .is_none());
+        assert_eq!(
+            diagnose_update_block(&clear_exotic, std::slice::from_mut(&mut user)),
+            "unknown-props:X-CUSTOM"
         );
         // Unknown X- prop likewise defers.
         let (enc_data, enc_sig) = seal_contact_card(
@@ -602,6 +637,86 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn test_update_preserves_categories_cleartext() {
+        // Previously: any Type-0 card deferred (`cleartext-card`). Now the
+        // labels re-emit regrouped (real grouped export shape), with a
+        // null-equivalent absent Signature on the wire.
+        let mut user = test_user_identity();
+        let signed = "BEGIN:VCARD\r\nVERSION:4.0\r\nUID:c\r\nFN:Labeled\r\nitem1.EMAIL:labeled@example.com\r\nEND:VCARD";
+        let clear = "BEGIN:VCARD\r\nVERSION:4.0\r\nPRODID;VALUE=TEXT:-//X//Y//EN\r\nitem1.CATEGORIES:Friends\r\nEND:VCARD";
+        let cards = vec![
+            crate::ContactCard {
+                Type: 2,
+                Data: signed.to_string(),
+                Signature: "sig".into(),
+            },
+            crate::ContactCard {
+                Type: 0,
+                Data: clear.to_string(),
+                Signature: String::new(),
+            },
+        ];
+        let phone = crate::vcard::ParsedContact {
+            display_name: "LabeledEdited".into(),
+            emails: vec![crate::vcard::ParsedEmail {
+                email: "labeled@example.com".into(),
+                types: Vec::new(),
+            }],
+            ..Default::default()
+        };
+        let out = build_contact_update_cards(&cards, &phone, "c", std::slice::from_mut(&mut user))
+            .unwrap()
+            .expect("labeled update seals");
+        // Email-only phone snapshot → single Type-2 + carried Type-0.
+        assert_eq!(out.len(), 2);
+        let clear_out = out.iter().find(|c| c.Type == 0).expect("Type 0 emitted");
+        assert!(clear_out.Data.contains("VERSION:4.0"), "{}", clear_out.Data);
+        // Params preserved verbatim; group follows the rebuilt email.
+        assert!(
+            clear_out.Data.contains("PRODID;VALUE=TEXT:-//X//Y//EN"),
+            "{}",
+            clear_out.Data
+        );
+        assert!(
+            clear_out.Data.contains("item1.CATEGORIES:Friends"),
+            "{}",
+            clear_out.Data
+        );
+        assert!(!clear_out.Data.contains("UID:"), "{}", clear_out.Data);
+        assert!(!clear_out.Data.contains("FN:"), "{}", clear_out.Data);
+        // Wire shape: absent Signature (server reads it as null).
+        let v = serde_json::to_value(clear_out).unwrap();
+        assert!(v.get("Signature").is_none(), "{v}");
+        assert_eq!(
+            diagnose_update_block(&cards, std::slice::from_mut(&mut user)),
+            "sealable"
+        );
+    }
+
+    #[test]
+    fn test_update_no_categories_emits_no_cleartext() {
+        // Unlabeled contacts keep the exact two-card shape (no empty
+        // Type-0 wrapper — same gate as the encrypted-card omission).
+        let mut user = test_user_identity();
+        let (cards, phone) = server_cards_fixture(&mut user);
+        let out =
+            build_contact_update_cards(&cards, &phone, "c-1", std::slice::from_mut(&mut user))
+                .unwrap()
+                .expect("update seals");
+        assert!(out.iter().all(|c| c.Type != 0));
+    }
+
+    #[test]
+    fn test_cleartext_card_null_signature_parses() {
+        // Server sends explicit null Signatures on Type-0 reads: must not
+        // fail the contact parse (previously only missing keys defaulted).
+        let card: crate::ContactCard =
+            serde_json::from_str(r#"{"Type":0,"Data":"x","Signature":null}"#).unwrap();
+        assert_eq!(card.Type, 0);
+        assert!(card.Signature.is_empty());
     }
 
     #[test]

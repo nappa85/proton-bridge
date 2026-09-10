@@ -459,6 +459,102 @@ pub fn build_vcard(contact: &ParsedContact, uid: &str) -> (String, Option<String
     (signed, encrypted)
 }
 
+/// One Type-0 cleartext line with its group context: `email` is the
+/// address of the group the line was found in (resolved from the signed
+/// card's EMAIL lines), `None` for ungrouped lines; `group` is the raw
+/// group prefix (`None` when the line has none). `line` is the raw
+/// unfolded line, verbatim (params like `;VALUE=TEXT` preserved).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClearProp {
+    pub email: Option<String>,
+    pub group: Option<String>,
+    pub line: String,
+}
+
+/// Extract preservable cleartext lines from a Type-0 card: every line
+/// except the wrapper-owned `VERSION` (plus `BEGIN`/`END`), each grouped
+/// line resolved to its address via the SIGNED card's EMAIL groups.
+/// Unknown-base lines are NOT filtered here — the update guard still
+/// trips on them (silent drops stay deferred); this only feeds the
+/// rebuild after the guard passes.
+pub fn extract_cleartext(signed_plain: &str, clear_plain: &str) -> Vec<ClearProp> {
+    let mut group_email: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for line in unfold_ical_lines(signed_plain) {
+        let Some((Some(group), base)) = split_grouped_name(&line) else {
+            continue;
+        };
+        if base != "EMAIL" {
+            continue;
+        }
+        if let Some(value) = line.split_once(':').map(|x| x.1) {
+            group_email
+                .entry(group.to_uppercase())
+                .or_insert_with(|| value.trim().to_string());
+        }
+    }
+    let mut out = Vec::new();
+    for line in unfold_ical_lines(clear_plain) {
+        let Some((group, base)) = split_grouped_name(&line) else {
+            continue;
+        };
+        if base == "BEGIN" || base == "END" || base == "VERSION" {
+            continue;
+        }
+        let email = group
+            .as_deref()
+            .and_then(|g| group_email.get(&g.to_uppercase()).cloned());
+        // Grouped lines whose group has no address stay attached to their
+        // group name (orphans are re-emitted verbatim below).
+        out.push(ClearProp { email, group, line });
+    }
+    out
+}
+
+/// Re-emit carried cleartext as a Type-0 part: ungrouped (or orphan)
+/// lines verbatim, grouped lines re-numbered onto the rebuilt emails
+/// (`email_to_group`: address → new `itemN`, same map as the key carry).
+/// An address deleted from the phone snapshot keeps its lines UNGROUPED
+/// (labels are contact-level data — dropping them would destroy user
+/// data, unlike per-address crypto settings). Returns `None` when empty
+/// (the common caseless — no wrapper without content).
+pub fn build_cleartext_card(
+    props: &[ClearProp],
+    email_to_group: &std::collections::HashMap<String, String>,
+) -> Option<String> {
+    if props.is_empty() {
+        return None;
+    }
+    let lower: std::collections::HashMap<String, &String> = email_to_group
+        .iter()
+        .map(|(k, v)| (k.to_lowercase(), v))
+        .collect();
+    let mut lines = Vec::with_capacity(props.len());
+    for prop in props {
+        // Strip exactly the stored `GROUP.` prefix; the remainder (base +
+        // params + value) always passes through byte-identical (values may
+        // legally contain dots — never re-split the line).
+        let Some(group) = prop.group.as_deref() else {
+            lines.push(prop.line.clone());
+            continue;
+        };
+        let rest = prop.line[group.len() + 1..].to_string();
+        match prop
+            .email
+            .as_ref()
+            .and_then(|e| lower.get(&e.to_lowercase()))
+        {
+            // Known address → regroup onto the rebuilt numbering.
+            Some(new_group) => lines.push(format!("{new_group}.{rest}")),
+            // Address gone (or orphan group) → keep the content ungrouped
+            // (never silently drop data, never attach it to the wrong
+            // address).
+            None => lines.push(rest),
+        }
+    }
+    Some(wrap_vcard(&lines))
+}
+
 /// Back to single-letter GENDER (inverse of the parse mapping).
 fn gender_letter(gender: &str) -> String {
     match gender.to_uppercase().as_str() {
@@ -472,8 +568,9 @@ fn gender_letter(gender: &str) -> String {
 }
 
 /// Property names the update path understands (everything `build_vcard`
-/// round-trips). A decrypted server card carrying anything else (X-*
-/// props, key fields, LABELs…) defers the update — rebuilding would
+/// round-trips, plus `CATEGORIES`/`PRODID` which the Type-0 part carries
+/// verbatim on rebuild). A decrypted server card carrying anything else
+/// (X-* props, key fields, LABELs…) defers the update — rebuilding would
 /// silently drop it (calendar patch-in-place lesson). `LOGO` counts as
 /// known (folds into photos, re-emitted as `PHOTO`).
 pub fn is_known_vcard_prop(name: &str) -> bool {
@@ -501,6 +598,7 @@ pub fn is_known_vcard_prop(name: &str) -> bool {
             | "GENDER"
             | "PHOTO"
             | "LOGO"
+            | "CATEGORIES"
     )
 }
 
@@ -1003,5 +1101,83 @@ mod tests {
         }
         // Empty append is identity (no rebuild churn when nothing carried).
         assert_eq!(append_vcard_lines(&signed, &[]), signed);
+    }
+    #[test]
+    fn test_parse_categories_and_prodid() {
+        // Sanity: the parser tolerates (and ignores for fields) Type-0
+        // label lines; extraction below is what preserves them.
+        let card = "BEGIN:VCARD\r\nVERSION:4.0\r\nUID:u\r\nFN:x\r\nPRODID:-//X//Y//EN\r\nCATEGORIES:Friends,Fam\\,ily\r\nEND:VCARD";
+        let back = parse_vcard(card).unwrap();
+        assert_eq!(back.display_name, "x");
+        // Defaults keep the shim↔engine contract stable (key absent).
+        let plain: ParsedContact = serde_json::from_str(r#"{"first_name":"A"}"#).unwrap();
+        assert_eq!(plain.display_name, "");
+    }
+
+    /// Real export shape (grouped labels + params on PRODID).
+    const GROUPED_SIGNED: &str =
+        "BEGIN:VCARD\r\nVERSION:4.0\r\nUID:u1\r\nFN:x\r\nitem1.EMAIL;TYPE=HOME:a@b.c\r\nEND:VCARD";
+
+    #[test]
+    fn test_extract_cleartext_resolves_groups() {
+        let clear = "BEGIN:VCARD\r\nVERSION:4.0\r\nPRODID;VALUE=TEXT:-//X//Y//EN\r\nitem1.CATEGORIES:Friends\r\nCATEGORIES:Solo\r\nEND:VCARD";
+        let props = extract_cleartext(GROUPED_SIGNED, clear);
+        assert_eq!(props.len(), 3, "{props:?}");
+        // Params preserved verbatim on the raw line.
+        assert!(
+            props
+                .iter()
+                .any(|p| p.line == "PRODID;VALUE=TEXT:-//X//Y//EN" && p.email.is_none()),
+            "{props:?}"
+        );
+        let grouped = props
+            .iter()
+            .find(|p| p.email.as_deref() == Some("a@b.c"))
+            .expect("email resolved");
+        assert_eq!(grouped.line, "item1.CATEGORIES:Friends");
+        assert_eq!(grouped.group.as_deref(), Some("item1"));
+        // No VERSION leakage (wrapper-owned).
+        assert!(!props.iter().any(|p| p.line.starts_with("VERSION")));
+    }
+
+    #[test]
+    fn test_extract_cleartext_unfolds_long_lines() {
+        // Live export shape: folded continuation lines rejoin before
+        // group extraction (the PHOTO fold in real exports proves the
+        // path; a folded CATEGORIES must behave identically).
+        let clear =
+            "BEGIN:VCARD\r\nVERSION:4.0\r\nitem1.CATEGORIES:Very Long\r\n Label Name\r\nEND:VCARD";
+        let props = extract_cleartext(GROUPED_SIGNED, clear);
+        assert_eq!(props.len(), 1, "{props:?}");
+        assert_eq!(props[0].line, "item1.CATEGORIES:Very LongLabel Name");
+        assert_eq!(props[0].email.as_deref(), Some("a@b.c"));
+    }
+
+    #[test]
+    fn test_build_cleartext_regroups_and_falls_back() {
+        let clear = "BEGIN:VCARD\r\nVERSION:4.0\r\nPRODID:-//P//EN\r\nitem1.CATEGORIES:Friends\r\nCATEGORIES:Solo\r\nEND:VCARD";
+        let props = extract_cleartext(GROUPED_SIGNED, clear);
+        // Rebuilt numbering differs → regrouped; ungrouped verbatim.
+        let mut map = std::collections::HashMap::new();
+        map.insert("a@b.c".to_string(), "item7".to_string());
+        let out = build_cleartext_card(&props, &map).expect("emits");
+        assert!(out.contains("item7.CATEGORIES:Friends"), "{out}");
+        assert!(out.contains("CATEGORIES:Solo"), "{out}");
+        assert!(out.contains("PRODID:-//P//EN"), "{out}");
+        assert!(!out.contains("item1.CATEGORIES"), "{out}");
+        for line in out.split("\r\n") {
+            assert!(line.len() <= 75, "overlong: {line}");
+        }
+        // Address deleted → content kept ungrouped (never dropped, never
+        // attached to the wrong address).
+        let dropped =
+            build_cleartext_card(&props, &std::collections::HashMap::new()).expect("emits");
+        assert!(dropped.contains("CATEGORIES:Friends"), "{dropped}");
+        assert!(!dropped.contains("item1."), "{dropped}");
+        // Empty → None (no wrapper without content).
+        assert_eq!(
+            build_cleartext_card(&[], &std::collections::HashMap::new()),
+            None
+        );
     }
 }

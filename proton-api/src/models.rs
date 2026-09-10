@@ -170,7 +170,14 @@ pub struct ContactCard {
     #[serde(deserialize_with = "deserialize_card_type")]
     pub Type: i32,
     pub Data: String,
-    #[serde(default)]
+    /// Armored detached signature (Types 2/3). Cleartext cards (Type 0)
+    /// carry JSON `null` on the wire: tolerated on read, omitted on write
+    /// (WebClients sends explicit null; Go treats absent identically).
+    #[serde(
+        default,
+        deserialize_with = "deserialize_string_default",
+        skip_serializing_if = "String::is_empty"
+    )]
     pub Signature: String,
 }
 

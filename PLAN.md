@@ -326,12 +326,16 @@ Sync (buteo OOPP, proton_bridge_shim.cpp, NoUserInteractionPolicy):
   Proton's model, on web too; the phone edits a single display alarm).
   Parity proven, no semantic change. Phone gate remainder: a text/time
   edit must still take the reseal path.
-- [ ] **RSVP sync-back + invitation sending** (filed 2026-09-09):
-  ORGANIZER/ATTENDEE identities are parsed and stored, attendee token
-  rows are re-sent verbatim on update, but phone-side RSVP changes and
-  new invitations never upload. Needs the write-path contract for
-  attendee mutations (proton-cal `docs/api.md` + WebClients invite
-  flows) before any code.
+- [ ] **RSVP sync-back + invitation sending** (filed 2026-09-09,
+  CONTRACT READY 2026-09-10, see `FINDINGS_CALENDAR.md` §16 — no code
+  yet, deliberately): RSVP = `PUT .../events/{id}/attendees/{attendeeID}
+  {Status, UpdateTime, Comment?}` (Status enum verified identical to
+  ours); acceptance = `PUT .../events/{uid}/accept {Signature}`
+  (signature recipe open); authoring via sync `Attendees` rows (web
+  composer flow open). Blockers, all real: our rows lack attendee ID
+  (ID≠Token, relation unknown), UpdateTime/Comment/self-resolution
+  missing; NO phone trigger (attendee events read-only); NO live invite
+  data (T16 must survive). Implementation starts only with all three.
 - [ ] **Contacts photo upload** (filed 2026-09-09): photos are dropped on
   create and only carried over on update (server copy wins). The
   "Multiple photos" entry above covers the People-app single-avatar
@@ -361,6 +365,30 @@ Sync (buteo OOPP, proton_bridge_shim.cpp, NoUserInteractionPolicy):
   found dead 21h from a restart loop — reset+restarted, now monitored;
   an unsaved/overwritten phone edit confirmed the download-wins path
   behaves.)
+- [x] **Contacts categories/Type-0 preservation** (found + done 2026-09-10
+  local-only, shrinks the deferred class): labeled (imported) contacts
+  deferred every phone edit (`cleartext-card`) because the rebuild would
+  drop their labels. A real user export then corrected the design
+  mid-session: live `CATEGORIES` are GROUPED (`ITEM1.CATEGORIES`, tied
+  to the email's group — an ungrouped-only cut would have emitted the
+  wrong shape), and `PRODID` carries params (`;VALUE=TEXT`). So the
+  rebuild extracts cleartext lines with group→address resolution and
+  re-emits them byte-identical except for the regrouped prefix
+  (unknown-address lines go ungrouped — never dropped, never
+  misattached; per-card-side exemption, encrypted-side keys still
+  defer). Wire fix included: Type-0 `Signature: null` tolerated on read
+  and omitted on write (was `""`). Verified: fmt + clippy clean, 222
+  tests (134+5+83), full bundle green. Staged
+  `packaging/buteo-plugin/libproton-client.so` sha256
+  `36d44fcc72c628769258b566cedda87a653d8b9fafb8492742b87837bd809b00`
+  (supersedes `9179ed5d…` — deploy only this). LIVE GATE BLOCKED
+  2026-09-10: import→export round trip with zero phone involvement loses
+  CATEGORIES, and web has no label UI — so no Type-0 fixture can reach
+  the account through supported paths (import drops them on the way in
+  and/or export drops them on the way out; indistinguishable
+  black-box-side). The code stays implemented + offline-proven (220
+  tests); it activates if a Type-0 card is ever encountered. Please
+  delete the re-imported probe contact.
 - [x] **Calendar out-of-window deletes** (filed 2026-09-09, CORRECTED +
   DONE 2026-09-09 local-only): audit found the filed claim ("can't
   upload") stale — the UID augment already covered (pid, uid)

@@ -1072,3 +1072,47 @@ satisfied), and the windowed re-list filters 1970 fixtures (use live
 timestamps). 214 workspace tests green, bundle green, staged
 `6dcb165a…`. Phone gate: deploy + steady sync (no behavior change
 without a failure).
+
+## 16. RSVP/invite write contracts – 2026-09-10 (research only, no code)
+
+The TODO asked for the contract before any code; here it is (all
+fetched 2026-09-10, no device needed). Deliberately no implementation:
+there is no phone-side trigger (attendee events are fully read-only in
+the Calendar app — T16 wall, reconfirmed) and no live invite data, so
+code would be unverifiable dead weight.
+
+### Routes (WebClients `api/calendars.ts`, all live client shapes)
+
+- RSVP change: `PUT calendar/v1/{calID}/events/{eventID}/attendees/
+  {attendeeID}` body `{Status, UpdateTime, Comment?}` (`updateAttendee-
+  Partstat`). `Status` = `ATTENDEE_STATUS_API` (verified against
+  `calendar/constants.ts`: 0 NEEDS_ACTION / 1 TENTATIVE / 2 DECLINED /
+  3 ACCEPTED — byte-identical to our `AttendeeToken.Status` comment).
+  `Comment` = `{Message, Type}` (0 cleartext / 1 encrypted+signed).
+- Invite acceptance (no local event yet): `PUT calendar/v1/events/{uid}/
+  accept` body `{Signature}` (`acceptInvite` — UID-addressed, not event
+  ID). Signature construction (what is signed) NOT recovered — needs
+  the web accept-flow source or a live trace; do not guess.
+- Sending/adding attendees: via the sync update's `Attendees` clear
+  rows + `AttendeesEventContent` cards (api.md `formatData`); proton-cal
+  `api.md` documents reads + sync shape but no attendee-authoring flow.
+  Needs the web composer/invite source before any code.
+- Calendar-membership invitations (`…/invitations[/{id}]/{accept,reject}`,
+  `getCalendarInvitations`) are a DIFFERENT feature (shared calendars),
+  not event RSVP — do not conflate.
+
+### Gaps in our stack for each (all verified against code)
+
+1. RSVP needs the attendee **ID**: the route takes `{attendeeID}` but
+   our `AttendeeToken` keeps `{Token, Status}` only, and the `Attendee`
+   interface carries ID and Token as SEPARATE fields (relation
+   unknown — do NOT assume equal). Also missing: `UpdateTime`
+   tracking, `Comment` model, and self-attendee resolution (web uses
+   `selfAddress`/`selfAttendeeIndex` matched against account
+   addresses). Plus the trigger question above.
+2. Acceptance needs the signature recipe (open) + live invite data.
+3. Authoring needs the web composer flow (open) + the same live data.
+
+Recommendation (unchanged): keep download-wins + verbatim attendee
+re-send (already live-safe); revisit when a live Proton-to-Proton
+invite exists on the test account AND a phone trigger is identified.
