@@ -302,13 +302,28 @@ Sync (buteo OOPP, proton_bridge_shim.cpp, NoUserInteractionPolicy):
   encrypted card on create/update; verify size limits against the API
   first (contact cards have no documented per-card cap — probe with the
   mock shape, then one live photo contact).
-- [ ] **Contacts key-field edits** (filed 2026-09-09): server cards
-  carrying `KEY` / `X-PM-*` (per-email crypto settings) defer updates
-  forever via the unknown-props guard — those contacts are read-only
-  from the phone. Direction: research the WebClients per-email settings
-  model (`contact_types.go` `GetSettings`/`SetSettings` + `encrypt.ts`
-  group handling) and either preserve-and-re-emit the groups on rebuild
-  or keep deferring deliberately with user-visible notice.
+- [x] **Contacts key-field edits** (filed 2026-09-09, DONE 2026-09-09
+  local-only): server cards with per-email crypto settings (`KEY` /
+  `X-PM-*` grouped with their address in the signed card — WebClients
+  `VCARD_KEY_FIELDS`, go-proton-api `GetGroup` model) no longer defer
+  updates forever. The rebuild carries those groups verbatim, regrouped
+  onto the rebuilt emails (address→new `itemN`, bodies byte-identical;
+  deleted addresses drop their groups); the guard exempts them
+  per-card-side (signed only — encrypted-side keys still defer rather
+  than relocate protection domains). Verified: fmt + clippy clean, 199
+  tests (117+5+77: extract/orphan-bare/guard-exemption/regroup+drop/
+  case-fold/append-folding, seal carry+regroup/drop/defer-encrypted/
+  diagnose, engine PUT-fires), full bundle green. Staged
+  `packaging/buteo-plugin/libproton-client.so` sha256
+  `60c05ed7d6cc71f4200436f8d267f993220d7555510fe56553e1bb1ad5b181c6`
+  (supersedes `609dc594…` — deploy only this). VERIFIED LIVE 2026-09-10
+  (deployed `60c05ed7…`, confirmed `adopted=0` trace): phone rename on
+  the trusted-key contact → `updated=1`, no deferral; web shows the new
+  name AND the key still trusted — groups carried byte-identical,
+  server accepted. (Side incidents same day, both recorded: msyncd was
+  found dead 21h from a restart loop — reset+restarted, now monitored;
+  an unsaved/overwritten phone edit confirmed the download-wins path
+  behaves.)
 - [x] **Calendar out-of-window deletes** (filed 2026-09-09, CORRECTED +
   DONE 2026-09-09 local-only): audit found the filed claim ("can't
   upload") stale — the UID augment already covered (pid, uid)

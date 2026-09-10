@@ -546,3 +546,40 @@ backup for read outputs. Also fixed while here: two tests sharing one
 temp dir (parallel race), mockito `$`-anchored GET mocks (matches
 path+query — never match), and an unrealistic single-entry chunk mock
 (real wire returns one response per contact).
+
+## 13. Key-field preservation – 2026-09-09 (local only, no device/live)
+
+Contacts with per-email crypto settings were phone-read-only (guard
+deferred on `KEY`/`X-PM-*`). Researched first: WebClients
+`VCARD_KEY_FIELDS` (key + 6 `x-pm-*`) live GROUPED with their address
+(`item3.EMAIL` + `item3.KEY`…) in the signed card; go-proton-api
+`contact_card.go` manipulates them via the same group handle. Fix: the
+update rebuild extracts those groups (orphan/ungrouped key lines stay
+unknown), re-emits them byte-identical under the rebuilt numbering
+(address→new `itemN`, case-folded match; deleted addresses drop their
+groups), appended pre-sign so the signature covers them. Guard
+exemption is per-card-side (signed only — an encrypted-side KEY would
+otherwise drop silently; still defers). Caught in review before tests:
+the first cut exempted key lines on both sides. Verified: 199
+workspace tests green (incl. regroup-across-reordered-emails,
+drop-on-delete, encrypted-side defer, diagnose naming, engine PUT),
+bundle green, staged `60c05ed7…`. Live gate pending (needs a
+key-settings contact — none on the test account).
+
+### Live 2026-09-10 — KEY PRESERVATION VERIFIED
+
+Deployed `60c05ed7…` (sha-checked). Setup on web per the key-pinning
+guide needed a Proton address (server-known keys) — trusted + set for
+sending on the Marco contact. Phone rename → sync → `plan c=0 u=1 d=0`
+→ `ran updated=1 deferred=0` (previously: `unknown-props` defer
+forever). Web ground truth: new name present AND key still trusted —
+the groups round-tripped byte-identical through decrypt → regroup →
+reseal, server accepted. Key-field TODO closed end-to-end.
+
+Side incidents (same day): (1) msyncd found dead 21h (`failed`,
+start-limit-hit from the verbose-test restart loop) — `reset-failed` +
+restart, verified active; lesson: always confirm msyncd active after
+remote restarts. (2) A phone rename got download-overwritten before
+uploading (full-replacement server-wins working as designed — the edit
+was saved after the last sync that could have carried it); re-edit +
+immediate sync uploaded cleanly.

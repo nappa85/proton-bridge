@@ -102,31 +102,66 @@ fn detached_sign_any(plain: &str, user_keys: &mut [UnlockedKey]) -> Result<Strin
     Err(ProtonError::Crypto(last_err))
 }
 
-/// Decrypt + parse all server cards of one contact for an update rebuild.
-/// Returns the parsed cards in order; `None` when a Type-0 cleartext card
-/// exists (nothing to merge it into — rebuild would drop it), any card
-/// fails to decrypt/parse, or unknown props are present.
-fn decrypt_server_cards(
+/// Decrypt all server cards, split by provenance. `None` on a Type-0
+/// cleartext card or any decrypt failure (fail-closed either way).
+fn split_server_plains(
     cards: &[crate::ContactCard],
     user_keys: &mut [UnlockedKey],
-) -> Option<Vec<crate::vcard::ParsedContact>> {
-    let mut plains = Vec::with_capacity(cards.len());
+) -> Option<(Vec<String>, Vec<String>)> {
+    let mut signed = Vec::new();
+    let mut decrypted = Vec::new();
     for card in cards {
         match card.Type {
             0 => return None,
-            2 => plains.push(card.Data.clone()),
+            2 => signed.push(card.Data.clone()),
             _ => {
-                plains.push(crate::crypto::decrypt_contact_card(&card.Data, user_keys).ok()?);
+                decrypted.push(crate::crypto::decrypt_contact_card(&card.Data, user_keys).ok()?);
             }
         }
     }
-    if crate::vcard::has_unknown_vcard_props(&plains) {
+    Some((signed, decrypted))
+}
+
+/// Guard: unknown props block the rebuild — EXCEPT preservable key
+/// groups, and then only on the SIGNED side (their canonical home per
+/// WebClients `VCARD_KEY_FIELDS`). Encrypted-side key lines stay
+/// blocking: the rebuild never relocates protection domains, so
+/// carrying them would silently drop them instead.
+fn blocking_unknowns(signed: &[String], decrypted: &[String]) -> Vec<String> {
+    let mut out = crate::vcard::unknown_vcard_props_except_keys(signed);
+    out.extend(crate::vcard::unknown_vcard_props(decrypted));
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Decrypt + parse all server cards of one contact for an update rebuild.
+/// Returns the parsed cards in order plus the carried per-email crypto
+/// settings (key groups from the signed cards, regrouped at seal time);
+/// `None` when a Type-0 cleartext card exists (nothing to merge it into —
+/// rebuild would drop it), any card fails to decrypt/parse, or blocking
+/// unknown props are present.
+fn decrypt_server_cards(
+    cards: &[crate::ContactCard],
+    user_keys: &mut [UnlockedKey],
+) -> Option<(
+    Vec<crate::vcard::ParsedContact>,
+    Vec<crate::vcard::KeyGroup>,
+)> {
+    let (signed, decrypted) = split_server_plains(cards, user_keys)?;
+    if !blocking_unknowns(&signed, &decrypted).is_empty() {
         return None;
     }
-    plains
+    let parsed: Vec<crate::vcard::ParsedContact> = signed
         .iter()
+        .chain(decrypted.iter())
         .map(|plain| crate::vcard::parse_vcard(plain).ok())
-        .collect()
+        .collect::<Option<_>>()?;
+    let mut groups = Vec::new();
+    for plain in &signed {
+        groups.extend(crate::vcard::extract_key_groups(plain));
+    }
+    Some((parsed, groups))
 }
 
 /// Diagnose WHY an update rebuild deferred, for the file-log trace
@@ -140,23 +175,24 @@ pub fn diagnose_update_block(
     if cards.iter().any(|card| card.Type == 0) {
         return "cleartext-card".to_string();
     }
-    let mut plains = Vec::with_capacity(cards.len());
+    let mut signed = Vec::with_capacity(cards.len());
+    let mut decrypted = Vec::with_capacity(cards.len());
     for card in cards {
         if card.Type == 2 {
-            plains.push(card.Data.clone());
+            signed.push(card.Data.clone());
         } else {
             match crate::crypto::decrypt_contact_card(&card.Data, user_keys) {
-                Ok(plain) => plains.push(plain),
+                Ok(plain) => decrypted.push(plain),
                 Err(_) => return "undecryptable-card".to_string(),
             }
         }
     }
-    for plain in &plains {
+    for plain in signed.iter().chain(decrypted.iter()) {
         if crate::vcard::parse_vcard(plain).is_err() {
             return "unparsable-card".to_string();
         }
     }
-    let unknown = crate::vcard::unknown_vcard_props(&plains);
+    let unknown = blocking_unknowns(&signed, &decrypted);
     if !unknown.is_empty() {
         return format!("unknown-props:{}", unknown.join(","));
     }
@@ -165,6 +201,7 @@ pub fn diagnose_update_block(
 
 /// Build sealed update cards for one server contact + full phone snapshot:
 /// server photos preserved (phone has no photo upload v1), UID preserved,
+/// per-email crypto settings carried (regrouped onto the rebuilt emails),
 /// phone fields win otherwise. Returns `None` (= deferred) on any guard
 /// above. Mirrors the calendar whole-object-replace discipline.
 pub fn build_contact_update_cards(
@@ -173,7 +210,7 @@ pub fn build_contact_update_cards(
     contact_uid: &str,
     user_keys: &mut [UnlockedKey],
 ) -> Result<Option<Vec<crate::ContactCard>>> {
-    let Some(server_parsed) = decrypt_server_cards(server_cards, user_keys) else {
+    let Some((server_parsed, key_groups)) = decrypt_server_cards(server_cards, user_keys) else {
         return Ok(None);
     };
     let mut merged = phone.clone();
@@ -181,7 +218,20 @@ pub fn build_contact_update_cards(
         .iter()
         .flat_map(|parsed| parsed.photos.clone())
         .collect();
-    let (signed_plain, enc_plain) = crate::vcard::build_vcard(&merged, contact_uid);
+    let (mut signed_plain, enc_plain) = crate::vcard::build_vcard(&merged, contact_uid);
+    // Carry crypto settings: same numbering as the rebuilt emails
+    // (`item{i+1}` for the i-th phone email), bodies byte-identical.
+    // Addresses dropped from the phone snapshot lose their groups.
+    if !key_groups.is_empty() {
+        let email_to_group: std::collections::HashMap<String, String> = merged
+            .emails
+            .iter()
+            .enumerate()
+            .map(|(i, mail)| (mail.email.clone(), format!("item{}", i + 1)))
+            .collect();
+        let carried = crate::vcard::render_key_groups(&key_groups, &email_to_group);
+        signed_plain = crate::vcard::append_vcard_lines(&signed_plain, &carried);
+    }
     let signed_sig = detached_sign_any(&signed_plain, user_keys)?;
     // Mirror `encrypt.ts`: no Type 3 when there is nothing encrypt-side
     // (email-only contact) — order stays [signed, encrypted] like before;
@@ -359,6 +409,159 @@ mod tests {
         // Encrypted card: phone name edit applied.
         let enc = decrypt_card(&out[1], &mut user);
         assert_eq!(enc.first_name, "New");
+    }
+
+    /// Server signed card with per-email crypto settings (WebClients
+    /// per-address key groups). Sealed encrypted side via the test key.
+    fn keyed_server_cards(user: &mut UnlockedKey) -> Vec<crate::ContactCard> {
+        let signed = "BEGIN:VCARD\r\nVERSION:4.0\r\nUID:c-1\r\nFN:Keyed Contact\r\nitem1.EMAIL;TYPE=HOME:kept@example.com\r\nitem1.KEY:data:;base64,QUJD\r\nitem1.X-PM-SCHEME:pgp-mime\r\nitem1.X-PM-SIGN:true\r\nitem2.EMAIL:plain@example.com\r\nEND:VCARD";
+        let (enc_data, enc_sig) = seal_contact_card(
+            "BEGIN:VCARD\r\nVERSION:4.0\r\nUID:c-1\r\nN:Contact;Keyed;;;\r\nEND:VCARD",
+            std::slice::from_mut(user),
+        )
+        .unwrap();
+        vec![
+            crate::ContactCard {
+                Type: 2,
+                Data: signed.to_string(),
+                Signature: "sig".into(),
+            },
+            crate::ContactCard {
+                Type: 3,
+                Data: enc_data,
+                Signature: enc_sig,
+            },
+        ]
+    }
+
+    fn keyed_phone() -> crate::vcard::ParsedContact {
+        // Same addresses REORDERED (exercises regrouping) + name edit.
+        crate::vcard::ParsedContact {
+            first_name: "KeyedEdited".into(),
+            emails: vec![
+                crate::vcard::ParsedEmail {
+                    email: "plain@example.com".into(),
+                    types: Vec::new(),
+                },
+                crate::vcard::ParsedEmail {
+                    email: "kept@example.com".into(),
+                    types: vec!["HOME".into()],
+                },
+            ],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_update_carries_key_groups_regrouped() {
+        // Previously: `unknown-props:KEY,X-PM-SCHEME,X-PM-SIGN` → deferred
+        // forever (contact phone-read-only). Now seals with the groups
+        // following their address to its new itemN, bodies byte-identical.
+        let mut user = test_user_identity();
+        let cards = keyed_server_cards(&mut user);
+        let out = build_contact_update_cards(
+            &cards,
+            &keyed_phone(),
+            "c-1",
+            std::slice::from_mut(&mut user),
+        )
+        .unwrap()
+        .expect("keyed update seals");
+        assert_eq!(out[0].Type, 2);
+        assert!(out[0].Data.contains("item2.EMAIL"), "{}", out[0].Data);
+        assert!(
+            out[0].Data.contains("item2.KEY:data:;base64,QUJD"),
+            "{}",
+            out[0].Data
+        );
+        assert!(
+            out[0].Data.contains("item2.X-PM-SCHEME:pgp-mime"),
+            "{}",
+            out[0].Data
+        );
+        assert!(
+            out[0].Data.contains("item2.X-PM-SIGN:true"),
+            "{}",
+            out[0].Data
+        );
+        assert!(!out[0].Data.contains("item1.KEY"), "{}", out[0].Data);
+        // Name edit applied alongside.
+        assert!(!out[1].Data.is_empty());
+        let enc = decrypt_card(&out[1], &mut user);
+        assert_eq!(enc.first_name, "KeyedEdited");
+        // Diagnose agrees it is sealable (no unknown-props deferral).
+        assert_eq!(
+            diagnose_update_block(&cards, std::slice::from_mut(&mut user)),
+            "sealable"
+        );
+    }
+
+    #[test]
+    fn test_update_drops_key_group_of_deleted_email() {
+        // Address removed from the phone snapshot: its settings go with it
+        // (no orphan KEY lines for a deleted address).
+        let mut user = test_user_identity();
+        let cards = keyed_server_cards(&mut user);
+        let mut phone = keyed_phone();
+        phone.emails.truncate(1); // keep only plain@example.com
+        let out =
+            build_contact_update_cards(&cards, &phone, "c-1", std::slice::from_mut(&mut user))
+                .unwrap()
+                .expect("update seals");
+        assert!(!out[0].Data.contains("KEY:"), "{}", out[0].Data);
+        assert!(!out[0].Data.contains("X-PM-"), "{}", out[0].Data);
+        assert!(out[0].Data.contains("item1.EMAIL:plain@example.com"));
+    }
+
+    #[test]
+    fn test_update_defers_encrypted_side_keys() {
+        // Key lines in the ENCRYPTED card never relocate: still deferred
+        // (protection domains don't move on rebuild).
+        let mut user = test_user_identity();
+        let (enc_data, enc_sig) = seal_contact_card(
+            "BEGIN:VCARD\r\nVERSION:4.0\r\nUID:c\r\nN:X;Y;;;\r\nitem1.KEY:abc\r\nEND:VCARD",
+            std::slice::from_mut(&mut user),
+        )
+        .unwrap();
+        let cards = vec![crate::ContactCard {
+            Type: 3,
+            Data: enc_data,
+            Signature: enc_sig,
+        }];
+        assert!(build_contact_update_cards(
+            &cards,
+            &crate::vcard::ParsedContact::default(),
+            "c",
+            std::slice::from_mut(&mut user)
+        )
+        .unwrap()
+        .is_none());
+        assert_eq!(
+            diagnose_update_block(&cards, std::slice::from_mut(&mut user)),
+            "unknown-props:KEY"
+        );
+    }
+
+    #[test]
+    fn test_diagnose_names_remaining_unknowns_beside_keys() {
+        // Key groups exempt, but a genuinely exotic prop still names itself.
+        let mut user = test_user_identity();
+        let mut cards = keyed_server_cards(&mut user);
+        cards[0].Data = cards[0]
+            .Data
+            .replace("END:VCARD", "X-CUSTOM:1\r\nEND:VCARD");
+        assert!(build_contact_update_cards(
+            &cards,
+            &keyed_phone(),
+            "c-1",
+            std::slice::from_mut(&mut user)
+        )
+        .unwrap()
+        .is_none());
+        assert_eq!(
+            diagnose_update_block(&cards, std::slice::from_mut(&mut user)),
+            "unknown-props:X-CUSTOM"
+        );
     }
 
     #[test]

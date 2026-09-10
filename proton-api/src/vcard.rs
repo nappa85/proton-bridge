@@ -511,18 +511,7 @@ pub fn is_known_vcard_prop(name: &str) -> bool {
 /// anything before the last dot can only be a group. `None` when the text
 /// doesn't parse as lines.
 fn card_prop_names(card: &str) -> Vec<String> {
-    let normalized = card.replace("\r\n", "\n").replace('\r', "\n");
-    let mut unfolded: Vec<String> = Vec::new();
-    for line in normalized.split('\n') {
-        if (line.starts_with(' ') || line.starts_with('\t')) && !unfolded.is_empty() {
-            if let Some(last) = unfolded.last_mut() {
-                last.push_str(&line[1..]);
-            }
-        } else {
-            unfolded.push(line.to_string());
-        }
-    }
-    unfolded
+    unfold_ical_lines(card)
         .iter()
         .filter_map(|line| {
             let name = line.split([';', ':']).next()?.trim().to_uppercase();
@@ -535,6 +524,185 @@ fn card_prop_names(card: &str) -> Vec<String> {
             }
         })
         .collect()
+}
+
+/// Unfold folded content lines (a CRLF followed by a single space/tab
+/// continues the previous line). Shared by the guard and the key-group
+/// preservation below — one unfolding rule everywhere.
+fn unfold_ical_lines(card: &str) -> Vec<String> {
+    let normalized = card.replace("\r\n", "\n").replace('\r', "\n");
+    let mut unfolded: Vec<String> = Vec::new();
+    for line in normalized.split('\n') {
+        if (line.starts_with(' ') || line.starts_with('\t')) && !unfolded.is_empty() {
+            if let Some(last) = unfolded.last_mut() {
+                last.push_str(&line[1..]);
+            }
+        } else {
+            unfolded.push(line.to_string());
+        }
+    }
+    unfolded
+}
+
+/// Per-email crypto-setting fields (WebClients `VCARD_KEY_FIELDS`): they
+/// live GROUPED with their address (`item3.EMAIL` + `item3.KEY`,
+/// `item3.X-PM-SCHEME`, …) in the signed card (see go-proton-api
+/// `contact_card.go` `GetGroup`). Ungrouped occurrences are NOT settings
+/// (unknown placement — still defer).
+pub const VCARD_KEY_FIELDS: &[&str] = &[
+    "KEY",
+    "X-PM-MIMETYPE",
+    "X-PM-ENCRYPT",
+    "X-PM-ENCRYPT-UNTRUSTED",
+    "X-PM-SIGN",
+    "X-PM-SCHEME",
+    "X-PM-TLS",
+];
+
+/// One address's carried crypto settings: unfolded raw lines, verbatim
+/// (re-emitted byte-identical except for the regrouped prefix).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct KeyGroup {
+    /// The group's email address (from its `EMAIL` line).
+    pub email: String,
+    /// Raw `GROUP.BASE;params:value` lines (unfolded, verbatim).
+    pub lines: Vec<String>,
+}
+
+/// Split one unfolded line into (group, BASE name). `None` when the line
+/// has no content name at all.
+fn split_grouped_name(line: &str) -> Option<(Option<String>, String)> {
+    let name = line.split([';', ':']).next()?.trim();
+    if name.is_empty() {
+        return None;
+    }
+    match name.rsplit_once('.') {
+        Some((group, base)) if !group.is_empty() && !base.is_empty() => {
+            Some((Some(group.to_string()), base.to_uppercase()))
+        }
+        _ => Some((None, name.to_uppercase())),
+    }
+}
+
+/// Extract preservable per-email crypto settings from one decrypted card:
+/// grouped key-field lines whose group also carries an `EMAIL` line.
+/// Orphan key lines (no address in their group) and ungrouped ones are
+/// NOT returned — they stay unknown and keep deferring the update.
+pub fn extract_key_groups(card: &str) -> Vec<KeyGroup> {
+    // group (upper-cased for matching) → (original group spelling, emails, key lines)
+    let mut groups: std::collections::HashMap<String, (String, Vec<String>, Vec<String>)> =
+        std::collections::HashMap::new();
+    let mut order: Vec<String> = Vec::new();
+    for line in unfold_ical_lines(card) {
+        let Some((group, base)) = split_grouped_name(&line) else {
+            continue;
+        };
+        let Some(group) = group else { continue };
+        if !VCARD_KEY_FIELDS.contains(&base.as_str()) && base != "EMAIL" {
+            continue;
+        }
+        let key = group.to_uppercase();
+        let entry = groups.entry(key.clone()).or_insert_with(|| {
+            order.push(key.clone());
+            (group, Vec::new(), Vec::new())
+        });
+        if base == "EMAIL" {
+            if let Some(value) = line.split_once(':').map(|x| x.1) {
+                entry.1.push(value.trim().to_string());
+            }
+        } else {
+            entry.2.push(line);
+        }
+    }
+    let mut out = Vec::new();
+    for key in order {
+        let (_, emails, lines) = &groups[&key];
+        let Some(email) = emails.first().filter(|e| !e.is_empty()) else {
+            continue;
+        };
+        if lines.is_empty() {
+            continue;
+        }
+        out.push(KeyGroup {
+            email: email.clone(),
+            lines: lines.clone(),
+        });
+    }
+    out
+}
+
+/// Unknown props IGNORING preservable key groups: the update rebuild
+/// carries those verbatim (see `render_key_groups`), so they no longer
+/// block it. Everything else unknown still defers. Encrypted-card key
+/// lines are deliberately NOT exempt (WebClients never emits them there;
+/// keep deferring rather than relocating protection domains).
+pub fn unknown_vcard_props_except_keys(cards: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    for card in cards {
+        let key_lines: std::collections::HashSet<String> = extract_key_groups(card)
+            .into_iter()
+            .flat_map(|g| g.lines)
+            .collect();
+        for line in unfold_ical_lines(card) {
+            if key_lines.contains(&line) {
+                continue;
+            }
+            let Some((_, base)) = split_grouped_name(&line) else {
+                continue;
+            };
+            if !base.is_empty() && !is_known_vcard_prop(&base) {
+                out.push(base);
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Re-emit carried groups under the rebuilt numbering: `email_to_group`
+/// maps address → new `itemN` (our `build_vcard` order). Only the group
+/// prefix changes — line bodies pass through byte-identical. Groups whose
+/// address vanished from the phone snapshot drop (address deleted; its
+/// settings are moot). Email lookup is case-insensitive (RFC 5321
+/// local-part reality + web-client mixed-case exports).
+pub fn render_key_groups(
+    groups: &[KeyGroup],
+    email_to_group: &std::collections::HashMap<String, String>,
+) -> Vec<String> {
+    let lower: std::collections::HashMap<String, &String> = email_to_group
+        .iter()
+        .map(|(k, v)| (k.to_lowercase(), v))
+        .collect();
+    let mut out = Vec::new();
+    for group in groups {
+        let Some(new_group) = lower.get(&group.email.to_lowercase()) else {
+            continue;
+        };
+        for line in &group.lines {
+            match line.split_once('.') {
+                Some((_, rest)) => out.push(format!("{new_group}.{rest}")),
+                None => out.push(line.clone()),
+            }
+        }
+    }
+    out
+}
+
+/// Append unfolded lines to a folded card (before `END:VCARD`), folding
+/// them to the 75-octet rule. Used for carried key groups (signed before
+/// sending — the detached signature must cover the final text).
+pub fn append_vcard_lines(card: &str, lines: &[String]) -> String {
+    if lines.is_empty() {
+        return card.to_string();
+    }
+    let mut out: Vec<String> = card.split("\r\n").map(str::to_string).collect();
+    if out.last().is_some_and(|l| l == "END:VCARD") {
+        out.pop();
+    }
+    out.extend(lines.iter().map(|l| fold_vcard_line(l)));
+    out.push("END:VCARD".to_string());
+    out.join("\r\n")
 }
 
 /// True when any decrypted server card carries properties outside the
@@ -750,5 +918,90 @@ mod tests {
             unknown_vcard_props(&[grouped_exotic.to_string()]),
             vec!["X-CUSTOM"]
         );
+    }
+
+    /// WebClients per-email crypto settings shape (go-proton-api
+    /// `contact_card.go` GetGroup model): key fields share the address's
+    /// group in the signed card.
+    const KEYED_SIGNED: &str = "BEGIN:VCARD\r\nVERSION:4.0\r\nUID:u1\r\nFN:Keyed\r\nitem1.EMAIL;TYPE=HOME:kept@example.com\r\nitem1.KEY:data:;base64,QUJD\r\nitem1.X-PM-SCHEME:pgp-mime\r\nitem1.X-PM-SIGN:true\r\nitem2.EMAIL:plain@example.com\r\nEND:VCARD";
+
+    #[test]
+    fn test_extract_key_groups_by_email() {
+        let groups = extract_key_groups(KEYED_SIGNED);
+        assert_eq!(groups.len(), 1, "{groups:?}");
+        assert_eq!(groups[0].email, "kept@example.com");
+        assert_eq!(groups[0].lines.len(), 3);
+        // Bodies byte-identical (only regrouped at render).
+        assert!(groups[0]
+            .lines
+            .iter()
+            .any(|l| l == "item1.KEY:data:;base64,QUJD"));
+        assert!(groups[0]
+            .lines
+            .iter()
+            .any(|l| l == "item1.X-PM-SCHEME:pgp-mime"));
+        // `plain@example.com` has no key lines → no group.
+        assert!(!groups.iter().any(|g| g.email == "plain@example.com"));
+    }
+
+    #[test]
+    fn test_extract_key_groups_ignores_orphans_and_bare() {
+        // Orphan group (no EMAIL) + ungrouped KEY: neither is preservable.
+        let card =
+            "BEGIN:VCARD\r\nVERSION:4.0\r\nUID:u\r\nFN:x\r\nitem9.KEY:abc\r\nKEY:bare\r\nEND:VCARD";
+        assert!(extract_key_groups(card).is_empty());
+        assert_eq!(
+            unknown_vcard_props_except_keys(&[card.to_string()]),
+            vec!["KEY"]
+        );
+    }
+
+    #[test]
+    fn test_key_groups_dont_trip_guard_but_exotic_does() {
+        assert!(unknown_vcard_props_except_keys(&[KEYED_SIGNED.to_string()]).is_empty());
+        // …while a genuinely unknown prop alongside still trips (and the
+        // key lines stay exempt from the report).
+        let mixed = KEYED_SIGNED.replace("END:VCARD", "X-CUSTOM:1\r\nEND:VCARD");
+        assert_eq!(unknown_vcard_props_except_keys(&[mixed]), vec!["X-CUSTOM"]);
+        // The strict guard still trips on key props (only the except-keys
+        // path — applied per-card-side at seal time — exempts them).
+        assert!(has_unknown_vcard_props(&[KEYED_SIGNED.to_string()]));
+    }
+
+    #[test]
+    fn test_render_key_groups_regroups_and_drops() {
+        let groups = extract_key_groups(KEYED_SIGNED);
+        // Rebuilt numbering differs (emails reordered): groups follow the
+        // address, bodies byte-identical.
+        let mut map = std::collections::HashMap::new();
+        map.insert("plain@example.com".to_string(), "item1".to_string());
+        map.insert("kept@example.com".to_string(), "item2".to_string());
+        let rendered = render_key_groups(&groups, &map);
+        assert_eq!(rendered.len(), 3);
+        assert!(rendered.iter().any(|l| l == "item2.KEY:data:;base64,QUJD"));
+        assert!(rendered.iter().any(|l| l == "item2.X-PM-SIGN:true"));
+        assert!(!rendered.iter().any(|l| l.starts_with("item1.KEY")));
+        // Address deleted from the phone snapshot → group dropped.
+        let mut dropped = std::collections::HashMap::new();
+        dropped.insert("plain@example.com".to_string(), "item1".to_string());
+        assert!(render_key_groups(&groups, &dropped).is_empty());
+        // Case-insensitive email match (mixed-case web exports).
+        let mut upper = std::collections::HashMap::new();
+        upper.insert("KEPT@example.com".to_string(), "item1".to_string());
+        assert_eq!(render_key_groups(&groups, &upper).len(), 3);
+    }
+
+    #[test]
+    fn test_append_vcard_lines_folds_and_closes() {
+        let (signed, _) = build_vcard(&ParsedContact::default(), "u");
+        let long_key = format!("item1.KEY:{}", "Q".repeat(200));
+        let out = append_vcard_lines(&signed, &[long_key]);
+        assert!(out.contains("UID:u"));
+        assert!(out.ends_with("END:VCARD"));
+        for line in out.split("\r\n") {
+            assert!(line.len() <= 75, "overlong: {line}");
+        }
+        // Empty append is identity (no rebuild churn when nothing carried).
+        assert_eq!(append_vcard_lines(&signed, &[]), signed);
     }
 }
