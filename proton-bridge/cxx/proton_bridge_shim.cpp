@@ -908,8 +908,9 @@ void ProtonContactsPlugin::persistContactsMaps(const QList<QtContacts::QContact>
         }
         const QList<QtContacts::QContactAvatar> avatars =
             fresh.details<QtContacts::QContactAvatar>();
+        // Last detail wins (see export): app edits accumulate stale ones.
         if (!avatars.isEmpty()) {
-            const QString avatarStr = avatars.first().imageUrl().toString();
+            const QString avatarStr = avatars.last().imageUrl().toString();
             if (!avatarStr.isEmpty()) {
                 photos.insert(qid, avatarStr);
             }
@@ -1096,21 +1097,46 @@ QJsonArray ProtonContactsPlugin::exportContactsInventory() {
         // download baseline (missing baseline = pre-feature row or fresh
         // avatar → include; conversion failure → omit, server copy wins).
         // Untouched avatars stay omitted: no re-upload churn and no QUrl
-        // echo-fidelity risk on the download round-trip.
+        // echo-fidelity risk on the download round-trip. Explicitly
+        // REMOVED avatars (baseline present, now gone) set photo_removed
+        // so the rebuild emits a bare PHOTO: line (WebClients deletion
+        // expression — an empty photos list alone would carry the server
+        // copy instead). Diagnostics (counts/lengths only, never avatar
+        // contents — data URIs are personal data).
         const QList<QtContacts::QContactAvatar> avatarDetails =
             c.details<QtContacts::QContactAvatar>();
-        if (!avatarDetails.isEmpty()) {
-            const QString avatarStr = avatarDetails.first().imageUrl().toString();
-            if (!avatarStr.isEmpty()
-                && (!photosBaseline.contains(qid)
-                    || photosBaseline.value(qid).toString() != avatarStr)) {
-                const QString dataUri = avatarToDataUri(avatarStr);
-                if (!dataUri.isEmpty()) {
-                    QJsonArray photosArr;
-                    photosArr.append(dataUri);
-                    f.insert(QStringLiteral("photos"), photosArr);
-                }
+        // App edits accumulate avatar details (a removal leaves the stale
+        // one behind instead of replacing it): the LAST detail is the
+        // freshest write, so it — not .first() — decides presence.
+        const QString avatarStr = avatarDetails.isEmpty()
+            ? QString()
+            : avatarDetails.last().imageUrl().toString();
+        if (!guid.isEmpty()) {
+            proton_log(QStringLiteral("Contacts avatar uid=%1 n=%2 len=%3 baseline=%4 dirty=%5")
+                       .arg(guid)
+                       .arg(avatarDetails.size())
+                       .arg(avatarStr.size())
+                       .arg(photosBaseline.contains(qid) ? 1 : 0)
+                       .arg(dirty ? 1 : 0));
+        }
+        if (!avatarStr.isEmpty()
+            && (!photosBaseline.contains(qid)
+                || photosBaseline.value(qid).toString() != avatarStr)) {
+            const QString dataUri = avatarToDataUri(avatarStr);
+            if (!dataUri.isEmpty()) {
+                QJsonArray photosArr;
+                photosArr.append(dataUri);
+                f.insert(QStringLiteral("photos"), photosArr);
             }
+        } else if (avatarStr.isEmpty() && !guid.isEmpty()
+                   && (!photosBaseline.contains(qid)
+                       || !photosBaseline.value(qid).toString().isEmpty())) {
+            // Known row, no avatar now: removed (baseline present), or
+            // first cycle after upgrade/clear with no baseline to compare
+            // against — flagging is safe either way (a bare PHOTO: is a
+            // no-op where the server holds no photo). Never-synced rows
+            // (no guid) never flag: nothing exists server-side to clear.
+            f.insert(QStringLiteral("photo_removed"), true);
         }
         o.insert(QStringLiteral("fields"), f);
         out.append(o);

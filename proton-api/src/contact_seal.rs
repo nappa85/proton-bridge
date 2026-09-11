@@ -231,7 +231,7 @@ pub fn build_contact_update_cards(
         return Ok(None);
     };
     let mut merged = phone.clone();
-    if merged.photos.is_empty() {
+    if merged.photos.is_empty() && !merged.photo_removed {
         merged.photos = server
             .parsed
             .iter()
@@ -941,5 +941,45 @@ mod tests {
         let enc = decrypt_card(&out[1], &mut user);
         assert_eq!(enc.photos.len(), 1);
         assert!(enc.photos[0].contains("/9j/OLD"), "{}", enc.photos[0]);
+    }
+
+    #[test]
+    fn test_update_removed_phone_photo_emits_bare() {
+        // Avatar deleted on device: the rebuilt card carries an explicit
+        // empty PHOTO (deletion expression) instead of the server copy.
+        let mut user = test_user_identity();
+        let (enc_data, enc_sig) = seal_contact_card(
+            "BEGIN:VCARD\r\nVERSION:4.0\r\nUID:c\r\nPHOTO:data:image/jpeg\\;base64\\,/9j/OLD\r\nEND:VCARD",
+            std::slice::from_mut(&mut user),
+        )
+        .unwrap();
+        let cards = vec![
+            crate::ContactCard {
+                Type: 2,
+                Data: "BEGIN:VCARD\r\nVERSION:4.0\r\nUID:c\r\nFN:Pic\r\nEND:VCARD".into(),
+                Signature: "sig".into(),
+            },
+            crate::ContactCard {
+                Type: 3,
+                Data: enc_data,
+                Signature: enc_sig,
+            },
+        ];
+        let phone = crate::vcard::ParsedContact {
+            display_name: "Pic".into(),
+            photo_removed: true,
+            ..Default::default()
+        };
+        let out = build_contact_update_cards(&cards, &phone, "c", std::slice::from_mut(&mut user))
+            .unwrap()
+            .expect("update seals");
+        // Parsed view: no photos. Raw plaintext: explicit bare PHOTO line.
+        let enc = decrypt_card(&out[1], &mut user);
+        assert!(enc.photos.is_empty());
+        let plain =
+            crate::crypto::decrypt_contact_card(&out[1].Data, std::slice::from_mut(&mut user))
+                .unwrap();
+        assert!(plain.split("\r\n").any(|l| l == "PHOTO:"), "{plain}");
+        assert!(!plain.contains("/9j/OLD"), "{plain}");
     }
 }

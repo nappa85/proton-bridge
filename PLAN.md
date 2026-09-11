@@ -204,8 +204,7 @@ Sync (buteo OOPP, proton_bridge_shim.cpp, NoUserInteractionPolicy):
   sha256   `1d2dc0ceaacfe46f1c703e7275473fadff559bad380e890a3adbfdf433c6384c`
   (supersedes `60c05ed7…` — deploy only this). VERIFIED LIVE 2026-09-10
   (deployed, sha-checked): avatar set on existing contact → `updated=1`,
-  photo visible on Proton web. Phone gate remainder: avatar removal →
-  photo stays (documented v1 gap, untested).
+  photo visible on Proton web. VERIFIED LIVE 2026-09-11 (deployed `9f06aea5\u2026`, sha-checked): avatar removal \u2192 `photo_delete` marker \u2192 `updated=1` \u2192 photo gone on web. Diagnosis along the way (recorded): app leaves a stale duplicate avatar detail on removal \u2014 last-wins read fixed it. Staged `packaging/buteo-plugin/libproton-client.so` sha256 `38e1b57f0d61aa8826654a63c25f5f7a14e3ae7795b9e75a4ebffacc7d777ff5` (photo-removal build — deploy only this).
 - **Password never persisted** (intentional): raw 20-char login password is transient `Password` param only for `derive_all_passwords` at `Verify`; `signon-secrets.db` `CREDENTIALS.password` stays dummy `"x"`, `handleAuthOk` never returns `Secret`. New `KeySalt` after manual Proton key rotation will need one more **Update credentials → OTP** to re-derive and re-store `DerivedPasswords`.
 - [x] **CAPTCHA / human-verification handling** (filed 2026-09-09, hit live
   from the host: SRP login → `422 Code 9001`; IMPLEMENTED 2026-09-09

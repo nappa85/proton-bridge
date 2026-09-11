@@ -43,6 +43,13 @@ pub struct ParsedContact {
     pub gender: String,
     #[serde(default)]
     pub photos: Vec<String>,
+    /// Avatar explicitly removed on device (baseline had one, now none).
+    /// The rebuild emits a bare `PHOTO:` line (WebClients
+    /// `removeVCardProperty` never removes the last photo — it pushes an
+    /// empty value). Without this flag an empty `photos` means "no info"
+    /// and the server copy is carried.
+    #[serde(default)]
+    pub photo_removed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -447,6 +454,9 @@ pub fn build_vcard(contact: &ParsedContact, uid: &str) -> (String, Option<String
     }
     for photo in &contact.photos {
         encrypted.push(format!("PHOTO:{}", escape_vcard(photo)));
+    }
+    if contact.photos.is_empty() && contact.photo_removed {
+        encrypted.push("PHOTO:".to_string());
     }
     let signed = wrap_vcard(&signed);
     // WebClients omits the encrypted card when there is nothing to seal
@@ -867,6 +877,7 @@ mod tests {
             nickname: "Queen of Numbers".into(),
             gender: "Female".into(),
             photos: vec!["data:image/jpeg;base64,/9j/".into()],
+            photo_removed: false,
         }
     }
 
@@ -1151,6 +1162,36 @@ mod tests {
         assert_eq!(props.len(), 1, "{props:?}");
         assert_eq!(props[0].line, "item1.CATEGORIES:Very LongLabel Name");
         assert_eq!(props[0].email.as_deref(), Some("a@b.c"));
+    }
+
+    #[test]
+    fn test_build_vcard_bare_photo_on_removal() {
+        // Avatar deleted on device: explicit empty PHOTO (WebClients
+        // deletion expression) — NOT the same as "no info" (which omits).
+        let removed = ParsedContact {
+            display_name: "X".into(),
+            photo_removed: true,
+            ..Default::default()
+        };
+        let (_, encrypted) = build_vcard(&removed, "u");
+        let enc = encrypted.expect("bare PHOTO is encrypt-side content");
+        assert!(enc.split("\r\n").any(|l| l == "PHOTO:"), "{enc}");
+        // Present photos win over the flag (contradictory input → content).
+        let kept = ParsedContact {
+            display_name: "X".into(),
+            photos: vec!["data:image/jpeg;base64,/9j/".into()],
+            photo_removed: true,
+            ..Default::default()
+        };
+        let (_, encrypted) = build_vcard(&kept, "u");
+        let enc = encrypted.expect("photo seals");
+        assert!(!enc.split("\r\n").any(|l| l == "PHOTO:"), "{enc}");
+        assert!(enc.contains("PHOTO:data:image"), "{enc}");
+        // Bare PHOTO parses back to nothing (no crash, no phantom photo).
+        let back =
+            parse_vcard("BEGIN:VCARD\r\nVERSION:4.0\r\nUID:u\r\nFN:X\r\nPHOTO:\r\nEND:VCARD")
+                .unwrap();
+        assert!(back.photos.is_empty());
     }
 
     #[test]

@@ -82,6 +82,19 @@ pub struct ContactPlan {
 /// successful sync.
 pub type ContactAnchorMap = HashMap<String, i64>;
 
+/// Proton UIDs whose phone avatar was explicitly removed (fields carry
+/// `photo_removed`): the rebuild emits a bare `PHOTO:` deletion
+/// expression for them. IDs only, for the file-log trace.
+pub fn photo_delete_uids(inventory: &[ContactItem]) -> Vec<String> {
+    inventory
+        .iter()
+        .filter(|item| {
+            item.proton_uid.is_some() && item.fields.as_ref().is_some_and(|f| f.photo_removed)
+        })
+        .filter_map(|item| item.proton_uid.clone())
+        .collect()
+}
+
 /// Merge fresh listing rows into anchors: upsert seen UIDs, prune UIDs in
 /// NEITHER fresh rows NOR local inventory.
 pub fn merge_contact_anchors(
@@ -359,6 +372,29 @@ mod tests {
                 qcontact_id: "q9".into()
             }]
         );
+    }
+
+    #[test]
+    fn test_photo_delete_uids_lists_flagged_known_rows() {
+        // Only known rows (proton_uid present) whose fields carry the
+        // removal flag — IDs only, for the trace.
+        let mut removed = item("q1", Some("u1"), true, Some(100));
+        removed.fields = Some(proton_api::vcard::ParsedContact {
+            photo_removed: true,
+            ..Default::default()
+        });
+        let mut unflagged = item("q2", Some("u2"), true, Some(100));
+        unflagged.fields = Some(proton_api::vcard::ParsedContact::default());
+        let mut guidless = item("q3", None, true, None);
+        guidless.fields = Some(proton_api::vcard::ParsedContact {
+            photo_removed: true,
+            ..Default::default()
+        });
+        assert_eq!(
+            photo_delete_uids(&[removed, unflagged, guidless]),
+            vec!["u1".to_string()]
+        );
+        assert!(photo_delete_uids(&[]).is_empty());
     }
 
     #[test]

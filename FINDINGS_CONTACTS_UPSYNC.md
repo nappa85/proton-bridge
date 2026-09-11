@@ -637,3 +637,54 @@ offline-proven (parse/emit/round-trip/seal/diagnose/engine-PUT, null
 Signature both directions) and activates on encounter. Lesson for
 future gates: validate the FIXTURE (import→export round trip) before
 burning phone cycles on the behavior.
+
+### Photo removal – 2026-09-10 (local only)
+
+Closes the photo TODO's stated remainder: avatar deletion propagates
+as an explicit empty `PHOTO:` line (WebClients `removeVCardProperty`
+expression — never line removal). Engine distinguishes via new
+`photo_removed` (baseline had avatar, now gone; serde-default safe):
+rebuild skips the server carry and seals the bare line, present photos
+still win on contradiction. Shim exports the flag from the baseline
+compare (missing baseline can never flag — creates unaffected). 224
+workspace tests green, bundle green, staged `38e1b57f…`. Phone gate:
+remove an avatar → sync → photo gone on web.
+
+### Photo-removal false alarm – 2026-09-11 (diagnosed, no code fault)
+
+Report: removed avatar re-uploaded instead of deleting (web keeps
+photo, phone restores it). Root cause, proven by verbose download JSON
+(Tiziano HAS a server photo) + code archaeology: the removal cycles
+ran on the pre-removal build, where the shim already exported the
+situation but the seal had no `photo_removed` handling — unknown JSON
+keys parse silently, so the engine fell into server-carry and
+re-uploaded the very photo being deleted (download then "restored" it
+locally). The missing-baseline theory recorded earlier was WRONG
+(baseline existed since the photo-upload cycle). The current build
+(`e52f1938…`, verified deployed) honors the flag; its new
+`photo_delete` trace marker distinguishes the cases live. Also
+corrected along the way: verbose mode is now unset again (an earlier
+cleanup command died on shell quoting before reaching it).
+
+### Photo-removal root cause – 2026-09-11 (diagnosed live, fixed locally)
+
+Symptom: avatar removal never propagated (no `photo_delete` marker,
+server photo kept, phone restored it) across several attempts on
+correct builds. A metadata-only trace line (`n=` avatar detail count)
+convicted it: the row carries TWO avatar details — the People app
+leaves the stale one behind on removal instead of replacing it, and
+`.first()` read the stale URL (equal to baseline → silent server
+carry, then download "restores" it). Your "flagged as removed, not
+really removed" hunch was exactly right in spirit. Fix: last detail
+wins (freshest write) in both export and baseline persist; trace now
+logs the full UID. Lesson: never `.first()` a multi-capable detail
+list without proving singularity — count it in the log instead.
+Staged `9f06aea5…`.
+
+### Live 2026-09-11 — PHOTO REMOVAL VERIFIED
+
+Deployed `9f06aea5…` (sha-checked): avatar removal → `Contacts avatar
+n=2 len=0 baseline=1 dirty=1` → `photo_delete <uid>` → `updated=1` →
+photo gone on Proton web. The `n=2` (stale duplicate detail) theory
+from the trace was exactly right; last-wins reads the removal. Photo
+TODO fully closed (upload + removal).

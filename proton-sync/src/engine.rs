@@ -906,6 +906,11 @@ impl SyncEngine {
             inventory.len(),
             known.len()
         ));
+        // Avatar removals feed a bare-PHOTO rebuild (IDs only, never
+        // contents) — the one upload decision invisible otherwise.
+        for uid in cp::photo_delete_uids(&inventory) {
+            trace.push(format!("contact_upsync photo_delete {uid}"));
+        }
         let local_uids: std::collections::HashSet<String> = inventory
             .iter()
             .filter_map(|item| item.proton_uid.clone())
