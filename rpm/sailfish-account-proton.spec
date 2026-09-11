@@ -55,6 +55,12 @@ install -m 0644 ui/proton-settings.qml \
 install -m 0644 ui/proton-update.qml \
     %{buildroot}%{_datadir}/accounts/ui/proton-update.qml
 
+# Install compiled message catalogs (built from translations/*.ts via
+# tools/build-qm.sh; loaded by the Proton QML extension per locale)
+mkdir -p %{buildroot}%{_datadir}/proton/translations
+install -m 0644 translations/*.qm \
+    %{buildroot}%{_datadir}/proton/translations/
+
 # Install icon (to be added)
 # mkdir -p %{buildroot}%{_datadir}/icons/hicolor/86x86/apps
 # install -m 0644 icons/proton.png \
@@ -68,6 +74,7 @@ install -m 0644 ui/proton-update.qml \
 %{_datadir}/accounts/ui/proton.qml
 %{_datadir}/accounts/ui/proton-settings.qml
 %{_datadir}/accounts/ui/proton-update.qml
+%{_datadir}/proton/translations/proton_*.qm
 # %{_datadir}/icons/hicolor/*/apps/proton.png
 
 %changelog

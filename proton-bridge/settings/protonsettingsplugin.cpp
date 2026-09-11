@@ -8,10 +8,13 @@
 #include <QContactManager>
 #include <QContactCollection>
 #include <QContactCollectionFilter>
+#include <QCoreApplication>
 #include <QDateTime>
 #include <QDebug>
 #include <QFile>
+#include <QLocale>
 #include <QTimeZone>
+#include <QTranslator>
 
 #include <extendedcalendar.h>
 #include <extendedstorage.h>
@@ -134,4 +137,32 @@ bool ProtonDataPurger::purgeData(int accountId)
 void ProtonSettingsPlugin::registerTypes(const char *uri)
 {
     qmlRegisterType<ProtonDataPurger>(uri, 1, 0, "ProtonDataPurger");
+}
+
+void ProtonSettingsPlugin::initializeEngine(QQmlEngine *engine, const char *uri)
+{
+    Q_UNUSED(engine);
+    Q_UNUSED(uri);
+    // One translator per process (initializeEngine can run per import).
+    // Tries full locale first (proton_it_IT.qm), then language
+    // (proton_it.qm); English (and unmatched locales) fall back to the
+    // qsTr() source strings with no file at all.
+    static bool installed = false;
+    if (installed) {
+        return;
+    }
+    installed = true;
+    const QString locale = QLocale::system().name();
+    const QString dir = QStringLiteral("/usr/share/proton/translations");
+    QTranslator *translator = new QTranslator();
+    bool loaded = translator->load(QStringLiteral("proton_%1").arg(locale), dir);
+    if (!loaded && locale.contains(QLatin1Char('_'))) {
+        loaded = translator->load(
+            QStringLiteral("proton_%1").arg(locale.section(QLatin1Char('_'), 0, 0)), dir);
+    }
+    if (loaded) {
+        QCoreApplication::installTranslator(translator);
+    } else {
+        delete translator;
+    }
 }

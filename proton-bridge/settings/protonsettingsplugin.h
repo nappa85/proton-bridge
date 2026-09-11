@@ -25,4 +25,9 @@ class ProtonSettingsPlugin : public QQmlExtensionPlugin
     Q_PLUGIN_METADATA(IID QQmlExtensionInterface_iid)
 public:
     void registerTypes(const char *uri) override;
+    // Installs our .qm translator (if any matches the system locale) so
+    // qsTr() in the account QML agents renders translated. Runs in the
+    // Settings app process, where per-app auto-loading does NOT apply —
+    // hence explicit install here rather than relying on it.
+    void initializeEngine(QQmlEngine *engine, const char *uri) override;
 };

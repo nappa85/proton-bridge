@@ -92,7 +92,7 @@ Sync (buteo OOPP, proton_bridge_shim.cpp, NoUserInteractionPolicy):
 - **Token-based address keys**: FIXED 2026-09-06 — `Token` is decrypted with
   the unlocked user keys (go-proton-api `Key::Unlock`), verified live on
   device (`addrkey_…_ok_via_token` with `pw_len=0`)
-- [ ] **Contacts upsync** (filed 2026-09-08, after calendar upsync verified
+- [x] **Contacts upsync** (filed 2026-09-08, after calendar upsync verified
   end-to-end — follow the same template: inventory/planner/batcher/
   fail-closed executor/selective handling, but contacts-specific):
   engine is download-only with full replacement (local creates wiped,
@@ -204,7 +204,7 @@ Sync (buteo OOPP, proton_bridge_shim.cpp, NoUserInteractionPolicy):
   sha256   `1d2dc0ceaacfe46f1c703e7275473fadff559bad380e890a3adbfdf433c6384c`
   (supersedes `60c05ed7…` — deploy only this). VERIFIED LIVE 2026-09-10
   (deployed, sha-checked): avatar set on existing contact → `updated=1`,
-  photo visible on Proton web. VERIFIED LIVE 2026-09-11 (deployed `9f06aea5\u2026`, sha-checked): avatar removal \u2192 `photo_delete` marker \u2192 `updated=1` \u2192 photo gone on web. Diagnosis along the way (recorded): app leaves a stale duplicate avatar detail on removal \u2014 last-wins read fixed it. Staged `packaging/buteo-plugin/libproton-client.so` sha256 `38e1b57f0d61aa8826654a63c25f5f7a14e3ae7795b9e75a4ebffacc7d777ff5` (photo-removal build — deploy only this).
+  photo visible on Proton web. VERIFIED LIVE 2026-09-11 (deployed `9f06aea5…`, sha-checked): avatar removal → `photo_delete` marker → `updated=1` → photo gone on web. Diagnosis along the way (recorded): app leaves a stale duplicate avatar detail on removal — last-wins read fixed it. Staged `packaging/buteo-plugin/libproton-client.so` sha256 `38e1b57f0d61aa8826654a63c25f5f7a14e3ae7795b9e75a4ebffacc7d777ff5` (photo-removal build — deploy only this).
 - **Password never persisted** (intentional): raw 20-char login password is transient `Password` param only for `derive_all_passwords` at `Verify`; `signon-secrets.db` `CREDENTIALS.password` stays dummy `"x"`, `handleAuthOk` never returns `Secret`. New `KeySalt` after manual Proton key rotation will need one more **Update credentials → OTP** to re-derive and re-store `DerivedPasswords`.
 - [x] **CAPTCHA / human-verification handling** (filed 2026-09-09, hit live
   from the host: SRP login → `422 Code 9001`; IMPLEMENTED 2026-09-09
@@ -265,29 +265,29 @@ Sync (buteo OOPP, proton_bridge_shim.cpp, NoUserInteractionPolicy):
   inherits msyncd's env at msyncd start — `set-environment` requires a
   msyncd restart to take effect. Rotation not triggerable live (~130
   KiB log) — offline-tested only.)
-- [ ] **UI i18n** (DEFERRED 2026-09-07 by user decision — do after settings
-  UI strings stabilize; they changed twice in two days and each change
-  invalidates translations): audit 2026-09-07 found all static strings in
-  `ui/proton.qml` / `ui/proton-update.qml` already use `qsTr` + `//%` (plus
-  3 stock `qsTrId`s from Jolla's catalog), and `ui/proton-settings.qml`
-  purge strings were converted to `qsTr` + `//%`. But there is NO
-  translation pipeline (no `.ts`, no `lupdate`/`lrelease` in CI/specs), so
-  custom strings render English everywhere. Reference
-  `sailfish-account-nextcloud` ships zero custom strings — no Jolla
-  precedent to copy. Design (researched 2026-09-07): our QML runs in the
-  Settings app process, so per-app auto-loading does NOT apply — load via
-  our `Proton 1.0` C++ extension (`QQmlExtensionPlugin::initializeEngine`
-  → `installTranslator`, `.qm` from `/usr/share/proton/translations/`;
-  needs a real non-English-locale device test, host-process assumptions
-  have bitten before). Steps: (1) seed `translations/proton-<lang>.ts` via
-  `lupdate`; (2) `lrelease` → `.qm` at bundle time + account spec `%files`;
-  (3) `initializeEngine` translator install with graceful fallback;
-  (4) CI gate keeping `.ts` in sync; (5) keep `qsTr` (free English
-  fallback — custom `qsTrId` without shipped `.qm` renders empty). Also in
-  scope: `proton.provider` name/description (XML, not QML). Out of scope:
-  dynamic server/plugin error messages (`_errorMessage`, English by
-  nature). Cheap first step when revived: commit English-source `.ts`
-  template only.
+- [x] **UI i18n** (DEFERRED 2026-09-07, DONE 2026-09-11 local-only —
+  Italian first, then all remaining official locales on user request): 13 unique custom strings (23 qsTr call sites, all
+  already `qsTr` + `//%`; 3 stock `qsTrId`s stay Jolla's). Pipeline:
+  `translations/proton.ts` template (lupdate) + `proton_it.ts` (Italian,
+  merged by `tools/apply-translations.py` — keeps finished strings
+  across re-runs) + committed `proton_<lang>.qm` per language (lrelease; byte-reproducible,
+  verified) — 39 catalogs (it/de/fr/es + 35 more incl. fi/ru/zh/CJK/Indic,
+  machine-translated, awaiting native-speaker review; English fallback covers
+  the rest). Toolchain without system Qt: `tools/build-qm.sh`
+  bootstraps lupdate/lrelease from the PySide6 wheel into
+  `$XDG_CACHE_HOME/qt-tools`. Loading via the `Proton 1.0` C++ extension
+  (`initializeEngine` → `installTranslator`, full locale then language
+  fallback, English needs no file); all three agents import Proton 1.0
+  (creation/update import it solely for this). PROVEN on device: a
+  cross-compiled Qt 5.6 probe loads the Qt6-built .qm and translates
+  (`Accedi`/`Verifica`/purge string, missing-key fallback intact) — the
+  exact risk the design flagged. CI `i18n` job fails on any drift
+  (`build-qm.sh --check`). Shipping: `.qm` in the account tarball +
+  spec `%files` (`proton_*.qm` glob) + deploy-script copy, installed to
+  `/usr/share/proton/translations/`. Out of scope kept out: dynamic
+  server/plugin errors (English by nature), `proton.provider`
+  name/description (no framework translation mechanism for provider
+  XML). Phone gate CLOSED 2026-09-11: all three agent pages render Italian on an it_IT device.
 - [ ] **Docs rewrite: findings → objective documentation** (filed 2026-09-09
   by user decision — final TODO, do after all sync work stabilizes):
   convert `PLAN.md` / `ARCHITECTURE.md` / `FINDINGS_OTP.md` /
@@ -323,8 +323,7 @@ Sync (buteo OOPP, proton_bridge_shim.cpp, NoUserInteractionPolicy):
   inherited email gone — byte-identical outcome to the 09-08 full-reseal
   verification of the same edit (custom list replaces inheritance in
   Proton's model, on web too; the phone edits a single display alarm).
-  Parity proven, no semantic change. Phone gate remainder: a text/time
-  edit must still take the reseal path.
+  Parity proven, no semantic change. VERIFIED LIVE 2026-09-11 (deployed `e45896a4…`, sha-checked, steady contacts sync green first): T02 → 2-hour reminder → `upsync_personal`, web confirmed — second live proof (1-hour + 2-hour, plain + zoned). CLOSED 2026-09-11: T02 description edit → `upsync_updated` reseal (no personal), web confirmed — router discriminates both directions live.
 - [ ] **RSVP sync-back + invitation sending** (filed 2026-09-09,
   CONTRACT READY 2026-09-10, see `FINDINGS_CALENDAR.md` §16 — no code
   yet, deliberately): RSVP = `PUT .../events/{id}/attendees/{attendeeID}
@@ -335,7 +334,7 @@ Sync (buteo OOPP, proton_bridge_shim.cpp, NoUserInteractionPolicy):
   (ID≠Token, relation unknown), UpdateTime/Comment/self-resolution
   missing; NO phone trigger (attendee events read-only); NO live invite
   data (T16 must survive). Implementation starts only with all three.
-- [ ] **Contacts photo upload** (filed 2026-09-09): photos are dropped on
+- [x] **Contacts photo upload** (filed 2026-09-09, DONE — upload + removal both live-verified): photos are dropped on
   create and only carried over on update (server copy wins). The
   "Multiple photos" entry above covers the People-app single-avatar
   limit, not upload. Direction: seal `PHOTO` data-URI lines into the
@@ -467,7 +466,7 @@ Sync (buteo OOPP, proton_bridge_shim.cpp, NoUserInteractionPolicy):
   `6dcb165aa9309a3753448d748873f41399889f81ded19d8075f9bc1a9a327b6a`
   (supersedes `e46b3605…` — deploy only this). Live delta: none on
   happy path; phone gate is deploy + steady sync.
-- [ ] **FIDO2 feasibility re-research** (filed 2026-09-09 by user
+- [x] **FIDO2 feasibility re-research** (filed 2026-09-09 by user
   challenge — RESEARCHED 2026-09-09, verdict in `FINDINGS_OTP.md` §9):
   the fingerprint reader canNOT become an authenticator (live fpd
   introspection: enroll/match-only API, no keys/signing — fingerprint is

@@ -290,7 +290,8 @@ mkdir -p "$packaging_dir/buteo-sync-plugin-proton-$PKG_VER/buteo-plugin" \
          "$packaging_dir/buteo-sync-plugin-proton-$PKG_VER/buteo-profiles/sync" \
          "$packaging_dir/buteo-sync-plugin-proton-$PKG_VER/settings-plugin" \
          "$packaging_dir/sailfish-account-proton-$PKG_VER/ui" \
-         "$packaging_dir/sailfish-account-proton-$PKG_VER/accounts"
+         "$packaging_dir/sailfish-account-proton-$PKG_VER/accounts" \
+         "$packaging_dir/sailfish-account-proton-$PKG_VER/translations"
 
 # Buteo plugin RPM contents: built .so files + install-time data only
 # (no .o/.a/moc intermediates).
@@ -316,6 +317,13 @@ cp "$repo_root/rpm/buteo-sync-plugin-proton.spec" "$packaging_dir/rpm/"
 # Account RPM contents: current UI + provider/services (no deleted files).
 cp "$repo_root/ui/proton.qml" "$repo_root/ui/proton-settings.qml" "$repo_root/ui/proton-update.qml" \
    "$packaging_dir/sailfish-account-proton-$PKG_VER/ui/"
+# Compiled message catalogs (built from translations/*.ts; missing .qm
+# files are a hard error — UI strings must never ship untranslated by
+# accident; build them with tools/build-qm.sh).
+for qm in "$repo_root"/translations/*.qm; do
+    [ -e "$qm" ] || { echo "ERROR: no .qm catalogs in translations/ (run tools/build-qm.sh)"; exit 1; }
+    cp "$qm" "$packaging_dir/sailfish-account-proton-$PKG_VER/translations/"
+done
 cp "$repo_root/packaging/accounts/proton.provider" \
    "$repo_root/packaging/accounts/proton-carddav.service" \
    "$repo_root/packaging/accounts/proton-caldav.service" \
@@ -378,6 +386,7 @@ scp "$repo_root/ui/proton-settings.qml" defaultuser@$PHONE_IP:/tmp/proton-settin
 scp "$repo_root/ui/proton-update.qml" defaultuser@$PHONE_IP:/tmp/proton-update.qml
 scp "$packaging_dir/settings-plugin/libprotonsettingsplugin.so" defaultuser@$PHONE_IP:/tmp/libprotonsettingsplugin.so
 scp "$repo_root/proton-bridge/settings/qmldir" defaultuser@$PHONE_IP:/tmp/proton-qmldir
+scp "$repo_root"/translations/*.qm defaultuser@$PHONE_IP:/tmp/
 
 ssh defaultuser@$PHONE_IP "
 set -e
@@ -420,6 +429,12 @@ cp /tmp/libprotonsettingsplugin.so /usr/lib64/qt5/qml/Proton/libprotonsettingspl
 chmod 755 /usr/lib64/qt5/qml/Proton/libprotonsettingsplugin.so
 cp /tmp/proton-qmldir /usr/lib64/qt5/qml/Proton/qmldir
 chmod 644 /usr/lib64/qt5/qml/Proton/qmldir
+
+# Message catalogs for the account QML agents (loaded per locale by the
+# Proton QML extension — see initializeEngine)
+mkdir -p /usr/share/proton/translations
+cp /tmp/proton_*.qm /usr/share/proton/translations/
+chmod 644 /usr/share/proton/translations/proton_*.qm
 '
 
 # Restart msyncd

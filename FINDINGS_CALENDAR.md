@@ -1116,3 +1116,18 @@ code would be unverifiable dead weight.
 Recommendation (unchanged): keep download-wins + verbatim attendee
 re-send (already live-safe); revisit when a live Proton-to-Proton
 invite exists on the test account AND a phone trigger is identified.
+
+### Live 2026-09-11 — PERSONAL ROUTE, SECOND PROOF
+
+Deployed `e45896a4…` (sha-checked; steady contacts sync green first).
+T02 (zoned Rome event) → 2-hour reminder → `upsync_personal
+cal=RfXFIcmY`, 21 saved, no reseal, web confirmed. Reminder-only path
+verified twice live (1-hour + 2-hour, UTC + zoned). Remainder: text/time
+edit proving the router still reseals those.
+
+### Live 2026-09-11 — ROUTER DISCRIMINATION PROOF (personal TODO closed)
+
+T02 description edit → `upsync_updated cal=RfXFIcmY n=1` (full reseal,
+no personal path), 21 saved, web confirmed. With the two reminder-only
+proofs, the router is verified live in both directions: reminders take
+the cheap personal PUT, content edits take the whole-object replace.

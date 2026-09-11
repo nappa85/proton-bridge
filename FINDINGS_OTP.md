@@ -294,3 +294,27 @@ security-key ceremony on account.proton.me with a plugged USB key —
 untested, browser-only, irrelevant to the native login flow; noted so
 nobody re-derives it.
 
+
+---
+
+## 9b. i18n implementation – 2026-09-11 (local + device-probe)
+
+Revived from §7's deferred TODO. Toolchain: no linguist tools on host,
+proton-build-env, or SDK — bootstrapped from the PySide6-Essentials
+wheel via tools/build-qm.sh (cached, reproducible, CI-gated). lupdate
+extracts 25 messages (13 unique custom + stock qsTrIds, which stay
+unfinished and never ship); Italian catalog hand-written (23/24
+finished). The headline risk (Qt6-built .qm unreadable by Qt 5.6) was
+killed empirically, not by reasoning: a cross-compiled probe binary ran
+ON THE PHONE and translated correctly with fallback intact. Extension
+installs per-locale in initializeEngine (full→language fallback);
+account RPM + deploy script carry the catalogs to
+/usr/share/proton/translations/. Remaining: Italian-locale visual
+check of all three agent pages on device.
+
+### Visual gate 2026-09-11 — CLOSED
+
+User-confirmed: all three Proton agent pages render Italian on the
+it_IT device. i18n TODO fully closed (39 catalogs shipped, English
+fallback for the rest, non-it/de/fr/es marked for native-speaker
+review as they come in).

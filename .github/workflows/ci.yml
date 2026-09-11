@@ -44,13 +44,28 @@ jobs:
       - name: qmllint syntax check
         # Qt 5.15 qmllint is a pure syntax verifier: it parses QML/JS with
         # QQmlJS and never resolves imports, so the Sailfish-only modules
-        # (Sailfish.Silica, com.jolla.*) cannot cause false positives.
+        # (Sailfish.Silica, com.jolla.*, Proton) cannot cause false positives.
         # Non-zero exit means a real syntax error. (Verified against
         # qtdeclarative 5.15 tools/qmllint/main.cpp.)
         run: |
           export PATH="$PATH:/usr/lib/qt5/bin:/usr/lib/x86_64-linux-gnu/qt5/bin"
           command -v qmllint
           qmllint ui/*.qml
+
+  i18n:
+    name: Translations freshness (lupdate/lrelease)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Rebuild catalogs and fail on drift
+        # tools/build-qm.sh bootstraps Qt linguist tools from the PySide6
+        # wheel (no system Qt needed) and fails when the committed
+        # translations/*.ts/*.qm differ from a fresh extraction — so UI
+        # string changes can never ship without updated catalogs.
+        run: bash tools/build-qm.sh --check
   # Cross-compilation test for aarch64 (host-only, no SDK) — needs aarch64 gcc for ring
   rust-cross:
     name: Rust cross-compile check (aarch64)

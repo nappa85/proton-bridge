@@ -2,6 +2,9 @@ import QtQuick 2.0
 import Sailfish.Silica 1.0
 import Sailfish.Accounts 1.0
 import com.jolla.settings.accounts 1.0
+// Unused import on purpose: loading the Proton extension runs its
+// initializeEngine, which installs our .qm translator for this page.
+import Proton 1.0
 
 /*
  * Proton account creation.
