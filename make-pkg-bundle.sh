@@ -9,6 +9,11 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 packaging_dir="$repo_root/packaging"
 target_triple="aarch64-unknown-linux-gnu"
 
+# Ensure packaging dir exists and is writable (CI: runner user must own it)
+mkdir -p "$packaging_dir"
+# In CI, previous container runs may have created root-owned dirs; fix ownership
+chmod -R u+rwX "$packaging_dir" 2>/dev/null || true
+
 mkdir -p "$packaging_dir/buteo-plugin" \
          "$packaging_dir/signon-plugin" \
          "$packaging_dir/accounts" \
@@ -21,12 +26,19 @@ echo "========================================="
 echo " Step 1: Cross-compile Rust for aarch64 "
 echo "========================================="
 
+if [ "${SKIP_RUST_DOCKER:-0}" != "1" ]; then
 docker run --rm -v "$repo_root":/workspace proton-build-env bash -c '
 set -e
 cd /workspace
 export CARGO_HOME=/workspace/.cargo-home
 cargo build --release --target aarch64-unknown-linux-gnu -p proton-bridge 2>&1 | tail -5
 '
+else
+    # CI release path: the workflow already cross-compiled the workspace
+    # (same target/triple/profile) on the runner, so reuse that artifact
+    # instead of requiring the local-only proton-build-env image.
+    echo "(SKIP_RUST_DOCKER=1: using prebuilt libproton_bridge.a)"
+fi
 
 if [ ! -f "$repo_root/target/$target_triple/release/libproton_bridge.a" ]; then
     echo "ERROR: libproton_bridge.a not found"
@@ -50,8 +62,11 @@ cp "$repo_root/proton-bridge/settings/protonsettingsplugin.cpp" "$packaging_dir/
 cp "$repo_root/proton-bridge/settings/qmldir" "$packaging_dir/settings-plugin/"
 
 # Prepare SignOn plugin sources
+mkdir -p "$packaging_dir/signon-plugin/SignOn"
 cp "$repo_root/proton-bridge/signon/proton_signon_plugin.h" "$packaging_dir/signon-plugin/"
 cp "$repo_root/proton-bridge/signon/proton_signon_plugin.cpp" "$packaging_dir/signon-plugin/"
+cp "$repo_root/proton-bridge/signon/SignOn/authpluginif.h" "$packaging_dir/signon-plugin/SignOn/"
+cp "$repo_root/proton-bridge/signon/SignOn/uisessiondata.h" "$packaging_dir/signon-plugin/SignOn/"
 if [ -f "$repo_root/proton-bridge/signon/minimal_authpluginif.h" ]; then
     cp "$repo_root/proton-bridge/signon/minimal_authpluginif.h" "$packaging_dir/signon-plugin/"
 fi
@@ -64,12 +79,9 @@ fi
 cp "$repo_root/proton-bridge/proton_bridge.h" "$packaging_dir/signon-plugin/"
 cp "$repo_root/target/$target_triple/release/libproton_bridge.a" "$packaging_dir/signon-plugin/"
 
-mkdir -p "$packaging_dir/buteo-headers/Buteo"
-if [ -d "$repo_root/buteo-syncfw/libbuteosyncfw" ]; then
-    for header in $(find "$repo_root/buteo-syncfw/libbuteosyncfw" -name "*.h" -type f); do
-        cp "$header" "$packaging_dir/buteo-headers/Buteo/" 2>/dev/null || true
-    done
-fi
+# Vendor Buteo headers (buteo-syncfw is gitignored; these are stable)
+mkdir -p "$packaging_dir/buteo-headers"
+cp -r "$repo_root/buteo-headers/"* "$packaging_dir/buteo-headers/"
 
 # Device-versioned mKCal/KCalendarCore headers (exact -devel RPM content from
 # the phone: mkcal-qt5-devel-0.7.33, kf5-calendarcore-devel-5.116.0). The SDK
@@ -108,7 +120,6 @@ ln -sf libQt5Xml.so.5 $TARGET_ROOT/usr/lib64/libQt5Xml.so 2>/dev/null || true
 ln -sf libQt5Network.so.5 $TARGET_ROOT/usr/lib64/libQt5Network.so 2>/dev/null || true
 
 BUTEO_INC="-I/home/mersdk/packaging/buteo-headers \
-    -I/home/mersdk/packaging/buteo-headers/Buteo \
     -I/home/mersdk/packaging/device-headers/mkcal-qt5 \
     -I/home/mersdk/packaging/device-headers/KF5 \
     -I/home/mersdk/packaging/device-headers/KF5/KCalendarCore \
@@ -283,62 +294,70 @@ if [ -z "$PKG_VER" ]; then
 fi
 echo "Packaging version $PKG_VER"
 
-rm -rf "$packaging_dir/buteo-sync-plugin-proton-$PKG_VER" \
-       "$packaging_dir/sailfish-account-proton-$PKG_VER"
-mkdir -p "$packaging_dir/buteo-sync-plugin-proton-$PKG_VER/buteo-plugin" \
-         "$packaging_dir/buteo-sync-plugin-proton-$PKG_VER/buteo-profiles/client" \
-         "$packaging_dir/buteo-sync-plugin-proton-$PKG_VER/buteo-profiles/sync" \
-         "$packaging_dir/buteo-sync-plugin-proton-$PKG_VER/settings-plugin" \
-         "$packaging_dir/sailfish-account-proton-$PKG_VER/ui" \
-         "$packaging_dir/sailfish-account-proton-$PKG_VER/accounts" \
-         "$packaging_dir/sailfish-account-proton-$PKG_VER/translations"
+# Build RPM source trees in a temp dir under repo_root (guaranteed
+# writable by the runner) to avoid any permission issues with
+# packaging/ which may have been created by docker as root.
+rpm_src="$repo_root/rpmbuild-tmp"
+rm -rf "$rpm_src"
+mkdir -p "$rpm_src/buteo-sync-plugin-proton-$PKG_VER/buteo-plugin" \
+         "$rpm_src/buteo-sync-plugin-proton-$PKG_VER/buteo-profiles/client" \
+         "$rpm_src/buteo-sync-plugin-proton-$PKG_VER/buteo-profiles/sync" \
+         "$rpm_src/buteo-sync-plugin-proton-$PKG_VER/settings-plugin" \
+         "$rpm_src/sailfish-account-proton-$PKG_VER/ui" \
+         "$rpm_src/sailfish-account-proton-$PKG_VER/accounts" \
+         "$rpm_src/sailfish-account-proton-$PKG_VER/translations"
 
 # Buteo plugin RPM contents: built .so files + install-time data only
 # (no .o/.a/moc intermediates).
 cp "$packaging_dir/buteo-plugin/libproton-client.so" \
-   "$packaging_dir/buteo-sync-plugin-proton-$PKG_VER/buteo-plugin/"
+   "$rpm_src/buteo-sync-plugin-proton-$PKG_VER/buteo-plugin/"
 cp "$repo_root/proton-bridge/cxx/proton_bridge_shim.h" \
    "$repo_root/proton-bridge/cxx/proton_bridge_shim.cpp" \
    "$repo_root/proton-bridge/proton_bridge.h" \
-   "$packaging_dir/buteo-sync-plugin-proton-$PKG_VER/buteo-plugin/"
+   "$rpm_src/buteo-sync-plugin-proton-$PKG_VER/buteo-plugin/"
 cp "$repo_root/buteo-profiles/client/proton-contacts.xml" \
-   "$packaging_dir/buteo-sync-plugin-proton-$PKG_VER/buteo-profiles/client/"
+   "$rpm_src/buteo-sync-plugin-proton-$PKG_VER/buteo-profiles/client/"
 cp "$repo_root/buteo-profiles/sync/proton.Contacts.xml" \
    "$repo_root/buteo-profiles/sync/proton.Calendar.xml" \
-   "$packaging_dir/buteo-sync-plugin-proton-$PKG_VER/buteo-profiles/sync/"
+   "$rpm_src/buteo-sync-plugin-proton-$PKG_VER/buteo-profiles/sync/"
 cp "$packaging_dir/settings-plugin/libprotonsettingsplugin.so" \
-   "$packaging_dir/buteo-sync-plugin-proton-$PKG_VER/settings-plugin/"
+   "$rpm_src/buteo-sync-plugin-proton-$PKG_VER/settings-plugin/"
 cp "$repo_root/proton-bridge/settings/qmldir" \
-   "$packaging_dir/buteo-sync-plugin-proton-$PKG_VER/settings-plugin/"
+   "$rpm_src/buteo-sync-plugin-proton-$PKG_VER/settings-plugin/"
 cp "$repo_root/rpm/buteo-sync-plugin-proton.spec" \
-   "$packaging_dir/buteo-sync-plugin-proton-$PKG_VER/"
-cp "$repo_root/rpm/buteo-sync-plugin-proton.spec" "$packaging_dir/rpm/"
+   "$rpm_src/buteo-sync-plugin-proton-$PKG_VER/"
+# Copy spec files so the CI RPM build step can find them at
+# rpmbuild-tmp/rpm/<name>.spec (mb2 uses -s ../rpm/<spec>).
+mkdir -p "$rpm_src/rpm"
+cp "$repo_root/rpm/buteo-sync-plugin-proton.spec" \
+   "$rpm_src/rpm/buteo-sync-plugin-proton.spec"
+cp "$repo_root/rpm/sailfish-account-proton.spec" \
+   "$rpm_src/rpm/sailfish-account-proton.spec"
 
 # Account RPM contents: current UI + provider/services (no deleted files).
 cp "$repo_root/ui/proton.qml" "$repo_root/ui/proton-settings.qml" "$repo_root/ui/proton-update.qml" \
-   "$packaging_dir/sailfish-account-proton-$PKG_VER/ui/"
+   "$rpm_src/sailfish-account-proton-$PKG_VER/ui/"
 # Compiled message catalogs (built from translations/*.ts; missing .qm
 # files are a hard error — UI strings must never ship untranslated by
 # accident; build them with tools/build-qm.sh).
 for qm in "$repo_root"/translations/*.qm; do
     [ -e "$qm" ] || { echo "ERROR: no .qm catalogs in translations/ (run tools/build-qm.sh)"; exit 1; }
-    cp "$qm" "$packaging_dir/sailfish-account-proton-$PKG_VER/translations/"
+    cp "$qm" "$rpm_src/sailfish-account-proton-$PKG_VER/translations/"
 done
 cp "$repo_root/packaging/accounts/proton.provider" \
    "$repo_root/packaging/accounts/proton-carddav.service" \
    "$repo_root/packaging/accounts/proton-caldav.service" \
-   "$packaging_dir/sailfish-account-proton-$PKG_VER/accounts/"
+   "$rpm_src/sailfish-account-proton-$PKG_VER/accounts/"
 cp "$repo_root/rpm/sailfish-account-proton.spec" \
-   "$packaging_dir/sailfish-account-proton-$PKG_VER/"
-cp "$repo_root/rpm/sailfish-account-proton.spec" "$packaging_dir/rpm/"
+   "$rpm_src/sailfish-account-proton-$PKG_VER/"
 
-tar -cjf "$packaging_dir/buteo-sync-plugin-proton-$PKG_VER.tar.bz2" \
-    -C "$packaging_dir" "buteo-sync-plugin-proton-$PKG_VER"
-tar -cjf "$packaging_dir/sailfish-account-proton-$PKG_VER.tar.bz2" \
-    -C "$packaging_dir" "sailfish-account-proton-$PKG_VER"
+tar -cjf "$rpm_src/buteo-sync-plugin-proton-$PKG_VER.tar.bz2" \
+    -C "$rpm_src" "buteo-sync-plugin-proton-$PKG_VER"
+tar -cjf "$rpm_src/sailfish-account-proton-$PKG_VER.tar.bz2" \
+    -C "$rpm_src" "sailfish-account-proton-$PKG_VER"
 echo "Tarballs ready:"
-tar -tf "$packaging_dir/buteo-sync-plugin-proton-$PKG_VER.tar.bz2" | sort | head -20
-tar -tf "$packaging_dir/sailfish-account-proton-$PKG_VER.tar.bz2" | sort
+tar -tf "$rpm_src/buteo-sync-plugin-proton-$PKG_VER.tar.bz2" | sort | head -20
+tar -tf "$rpm_src/sailfish-account-proton-$PKG_VER.tar.bz2" | sort
 
 echo "========================================="
 echo " Step 3: Deploy to phone                 "
@@ -356,7 +375,7 @@ for arg in "$@"; do
     esac
 done
 if [ "$SKIP_DEPLOY" = "1" ]; then
-    echo "Skipping deploy (--no-deploy). Artifacts are in $packaging_dir."
+    echo "Skipping deploy (--no-deploy). Artifacts are in $rpm_src."
     echo "Done. Copy to phone manually, then test with: ssh defaultuser@$PHONE_IP 'DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/100000/dbus/user_bus_socket dbus-send --session --print-reply --dest=com.meego.msyncd /synchronizer com.meego.msyncd.startSync string:proton.Contacts-2'"
     exit 0
 fi

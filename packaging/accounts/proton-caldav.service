@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<service id="proton-caldav">
+    <!-- Custom type on purpose: this is NOT CalDAV (E2EE, no DAV server).
+         The stock settings agent hardcodes a CalDAV discovery flow for
+         type "caldav" (OnlineCalendarUpdatePage PROPFIND) that can never
+         succeed here and reverts the toggle. Unknown types fall back to
+         the service's own display name with a plain on/off switch
+         (AccountsUtil.serviceDisplayNameForService default branch), while
+         msyncd mapping and our plugin both match by service NAME. -->
+    <type>proton-calendar</type>
+    <name>Calendar</name>
+    <icon>image://theme/icon-m-calendar</icon>
+    <provider>proton</provider>
+    <template>
+        <setting name="sync_profile_templates" type="as">["proton-caldav"]</setting>
+        <group name="auth">
+            <setting name="method">proton</setting>
+            <setting name="mechanism">password</setting>
+        </group>
+    </template>
+</service>

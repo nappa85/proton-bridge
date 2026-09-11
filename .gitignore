@@ -4,7 +4,8 @@
 Cargo.lock
 
 # Build outputs
-/packaging
+/packaging/*
+!/packaging/accounts/
 proton_bridge.h
 *.o
 
@@ -13,6 +14,7 @@ proton_bridge.h
 /bridge
 /tmp_build3
 /.cargo-home
+/rpmbuild-tmp
 
 # Test/debug artifacts
 /proton-vcard-raw.log

@@ -1,7 +1,7 @@
 #pragma once
 
-#include "Buteo/ClientPlugin.h"
-#include "Buteo/SyncPluginLoader.h"
+#include "ClientPlugin.h"
+#include "SyncPluginLoader.h"
 
 #include <QContactManager>
 #include <QContact>

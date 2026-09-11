@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<service id="proton-carddav">
+    <type>carddav</type>
+    <name>Contacts</name>
+    <icon>image://theme/icon-m-file-vcard</icon>
+    <provider>proton</provider>
+    <template>
+        <setting name="sync_profile_templates" type="as">["proton-carddav"]</setting>
+        <group name="auth">
+            <setting name="method">proton</setting>
+            <setting name="mechanism">password</setting>
+        </group>
+    </template>
+</service>

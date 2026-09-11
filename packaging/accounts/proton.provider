@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE provider>
+<provider version="1.0" id="proton">
+    <name>Proton</name>
+    <description>Proton Mail, Contacts, Calendar</description>
+    <icon>image://theme/icon-m-file-vcard</icon>
+    <tags>
+        <tag>user-group:account-onlinesync</tag>
+    </tags>
+    <template>
+        <key name="server">https://mail.proton.me</key>
+        <group name="auth">
+            <setting name="method">proton</setting>
+            <setting name="mechanism">password</setting>
+        </group>
+    </template>
+
+</provider>

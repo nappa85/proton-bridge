@@ -77,6 +77,12 @@ jobs:
           cargo build --release --target aarch64-unknown-linux-gnu
 
       - name: Stage package bundle (Rust cdylib + configs)
+        # The previous step already cross-compiled the workspace on the
+        # runner (same target/triple/profile, incl. libproton_bridge.a),
+        # so the bundle reuses it instead of the local-only
+        # proton-build-env docker image (not published anywhere).
+        env:
+          SKIP_RUST_DOCKER: 1
         run: |
           chmod +x make-pkg-bundle.sh
           ./make-pkg-bundle.sh --no-deploy
@@ -84,44 +90,42 @@ jobs:
       - name: Pull Sailfish Platform SDK
         run: docker pull coderus/sailfishos-platform-sdk-aarch64
 
-      - name: Build buteo-sync-plugin-proton RPM
+      - name: Build RPMs in Sailfish SDK container
         # NOTE: mb2 runs rpmbuild --build-in-place --short-circuit, so it
         # must execute INSIDE the unpacked source tree (not the rpm/ dir) —
         # no `prepare` step needed or wanted. Verified locally 2026-09-06.
+        # Both RPMs must be built in the same step because the EXIT trap
+        # removes the container when the step's shell exits.
         run: |
           set -euxo pipefail
           docker create --name proton-build coderus/sailfishos-platform-sdk-aarch64 sleep infinity
           docker start proton-build
           trap 'docker rm -f proton-build >/dev/null 2>&1 || true' EXIT
 
-          # Copy packaging tree
-          docker cp packaging proton-build:/home/mersdk/packaging
+          # Copy RPM source trees + specs (built in rpmbuild-tmp by
+          # make-pkg-bundle.sh to avoid root-owned packaging/ permission
+          # issues).  docker cp creates the destination dir automatically.
+          docker cp rpmbuild-tmp/. proton-build:/home/mersdk/packaging/
           docker exec -u root proton-build chown -R mersdk:mersdk /home/mersdk/packaging
 
-          # Build buteo plugin RPM (in-place in the staged source tree)
+          # Build buteo plugin RPM
           docker exec -w /home/mersdk/packaging/buteo-sync-plugin-proton-${{ steps.version.outputs.version }} proton-build \
             mb2 --target SailfishOS-5.2.0.15-aarch64 -s ../rpm/buteo-sync-plugin-proton.spec build
 
-          mkdir -p packaging/RPMS
-          docker exec proton-build bash -c 'mv /home/mersdk/packaging/*/RPMS/*.rpm /home/mersdk/packaging/RPMS/ 2>/dev/null; true'
-          docker cp proton-build:/home/mersdk/packaging/RPMS/. packaging/RPMS/
-
-      - name: Build sailfish-account-proton RPM
-        run: |
-          set -euxo pipefail
-          # Reuse the same container
+          # Build sailfish account RPM
           docker exec -w /home/mersdk/packaging/sailfish-account-proton-${{ steps.version.outputs.version }} proton-build \
             mb2 --target SailfishOS-5.2.0.15-aarch64 -s ../rpm/sailfish-account-proton.spec build
 
-          docker exec proton-build bash -c 'mv /home/mersdk/packaging/*/RPMS/*.rpm /home/mersdk/packaging/RPMS/ 2>/dev/null; true'
-          docker cp proton-build:/home/mersdk/packaging/RPMS/. packaging/RPMS/
+          mkdir -p rpmbuild-tmp/RPMS
+          docker exec proton-build bash -c 'mkdir -p /home/mersdk/packaging/RPMS && mv /home/mersdk/packaging/*/RPMS/*.rpm /home/mersdk/packaging/RPMS/ 2>/dev/null; true'
+          docker cp proton-build:/home/mersdk/packaging/RPMS/. rpmbuild-tmp/RPMS/
 
       - name: Sanity-check built RPMs
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq rpm >/dev/null
           expected="${{ steps.version.outputs.version }}"
           found=0
-          for f in packaging/RPMS/*.rpm; do
+          for f in rpmbuild-tmp/RPMS/*.rpm; do
             [ -e "$f" ] || continue
             found=1
             echo "== $f =="
@@ -138,7 +142,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            packaging/RPMS/*.rpm
+            rpmbuild-tmp/RPMS/*.rpm
           generate_release_notes: true
           make_latest: true
 
@@ -148,4 +152,4 @@ jobs:
         with:
           name: rpms-${{ steps.version.outputs.version }}
           path: |
-            packaging/RPMS/*.rpm
+            rpmbuild-tmp/RPMS/*.rpm

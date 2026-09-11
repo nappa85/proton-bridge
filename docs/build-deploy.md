@@ -21,7 +21,11 @@ SDK sysroot glibc 2.35 vs phone 2.41 is forward-compatible.
 
 ## make-pkg-bundle.sh
 
-`--no-deploy` (or `SKIP_DEPLOY=1`) skips all ssh/scp contact. Stages:
+`--no-deploy` (or `SKIP_DEPLOY=1`) skips all ssh/scp contact.
+`SKIP_RUST_DOCKER=1` skips the Step-1 `proton-build-env` container rebuild
+and reuses a prebuilt `target/<triple>/release/libproton_bridge.a` (the CI
+release workflow sets it — the image is local-only, never published — after
+cross-compiling the workspace on the runner itself). Stages:
 
 1. Rust cross: `cargo build --release --target aarch64-unknown-linux-gnu
    -p proton-bridge` → `target/<triple>/release/libproton_bridge.a`
