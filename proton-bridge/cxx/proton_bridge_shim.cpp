@@ -526,14 +526,30 @@ void ProtonContactsPlugin::pollStatus()
         persistContactsPending(contactPending ? QString::fromUtf8(contactPending) : QString());
         if (contactPending) proton_bridge_free_string(contactPending);
         char *contactConflicts = proton_bridge_get_contact_conflicts_json(m_engine);
+        QStringList noticeParts;
         if (contactConflicts) {
             QJsonDocument doc = QJsonDocument::fromJson(QByteArray(contactConflicts));
             proton_bridge_free_string(contactConflicts);
             if (doc.isArray() && !doc.array().isEmpty()) {
-                sendProtonNotification(
-                    QStringLiteral("Proton Contacts sync conflicts"),
-                    QStringLiteral("%1 contacts changed on both sides; server version kept").arg(doc.array().size()));
+                noticeParts << QStringLiteral("%1 contacts changed on both sides; server version kept").arg(doc.array().size());
             }
+        }
+        // Skipped uploads (IDs + reason codes only, never contents): the
+        // download overwrote them, so the user hears about it here. The
+        // full list lands in the file log for diagnosis.
+        char *contactDeferred = proton_bridge_get_contact_deferred_json(m_engine);
+        if (contactDeferred) {
+            QJsonDocument doc = QJsonDocument::fromJson(QByteArray(contactDeferred));
+            proton_bridge_free_string(contactDeferred);
+            if (doc.isArray() && !doc.array().isEmpty()) {
+                proton_log(QStringLiteral("Contacts deferred uploads: %1").arg(QString::fromUtf8(QJsonDocument(doc).toJson(QJsonDocument::Compact)).left(2000)));
+                noticeParts << QStringLiteral("%1 local changes could not be uploaded; server version kept").arg(doc.array().size());
+            }
+        }
+        if (!noticeParts.isEmpty()) {
+            sendProtonNotification(
+                QStringLiteral("Proton Contacts sync conflicts"),
+                noticeParts.join(QStringLiteral("; ")));
         }
 
         char *json = proton_bridge_get_synced_contacts_json(m_engine);

@@ -688,3 +688,17 @@ n=2 len=0 baseline=1 dirty=1` → `photo_delete <uid>` → `updated=1` →
 photo gone on Proton web. The `n=2` (stale duplicate detail) theory
 from the trace was exactly right; last-wins reads the removal. Photo
 TODO fully closed (upload + removal).
+
+### Deferred visibility – 2026-09-11 (local only, notification layer)
+
+Skipped uploads now surface: `ContactDeferred{kind,id,reason}` built
+alongside the trace strings (which stay byte-identical), exposed via
+FFI, appended to the sync notification + full list in the file log
+(IDs/codes only). The keep-dirty half was deliberately NOT built:
+preserving edited content across the full-replacement download needs
+ID re-keying surgery in the shim write path — high blast radius,
+unverifiable without crafted fixtures (web import drops exotics the
+same way it drops labels). Recorded as a rejected direction, not a
+deferral. 226 workspace tests green (deferring mock asserts both the
+trace and the structured getter), bundle green, staged `e45896a4…`.
+Notification text unverified live (no producible deferred case).

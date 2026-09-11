@@ -410,12 +410,22 @@ Sync (buteo OOPP, proton_bridge_shim.cpp, NoUserInteractionPolicy):
   focused live session to isolate it (same token/session, overlapping
   windows, per-query logging already exists) or delete the typed path
   outright so it stops looking like a supported alternative.
-- [ ] **Deferred-update visibility** (filed 2026-09-09): conflict
-  notifications are wired (`proton_bridge_shim.cpp:496`), but deferred
-  counts/reasons are file-log-only, and the download still overwrites a
-  deferred local edit so the next snapshot looks clean. Direction:
-  include deferred counts + first reason in the conflict notification
-  and/or keep the local row dirty until its content actually uploads.
+- [x] **Deferred-update visibility** (filed 2026-09-09, NOTIFICATION DONE
+  2026-09-11 local-only): skipped uploads now surface — structured
+  `ContactDeferred{kind,id,reason}` list (IDs + codes only) via new FFI
+  `proton_bridge_get_contact_deferred_json`, appended to the sync
+  notification (`N local changes could not be uploaded; server version
+  kept`, combined with conflicts when both) + full list in the file log.
+  Deliberately NOT the keep-dirty surgery: preserving content across the
+  full-replacement download needs ID re-keying surgery in the shim write
+  path, unverifiable without crafted fixtures and risky to the most
+  critical code — documented as rejected, not deferred. Verified: fmt +
+  clippy clean, 226 tests (136+5+85: deferring mock asserts trace +
+  structured getter), full bundle green. Staged
+  `packaging/buteo-plugin/libproton-client.so` sha256
+  `e45896a49c9e9627604c3a61d1b80f7f3d7ada86f832012817c90232994bc67d`
+  (supersedes `36d44fcc…` — deploy only this). Notification text itself
+  unverified live (no producible deferred case on demand).
 - [x] **Rate-limit pacing + create-retry duplication** (filed 2026-09-09,
   DONE 2026-09-09 local-only, contacts engine): retries are now
   idempotent instead of merely documented. Each create seals under a

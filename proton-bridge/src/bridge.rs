@@ -403,6 +403,26 @@ pub extern "C" fn proton_bridge_get_contact_conflicts_json(
     }
 }
 
+/// Skipped uploads this run (`[]` JSON — IDs and reason codes only).
+/// The shim appends the count to the sync notification and logs the
+/// full list to the file log.
+#[no_mangle]
+pub extern "C" fn proton_bridge_get_contact_deferred_json(
+    engine: *mut ProtonSyncEngine,
+) -> *mut c_char {
+    if engine.is_null() {
+        return std::ptr::null_mut();
+    }
+    let engine_ref = unsafe { &*engine };
+    let guard = engine_ref.inner.lock().unwrap();
+    match guard.as_ref() {
+        Some(e) => CString::new(e.get_contact_deferred_json())
+            .unwrap()
+            .into_raw(),
+        None => std::ptr::null_mut(),
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn proton_bridge_get_contact_anchors_json(
     engine: *mut ProtonSyncEngine,

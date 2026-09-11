@@ -69,6 +69,7 @@ pub struct SyncEngine {
     contact_conflicts: Arc<Mutex<Vec<crate::contact_plan::ContactConflict>>>,
     contact_anchors: Arc<Mutex<std::collections::HashMap<String, i64>>>,
     contact_pending: Arc<Mutex<std::collections::HashMap<String, String>>>,
+    contact_deferred: Arc<Mutex<Vec<ContactDeferred>>>,
 }
 
 impl SyncEngine {
@@ -103,6 +104,7 @@ impl SyncEngine {
             contact_conflicts: Arc::new(Mutex::new(Vec::new())),
             contact_anchors: Arc::new(Mutex::new(std::collections::HashMap::new())),
             contact_pending: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            contact_deferred: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -205,6 +207,7 @@ impl SyncEngine {
                 ) {
                     Ok(outcome) => {
                         *self.contact_pending.lock().unwrap() = outcome.pending_creates.clone();
+                        *self.contact_deferred.lock().unwrap() = outcome.deferred_list.clone();
                         outcome
                     }
                     Err(e) => {
@@ -817,6 +820,17 @@ impl SyncEngine {
     }
 }
 
+/// One skipped upload for the user-visible deferred list: which local
+/// change did not reach the server this cycle (the download overwrote
+/// it). IDs and reason codes only — never field contents.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ContactDeferred {
+    /// `create` (id = phone row) or `update` (id = Proton UID).
+    pub kind: String,
+    pub id: String,
+    pub reason: String,
+}
+
 /// Outcome of the contacts upload phase: reconciled server rows plus
 /// shim outputs (conflicts to notify, anchors to persist) plus a
 /// single-line trace (`contact_upsync …` fragments) that `run_sync` folds
@@ -834,6 +848,8 @@ pub struct ContactUploadOutcome {
     /// shim to persist when the phase fails after posting (re-list
     /// failure). Empty on every successful return (re-list confirms).
     pub pending_creates: std::collections::HashMap<String, String>,
+    /// Skipped uploads this cycle, for the user-visible deferred list.
+    pub deferred_list: Vec<ContactDeferred>,
 }
 
 /// Pacing between upload requests (WebClients `API_SAFE_INTERVAL`:
@@ -882,6 +898,10 @@ impl SyncEngine {
         // the journal.
         let mut trace: Vec<String> = Vec::new();
         let mut defer_reasons: Vec<String> = Vec::new();
+        // Structured twin of the trace reasons above (IDs + reason codes
+        // only, never contents) for the user-visible deferred list. The
+        // trace strings stay byte-identical; this only adds fields.
+        let mut deferred_list: Vec<ContactDeferred> = Vec::new();
         // Half-fed defense (2026-09-09 wipe): the shim always feeds inventory
         // AND known together, so inventory=None + known=Some(non-empty) can
         // only mean the inventory JSON failed to parse (e.g. a contract key
@@ -930,6 +950,7 @@ impl SyncEngine {
                 anchors,
                 trace: trace.join("|"),
                 pending_creates: std::collections::HashMap::new(),
+                deferred_list: Vec::new(),
             });
         }
         let client = client
@@ -988,6 +1009,11 @@ impl SyncEngine {
                 None => {
                     deferred += 1;
                     defer_reasons.push(format!("create:{op}:no-fields"));
+                    deferred_list.push(ContactDeferred {
+                        kind: "create".into(),
+                        id: op.clone(),
+                        reason: "no-fields".into(),
+                    });
                     proton_api::vlog!("upsync_deferred contact create {op} no-fields");
                 }
             }
@@ -1014,11 +1040,21 @@ impl SyncEngine {
                     Ok(None) => {
                         deferred += 1;
                         defer_reasons.push("create:unsealable".to_string());
+                        deferred_list.push(ContactDeferred {
+                            kind: "create".into(),
+                            id: qid.clone(),
+                            reason: "unsealable".into(),
+                        });
                         proton_api::vlog!("upsync_deferred contact create unsealable");
                     }
                     Err(e) => {
                         deferred += 1;
                         defer_reasons.push(format!("create:seal-error:{e}"));
+                        deferred_list.push(ContactDeferred {
+                            kind: "create".into(),
+                            id: qid.clone(),
+                            reason: "seal-error".into(),
+                        });
                         proton_api::vlog!("upsync_deferred contact create: {e}");
                     }
                 }
@@ -1110,6 +1146,11 @@ impl SyncEngine {
             ) else {
                 deferred += 1;
                 defer_reasons.push(format!("update:{op}:no-row-or-fields"));
+                deferred_list.push(ContactDeferred {
+                    kind: "update".into(),
+                    id: op.clone(),
+                    reason: "no-row-or-fields".into(),
+                });
                 proton_api::vlog!("upsync_deferred contact update {op} no-row-or-fields");
                 continue;
             };
@@ -1134,11 +1175,21 @@ impl SyncEngine {
                     deferred += 1;
                     let why = proton_api::contact_seal::diagnose_update_block(&cards, user_keys);
                     defer_reasons.push(format!("update:{op}:{why}"));
+                    deferred_list.push(ContactDeferred {
+                        kind: "update".into(),
+                        id: op.clone(),
+                        reason: why.clone(),
+                    });
                     proton_api::vlog!("upsync_deferred contact update {op} {why}");
                 }
                 Err(e) => {
                     deferred += 1;
                     defer_reasons.push(format!("update:{op}:seal-error:{e}"));
+                    deferred_list.push(ContactDeferred {
+                        kind: "update".into(),
+                        id: op.clone(),
+                        reason: "seal-error".into(),
+                    });
                     proton_api::vlog!("upsync_deferred contact update {op}: {e}");
                 }
             }
@@ -1223,6 +1274,7 @@ impl SyncEngine {
             anchors,
             trace: trace.join("|"),
             pending_creates: pending_out.clone(),
+            deferred_list,
         })
     }
 
@@ -1296,6 +1348,12 @@ impl SyncEngine {
     /// Server-wins contact conflicts this run (`[]` when none).
     pub fn get_contact_conflicts_json(&self) -> String {
         serde_json::to_string(&*self.contact_conflicts.lock().unwrap()).unwrap_or_default()
+    }
+
+    /// Skipped uploads this run (`[]` when none — IDs and reason codes
+    /// only, never field contents).
+    pub fn get_contact_deferred_json(&self) -> String {
+        serde_json::to_string(&*self.contact_deferred.lock().unwrap()).unwrap_or_default()
     }
 
     /// Merged contact anchors (`{}` when nothing known — caller must not
@@ -2037,6 +2095,107 @@ mod tests {
             dbg.contains("ran created=0 updated=1 deleted=0 deferred=0"),
             "{dbg}"
         );
+        let _held = guards;
+    }
+
+    #[test]
+    fn test_contact_deferred_update_surfaces_structured_mock() {
+        // Exotic server props still defer — but now visibly: the file-log
+        // trace names the reason AND the structured getter carries it
+        // (kind/id/reason, no contents) for the notification.
+        let (user_esc, _user_raw) = armored_test_key();
+        let (addr_esc, _) = armored_test_key();
+        let mut server = mockito::Server::new();
+        let mut guards = Vec::new();
+        macro_rules! mock_get {
+            ($re:expr, $code:expr, $body:expr) => {
+                guards.push(
+                    server
+                        .mock("GET", mockito::Matcher::Regex($re.into()))
+                        .with_status($code)
+                        .with_header("content-type", "application/json")
+                        .with_body($body)
+                        .create(),
+                );
+            };
+        }
+        mock_get!(
+            r"/core/v4/users.*",
+            200,
+            format!(
+                r#"{{"User":{{"ID":"u","Name":"t","Keys":[{{"ID":"k1abcdef01","PrivateKey":"{user_esc}","Token":"","Signature":""}}]}}}}"#
+            )
+        );
+        mock_get!(
+            r"/core/v4/keys/salts.*",
+            200,
+            r#"{"KeySalts":[{"ID":"k1abcdef01","KeySalt":""},{"ID":"ak1abcdef01","KeySalt":""}]}"#
+        );
+        mock_get!(
+            r"/core/v4/addresses.*",
+            200,
+            format!(
+                r#"{{"Addresses":[{{"ID":"a1","Email":"t@x","Keys":[{{"ID":"ak1abcdef01","PrivateKey":"{addr_esc}","Token":"","Signature":""}}]}}]}}"#
+            )
+        );
+        // Signed card with a genuinely exotic prop: no PUT shape exists.
+        let row_e1 = r#"{"ID":"c1","Name":"Old","UID":"u1","ModifyTime":100,
+            "Cards":[{"Type":2,"Data":"BEGIN:VCARD\r\nVERSION:4.0\r\nUID:u1\r\nFN:Old Name\r\nX-CUSTOM:1\r\nEND:VCARD","Signature":"s"}]}"#;
+        guards.push(
+            server
+                .mock("GET", mockito::Matcher::Regex(r"/contacts/v4".into()))
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                .with_body(format!("{{\"Contacts\":[{row_e1}],\"Total\":1}}"))
+                .create(),
+        );
+        guards.push(
+            server
+                .mock("GET", mockito::Matcher::Regex(r"/contacts/v4/c1".into()))
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                .with_body(format!("{{\"Contact\":{row_e1}}}"))
+                .create(),
+        );
+        // Any PUT would be wrong (no sealable shape) — expect zero.
+        let no_put = server
+            .mock("PUT", mockito::Matcher::Regex(r"/contacts/v4".into()))
+            .expect(0)
+            .create();
+        guards.push(no_put);
+
+        let mut c = cycle_cfg(server.url());
+        c.password = "testpw".into();
+        c.contact_inventory = Some(vec![crate::contact_plan::ContactItem {
+            qcontact_id: "q1".into(),
+            proton_uid: Some("u1".into()),
+            modified: true,
+            last_synced_mtime: Some(100),
+            fields: Some(proton_api::vcard::ParsedContact {
+                first_name: "Edited".into(),
+                ..Default::default()
+            }),
+            pending_uid: None,
+        }]);
+        let mut anchors = std::collections::HashMap::new();
+        anchors.insert("u1".to_string(), 100);
+        c.contact_anchors = Some(anchors);
+
+        let mut engine = SyncEngine::new(c.clone());
+        engine.start_sync(c);
+        assert_eq!(engine.status().state, "complete");
+        let dbg = engine.get_keys_debug().unwrap_or_default();
+        assert!(
+            dbg.contains("ran created=0 updated=0 deleted=0 deferred=1"),
+            "{dbg}"
+        );
+        assert!(dbg.contains("unknown-props:X-CUSTOM"), "{dbg}");
+        let deferred: Vec<ContactDeferred> =
+            serde_json::from_str(&engine.get_contact_deferred_json()).expect("deferred parses");
+        assert_eq!(deferred.len(), 1);
+        assert_eq!(deferred[0].kind, "update");
+        assert_eq!(deferred[0].id, "u1");
+        assert!(deferred[0].reason.contains("X-CUSTOM"), "{deferred:?}");
         let _held = guards;
     }
 
