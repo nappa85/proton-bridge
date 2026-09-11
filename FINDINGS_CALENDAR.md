@@ -602,6 +602,10 @@ Calendar sync:
 - [ ] Typed windowed listing anomaly (runs 1–10 notes above): identical
   typed queries intermittently 200-empty while untyped succeeds; untyped +
   client filter is primary, typed code retained mock-tested for future work.
+  LIVE HEAD-TO-HEAD 2026-09-11 (see §17): `PROTON_CAL_DIAG` narrow-window
+  comparison ran 3× on device — main cal typed=19 vs untyped=20 every time
+  (same single miss, likely T12 yearly all-day master), second cal 1/1
+  exact. Anomaly reproduced live and narrowed, not exonerated.
 - [ ] Token `Signature` verify skipped (lenient, proton-cal behavior) —
   consider sequoia detached-verify once author public keys are available.
 - Derived-map shadowing (2026-09-06): different logins stored single-key
@@ -1131,3 +1135,50 @@ T02 description edit → `upsync_updated cal=RfXFIcmY n=1` (full reseal,
 no personal path), 21 saved, web confirmed. With the two reminder-only
 proofs, the router is verified live in both directions: reminders take
 the cheap personal PUT, content edits take the whole-object replace.
+
+## 17. Typed-vs-untyped head-to-head – 2026-09-11 (diag build + live runs)
+
+Uncommitted `proton-sync/src/calendar.rs` diagnostic (local green at the
+time of deploy: fmt clean, clippy `-D warnings` clean, 227 tests =
+136+5+86 incl. new `test_cal_diag_head_to_head_mock`): inside the normal
+untyped listing, when `PROTON_CAL_DIAG` is set, the same ±45d window also
+runs through the typed 4-Type sweep (`list_all_events_windowed`, UTC)
+and reports ID-set diffs as `cal_diag` lines in `keys_debug` (read-only,
+zero behavior change — 4 extra queries per calendar, not the full 3y
+sweep). Staged `packaging/buteo-plugin/libproton-client.so` sha256
+`5b8f15ddf95aa364aebb56ff9ac60e74111f188e147ae2cf80bf603be8b0f27d`
+(deployed on phone, sha-checked `/tmp` + `/usr/lib64/.../oopp/`).
+
+Live outcomes (all from `/tmp/proton-sync-debug.log`, device clock):
+
+- 11:28:37 run: `cal_diag cal=RfXFIcmY typed=19 untyped=20
+  only_typed=[] only_untyped=["YF_UtrMe…c1g=="]` (full 88-char ID) |
+  `cal_diag cal=jL51FptW typed=1 untyped=1` exact. 21 saved.
+- 11:30:27 run: identical — typed=19 untyped=20, same missed ID,
+  second cal 1/1. 21 saved.
+- 11:35:01 run: same counts with the enriched shape line for the miss:
+  `only_untyped=["YF_UtrMe:rr=FREQ=YEARLYrec=-1fd=1st=1459555200
+  et=1459641600"]` (master, FullDay=1, 2016 start, 1-day span),
+  second cal 1/1. 21 saved.
+
+Reading: the §7 anomaly REPRODUCES live and is now narrowed — the typed
+path deterministically misses exactly one old yearly all-day recurring
+master (shape matches T12: `FREQ=YEARLY` birthday-style, old start year,
+the FullDayBeforeWindow Type-3 case) in a ±45d window around now, while
+untyped (which always includes recurring masters client-side) carries
+it. `only_typed` is empty in all 3 runs — typed never finds anything
+untyped lacks. Download path is unaffected (untyped primary + 21 saved
+every run); no data-loss class here, only the retained-typed-path
+question in PLAN.
+
+Phone state note: `systemctl --user show-environment` afterwards shows
+no `PROTON_*` (diag env cleaned), but `msyncd` is `failed
+(start-limit-hit)` since 11:38:43 — same restart-loop pattern as
+2026-09-10. Needs `systemctl --user reset-failed msyncd` + restart (user
+level, no root) before the next sync; last contacts state steady
+(`c=0 u=0 d=0`, 09:51:12).
+
+Open: correlate missed ID `YF_UtrMe…` to T12 via web/decrypted summary;
+then either delete the typed path outright or keep it mock-tested
+beside untyped (current). No OTP / host-API calls were used for this
+(host SRP stays CAPTCHA-flagged; phone refresh-token path only).

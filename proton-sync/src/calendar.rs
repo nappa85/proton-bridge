@@ -240,7 +240,97 @@ impl CalendarSyncEngine {
         let mut fetched: Vec<(proton_api::Calendar, Vec<CalendarEvent>)> = Vec::new();
         for cal in &cals {
             match cal_client.list_all_events(&cal.ID) {
-                Ok(evs) => fetched.push((cal.clone(), evs)),
+                Ok(evs) => {
+                    // Head-to-head listing diagnostic (env-gated, read-only,
+                    // zero behavior change): the same ±45d window through
+                    // the typed 4-Type sweep, compared as ID sets against
+                    // the untyped result filtered to that window. Answers
+                    // the FINDINGS §7 anomaly (identical typed queries
+                    // intermittently 200-empty on host): a `typed=0` line
+                    // next to a populated untyped set reproduces it live;
+                    // matching sets exonerate the typed path. Narrow window
+                    // keeps it to 4 extra queries per calendar (the full
+                    // 3y sweep would be ~50, near the rate limit).
+                    if std::env::var("PROTON_CAL_DIAG").is_ok() {
+                        let diag_end = chrono::Utc::now().timestamp() + 45 * 86400;
+                        let diag_start = diag_end - 90 * 86400;
+                        match cal_client
+                            .list_all_events_windowed(&cal.ID, diag_start, diag_end, "UTC")
+                        {
+                            Ok(typed) => {
+                                let untyped_ids: HashSet<&str> = evs
+                                    .iter()
+                                    .filter(|e| {
+                                        !e.RRule.as_deref().unwrap_or("").is_empty()
+                                            || (e.StartTime < diag_end && e.EndTime > diag_start)
+                                    })
+                                    .map(|e| e.ID.as_str())
+                                    .collect();
+                                let typed_ids: HashSet<&str> =
+                                    typed.iter().map(|e| e.ID.as_str()).collect();
+                                let mut only_typed: Vec<&str> = typed_ids
+                                    .difference(&untyped_ids)
+                                    .take(10)
+                                    .copied()
+                                    .collect();
+                                let mut only_untyped: Vec<&str> = untyped_ids
+                                    .difference(&typed_ids)
+                                    .take(10)
+                                    .copied()
+                                    .collect();
+                                only_typed.sort_unstable();
+                                only_untyped.sort_unstable();
+                                // Row shapes for the diff only (plaintext
+                                // columns: recurrence + window position tell
+                                // expected boundary/master divergences apart
+                                // from genuine mistypings).
+                                let by_id: std::collections::HashMap<
+                                    &str,
+                                    &proton_api::CalendarEvent,
+                                > = evs
+                                    .iter()
+                                    .chain(typed.iter())
+                                    .map(|e| (e.ID.as_str(), e))
+                                    .collect();
+                                let describe = |id: &&str| -> String {
+                                    match by_id.get(id) {
+                                        Some(e) => format!(
+                                            "{}:rr={}rec={}fd={}st={}et={}",
+                                            &e.ID[..8.min(e.ID.len())],
+                                            e.RRule.as_deref().unwrap_or("-"),
+                                            e.RecurrenceID.unwrap_or(-1),
+                                            e.FullDay.unwrap_or(false) as u8,
+                                            e.StartTime,
+                                            e.EndTime,
+                                        ),
+                                        None => format!("{id}:gone"),
+                                    }
+                                };
+                                let only_typed_shapes: Vec<String> =
+                                    only_typed.iter().map(describe).collect();
+                                let only_untyped_shapes: Vec<String> =
+                                    only_untyped.iter().map(describe).collect();
+                                self.set_debug(format!(
+                                    "cal_diag cal={} typed={} untyped={} only_typed={:?} only_untyped={:?}",
+                                    &cal.ID[..8.min(cal.ID.len())],
+                                    typed_ids.len(),
+                                    untyped_ids.len(),
+                                    only_typed_shapes,
+                                    only_untyped_shapes,
+                                ));
+                            }
+                            Err(e) => {
+                                let msg = format!("{e}");
+                                let short: String = msg.chars().take(120).collect();
+                                self.set_debug(format!(
+                                    "cal_diag cal={} typed_err:{short}",
+                                    &cal.ID[..8.min(cal.ID.len())]
+                                ));
+                            }
+                        }
+                    }
+                    fetched.push((cal.clone(), evs));
+                }
                 Err(e) => {
                     query_errors.push(format!("{}:{e}", &cal.ID[..8.min(cal.ID.len())]));
                 }
@@ -2182,6 +2272,67 @@ mod tests {
         put_personal.assert();
         let dbg = engine.get_keys_debug().unwrap_or_default();
         assert!(dbg.contains("upsync_personal"), "{dbg}");
+        let _held = guards;
+    }
+
+    #[test]
+    fn test_cal_diag_head_to_head_mock() {
+        // The PROTON_CAL_DIAG comparison runs inside the normal listing
+        // (before unlock, so no keys are needed) and reports typed vs
+        // untyped ID sets for the same window. Env save/restore keeps
+        // parallel tests hermetic.
+        let prev = std::env::var("PROTON_CAL_DIAG").ok();
+        std::env::set_var("PROTON_CAL_DIAG", "1");
+        let mut server = mockito::Server::new();
+        let mut guards = Vec::new();
+        macro_rules! mock_get {
+            ($re:expr, $code:expr, $body:expr) => {
+                guards.push(
+                    server
+                        .mock("GET", mockito::Matcher::Regex($re.into()))
+                        .with_status($code)
+                        .with_header("content-type", "application/json")
+                        .with_body($body)
+                        .create(),
+                );
+            };
+        }
+        mock_get!(
+            r"/calendar/v1$",
+            200,
+            r#"{"Code":1000,"Calendars":[{"ID":"cal1","Name":"C"}]}"#
+        );
+        let now = chrono::Utc::now().timestamp();
+        guards.push(
+            server
+                .mock(
+                    "GET",
+                    mockito::Matcher::Regex(r"/calendar/v1/cal1/events.*".into()),
+                )
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                .with_body(format!(
+                    "{{\"Code\":1000,\"Events\":[{{\"ID\":\"e1\",\"UID\":\"u1\",\"StartTime\":{now},\"EndTime\":{},\"LastEditTime\":100,\"FullDay\":0,\"SharedEvents\":[]}}],\"More\":0}}",
+                    now + 3600
+                ))
+                .create(),
+        );
+        let mut c = cfg();
+        c.refresh_token = Some("rt".into());
+        c.uid = Some("uid".into());
+        c.access_token = Some("at".into());
+        c.api_base_url = Some(server.url());
+        let mut engine = CalendarSyncEngine::new(c.clone());
+        engine.start_sync(c);
+        let dbg = engine.get_keys_debug().unwrap_or_default();
+        assert!(dbg.contains("cal_diag cal=cal1"), "{dbg}");
+        assert!(dbg.contains("typed=1 untyped=1"), "{dbg}");
+        assert!(dbg.contains("only_typed=[]"), "{dbg}");
+        assert!(dbg.contains("only_untyped=[]"), "{dbg}");
+        match prev {
+            Some(v) => std::env::set_var("PROTON_CAL_DIAG", v),
+            None => std::env::remove_var("PROTON_CAL_DIAG"),
+        }
         let _held = guards;
     }
 

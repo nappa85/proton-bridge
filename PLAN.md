@@ -403,12 +403,16 @@ Sync (buteo OOPP, proton_bridge_shim.cpp, NoUserInteractionPolicy):
   (supersedes `147ae55f…` — deploy only this). Live delta: none on
   happy path; phone gate is deploy + steady sync.
 - [ ] **Typed windowed listing anomaly** (filed 2026-09-09, runs 1–10 in
-  `FINDINGS_CALENDAR.md` §7): identical typed queries intermittently
-  return 200-empty while untyped succeeds; cause unexplained, typed code
-  retained mock-tested beside the untyped primary. Direction: either a
-  focused live session to isolate it (same token/session, overlapping
-  windows, per-query logging already exists) or delete the typed path
-  outright so it stops looking like a supported alternative.
+  `FINDINGS_CALENDAR.md` §7, head-to-head live data in §17): identical
+  typed queries intermittently return 200-empty while untyped succeeds;
+  cause narrowed 2026-09-11 (diag build `5b8f15dd…`, deployed
+  sha-checked): 3/3 device runs miss exactly the same old yearly all-day
+  recurring master (likely T12, Type-3 FullDayBeforeWindow case) —
+  typed=19 vs untyped=20 on the main cal, 1/1 exact on the second;
+  `only_typed` always empty. Untyped stays primary (21 saved every run,
+  no data-loss class). Direction: either a focused live session to
+  isolate the Type-3 miss further or delete the typed path outright so
+  it stops looking like a supported alternative.
 - [x] **Deferred-update visibility** (filed 2026-09-09, NOTIFICATION DONE
   2026-09-11 local-only): skipped uploads now surface — structured
   `ContactDeferred{kind,id,reason}` list (IDs + codes only) via new FFI
