@@ -7,6 +7,10 @@ use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
+fn lock_or_recover<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// JSON shape consumed by the C++ mKCal shim.
 ///
 /// New fields are `#[serde(default)]` so old phone builds ignore them and
@@ -114,7 +118,7 @@ impl CalendarSyncEngine {
     /// Serialized last-seen non-empty per-calendar defaults (`{}` when none
     /// this run — caller must not overwrite a good cache with it).
     pub fn defaults_json(&self) -> String {
-        let map = self.last_defaults.lock().unwrap();
+        let map = lock_or_recover(&self.last_defaults);
         if map.is_empty() {
             return String::new();
         }
@@ -125,18 +129,18 @@ impl CalendarSyncEngine {
     /// unions these with its replacement-phase removals for selective
     /// purge; ONLY valid after a `complete` status).
     pub fn purgeable_json(&self) -> String {
-        serde_json::to_string(&*self.last_purgeable.lock().unwrap()).unwrap_or_default()
+        serde_json::to_string(&*lock_or_recover(&self.last_purgeable)).unwrap_or_default()
     }
 
     /// Server-wins conflicts this run (`[]` when none — the shim notifies).
     pub fn conflicts_json(&self) -> String {
-        serde_json::to_string(&*self.last_conflicts.lock().unwrap()).unwrap_or_default()
+        serde_json::to_string(&*lock_or_recover(&self.last_conflicts)).unwrap_or_default()
     }
 
     /// Merged anchor map (`{}` when nothing known — caller must not
     /// overwrite a good cache with it).
     pub fn anchors_json(&self) -> String {
-        let map = self.last_anchors.lock().unwrap();
+        let map = lock_or_recover(&self.last_anchors);
         if map.is_empty() {
             return String::new();
         }
@@ -149,7 +153,7 @@ impl CalendarSyncEngine {
     /// nothing is unconfirmed — the shim must overwrite its cache
     /// wholesale, never merge, so stale entries vanish.
     pub fn pending_json(&self) -> String {
-        let map = self.last_pending.lock().unwrap();
+        let map = lock_or_recover(&self.last_pending);
         if map.is_empty() {
             return String::new();
         }
@@ -166,12 +170,12 @@ impl CalendarSyncEngine {
     }
 
     pub fn config(&self) -> SyncConfig {
-        self.config.lock().unwrap().clone()
+        lock_or_recover(&self.config).clone()
     }
 
     pub fn start_sync(&mut self, config: SyncConfig) {
-        *self.config.lock().unwrap() = config.clone();
-        *self.events_json.lock().unwrap() = None;
+        *lock_or_recover(&self.config) = config.clone();
+        *lock_or_recover(&self.events_json) = None;
         self.set_status(SyncStatus {
             state: "syncing".into(),
             progress: 0.0,
@@ -180,7 +184,7 @@ impl CalendarSyncEngine {
         match self.run_sync(&config) {
             Ok(evts) => {
                 let json = serde_json::to_string(&evts).unwrap_or_else(|_| "[]".into());
-                *self.events_json.lock().unwrap() = Some(json);
+                *lock_or_recover(&self.events_json) = Some(json);
                 self.set_status(SyncStatus {
                     state: "complete".into(),
                     progress: 1.0,
@@ -200,7 +204,7 @@ impl CalendarSyncEngine {
     }
 
     fn run_sync(&self, config: &SyncConfig) -> Result<Vec<CalEventJson>, proton_api::ProtonError> {
-        let mut tm = self.token_manager.lock().unwrap();
+        let mut tm = lock_or_recover(&self.token_manager);
         if tm.refresh_token().is_none()
             && config.password.is_empty()
             && config.derived_passwords.is_none()
@@ -389,7 +393,7 @@ impl CalendarSyncEngine {
                     .as_deref()
                     .map_or_else(Vec::new, Self::parse_notification_list);
                 if !part.is_empty() || !full.is_empty() {
-                    self.last_defaults.lock().unwrap().insert(
+                    lock_or_recover(&self.last_defaults).insert(
                         cal.ID.clone(),
                         crate::config::CalendarDefaults { part, full },
                     );
@@ -647,7 +651,7 @@ impl CalendarSyncEngine {
         let inventory = config.local_inventory.clone().unwrap_or_default();
         // Drop stale retry UIDs: rows deleted locally since the error cycle
         // have no job anymore (only guid-less rows can carry pending_uid).
-        self.last_pending.lock().unwrap().retain(|qid, _| {
+        lock_or_recover(&self.last_pending).retain(|qid, _| {
             inventory
                 .iter()
                 .any(|i| &i.mkcal_uid == qid && i.proton_id.is_none())
@@ -714,7 +718,7 @@ impl CalendarSyncEngine {
             .iter()
             .filter_map(|item| item.proton_id.clone())
             .collect();
-        *self.last_anchors.lock().unwrap() = crate::upsync::merge_anchors(
+        *lock_or_recover(&self.last_anchors) = crate::upsync::merge_anchors(
             config.anchor_map.as_ref().unwrap_or(&HashMap::new()),
             &all_rows,
             &local_ids,
@@ -723,8 +727,8 @@ impl CalendarSyncEngine {
             return Ok(());
         }
         let plan = crate::upsync::plan_sync(&all_rows, &inventory);
-        *self.last_purgeable.lock().unwrap() = plan.purgeable_tombstones.clone();
-        *self.last_conflicts.lock().unwrap() = plan.conflicts.clone();
+        *lock_or_recover(&self.last_purgeable) = plan.purgeable_tombstones.clone();
+        *lock_or_recover(&self.last_conflicts) = plan.conflicts.clone();
         if plan.uploads.is_empty() {
             return Ok(());
         }
@@ -861,9 +865,7 @@ impl CalendarSyncEngine {
                 for (i, (mkcal_uid, stable_uid)) in created_meta.iter().enumerate() {
                     match resp.Responses.iter().find(|r| r.Index == i as i64) {
                         Some(entry) if entry.Response.Code == 1000 => {
-                            self.last_pending
-                                .lock()
-                                .unwrap()
+                            lock_or_recover(&self.last_pending)
                                 .insert(mkcal_uid.clone(), stable_uid.clone());
                         }
                         Some(entry) => {
@@ -878,7 +880,7 @@ impl CalendarSyncEngine {
                                     // Adopted rows need anchor refresh like
                                     // fresh creates: re-list below.
                                     relist.insert(cal.ID.clone());
-                                    self.last_pending.lock().unwrap().remove(mkcal_uid);
+                                    lock_or_recover(&self.last_pending).remove(mkcal_uid);
                                     self.set_debug(format!(
                                         "upsync_adopted cal={} uid-conflict",
                                         &cal.ID[..8.min(cal.ID.len())]
@@ -1101,10 +1103,7 @@ impl CalendarSyncEngine {
             .iter()
             .flat_map(|(_, evs)| evs.iter().map(|e| e.UID.as_str()))
             .collect();
-        self.last_pending
-            .lock()
-            .unwrap()
-            .retain(|_, uid| !confirmed.contains(uid.as_str()));
+        lock_or_recover(&self.last_pending).retain(|_, uid| !confirmed.contains(uid.as_str()));
         Ok(())
     }
 
@@ -1122,9 +1121,6 @@ impl CalendarSyncEngine {
         // calendar parts, attendees. Key packets per Go Decode: shared cards use
         // SharedKeyPacket, calendar cards use CalendarKeyPacket.
         for part in &ev.SharedEvents {
-            let is_cal = false;
-            let _ = is_cal;
-            // Heuristic: shared group → SharedKeyPacket.
             let kp = if ev.SharedKeyPacket.is_empty() {
                 None
             } else {
@@ -1423,7 +1419,7 @@ impl CalendarSyncEngine {
     }
 
     fn set_debug(&self, s: String) {
-        let mut prev = self.keys_debug.lock().unwrap();
+        let mut prev = lock_or_recover(&self.keys_debug);
         let combined = match prev.clone() {
             Some(p) if !p.is_empty() => format!("{p}|{s}"),
             _ => s,
@@ -1432,35 +1428,33 @@ impl CalendarSyncEngine {
     }
 
     pub fn status(&self) -> SyncStatus {
-        self.status.lock().unwrap().clone()
+        lock_or_recover(&self.status).clone()
     }
 
     pub fn get_events_json(&self) -> String {
-        self.events_json
-            .lock()
-            .unwrap()
+        lock_or_recover(&self.events_json)
             .clone()
             .unwrap_or_else(|| "[]".into())
     }
 
     pub fn get_keys_debug(&self) -> Option<String> {
-        self.keys_debug.lock().unwrap().clone()
+        lock_or_recover(&self.keys_debug).clone()
     }
 
     pub fn get_refresh_token(&self) -> Option<String> {
-        self.token_manager
-            .lock()
-            .unwrap()
+        lock_or_recover(&self.token_manager)
             .refresh_token()
             .map(str::to_string)
     }
 
     pub fn get_uid(&self) -> Option<String> {
-        self.token_manager.lock().unwrap().uid().map(str::to_string)
+        lock_or_recover(&self.token_manager)
+            .uid()
+            .map(str::to_string)
     }
 
     fn set_status(&self, s: SyncStatus) {
-        *self.status.lock().unwrap() = s;
+        *lock_or_recover(&self.status) = s;
     }
 }
 

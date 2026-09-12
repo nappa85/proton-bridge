@@ -1,15 +1,12 @@
+use crate::client::{build_client, API_BASE, APP_VERSION};
 use crate::{AuthTokens, CaptchaChallenge, ProtonError, Result};
 use num_bigint::BigUint;
-use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha512};
 use std::time::{Duration, Instant};
 
-const API_BASE: &str = "https://mail.proton.me/api";
-const APP_VERSION: &str = "web-mail@6.3.2";
-
 pub struct AuthClient {
-    client: Client,
+    client: reqwest::blocking::Client,
     base_url: String,
 }
 
@@ -20,10 +17,7 @@ pub enum LoginState {
         scopes: Vec<String>,
     },
     Requires2FA {
-        /// Locked-session access token (scopes: twofactor). Upgraded in-place
-        /// by the server once the TOTP code is submitted.
         access_token: String,
-        /// Refresh token issued at login; stays valid after 2FA.
         refresh_token: String,
         uid: String,
         scopes: Vec<String>,
@@ -33,11 +27,7 @@ pub enum LoginState {
 impl AuthClient {
     pub fn new() -> Self {
         Self {
-            client: Client::builder()
-                .timeout(Duration::from_secs(30))
-                .user_agent("curl/8.0")
-                .build()
-                .expect("HTTP client"),
+            client: build_client(Duration::from_secs(30)),
             base_url: API_BASE.to_string(),
         }
     }
@@ -45,11 +35,7 @@ impl AuthClient {
     #[cfg(test)]
     pub fn new_with_base_url(base_url: String) -> Self {
         Self {
-            client: Client::builder()
-                .timeout(Duration::from_secs(30))
-                .user_agent("curl/8.0")
-                .build()
-                .expect("HTTP client"),
+            client: build_client(Duration::from_secs(30)),
             base_url,
         }
     }
@@ -59,17 +45,16 @@ impl AuthClient {
         self
     }
 
-    pub fn login(&self, username: &str, password: &str) -> Result<LoginState> {
-        let info = self.get_auth_info(username)?;
+    pub fn login(
+        &self,
+        username: &str,
+        password: &str,
+        hv_token: Option<&str>,
+    ) -> Result<LoginState> {
+        let info = self.get_auth_info(username, hv_token)?;
         let auth = SrpAuth::new(password, &info)?;
         let proofs = auth.generate_proofs(2048)?;
-        let resp = self.post_auth(username, &proofs)?;
-
-        let _tokens = AuthTokens {
-            access_token: resp.AccessToken.clone(),
-            refresh_token: resp.RefreshToken.clone(),
-            uid: resp.UID.clone(),
-        };
+        let resp = self.post_auth(username, &proofs, hv_token)?;
 
         let two_fa_enabled = Self::is_totp_required(&resp.TwoFA, &resp.TwoFactor);
         let scopes: Vec<String> = resp.Scopes.clone().unwrap_or_default();
@@ -120,13 +105,20 @@ impl AuthClient {
         access_token: &str,
         refresh_token: &str,
         uid: &str,
+        hv_token: Option<&str>,
     ) -> Result<AuthTokens> {
-        let resp = self
+        let mut req = self
             .client
             .post(format!("{}/auth/v4/2fa", self.base_url))
             .header("x-pm-appversion", APP_VERSION)
             .header("x-pm-uid", uid)
-            .bearer_auth(access_token)
+            .bearer_auth(access_token);
+        if let Some(token) = hv_token {
+            req = req
+                .header("x-pm-human-verification-token", token)
+                .header("x-pm-human-verification-token-type", "captcha");
+        }
+        let resp = req
             .json(&TwoFARequest {
                 TwoFactorCode: totp_code.to_string(),
             })
@@ -231,18 +223,51 @@ impl AuthClient {
         ))
     }
 
-    fn get_auth_info(&self, username: &str) -> Result<AuthInfoResponse> {
-        let resp = self
+    fn get_auth_info(&self, username: &str, hv_token: Option<&str>) -> Result<AuthInfoResponse> {
+        let mut req = self
             .client
             .post(format!("{}/core/v4/auth/info", self.base_url))
             .header("x-pm-appversion", APP_VERSION)
+            .header("Content-Type", "application/json");
+        if let Some(token) = hv_token {
+            eprintln!(
+                "proton-auth: get_auth_info sending HV token ({} chars)",
+                token.len()
+            );
+            req = req
+                .header("x-pm-human-verification-token", token)
+                .header("x-pm-human-verification-token-type", "captcha");
+        } else {
+            eprintln!("proton-auth: get_auth_info NO HV token");
+        }
+        let resp = req
             .json(&AuthInfoRequest {
                 Username: username.to_string(),
             })
-            .send()?
-            .error_for_status()?
-            .json()?;
-        Ok(resp)
+            .send()?;
+
+        let status = resp.status();
+        let body = resp.text()?;
+        eprintln!(
+            "proton-auth: get_auth_info status={status} body_len={}",
+            body.len()
+        );
+
+        if !status.is_success() {
+            if let Some(challenge) = parse_captcha_challenge(&body) {
+                eprintln!(
+                    "proton-auth: get_auth_info got 9001 captcha, token_len={}",
+                    challenge.token.len()
+                );
+                return Err(ProtonError::Captcha(challenge));
+            }
+            return Err(ProtonError::Auth(format!(
+                "Auth info POST failed {status}: {body}"
+            )));
+        }
+
+        let info: AuthInfoResponse = serde_json::from_str(&body)?;
+        Ok(info)
     }
 
     fn is_totp_required(two_fa: &Option<TwoFAField>, two_factor: &Option<TwoFactorInfo>) -> bool {
@@ -279,15 +304,32 @@ impl AuthClient {
         modern || legacy
     }
 
-    fn post_auth(&self, username: &str, proofs: &SrpProofs) -> Result<AuthResponse> {
+    fn post_auth(
+        &self,
+        username: &str,
+        proofs: &SrpProofs,
+        hv_token: Option<&str>,
+    ) -> Result<AuthResponse> {
         let client_ephemeral_b64 = b64_encode(&proofs.client_ephemeral);
         let client_proof_b64 = b64_encode(&proofs.client_proof);
 
-        let resp = self
+        let mut req = self
             .client
             .post(format!("{}/core/v4/auth", self.base_url))
             .header("x-pm-appversion", APP_VERSION)
-            .header("Content-Type", "application/json")
+            .header("Content-Type", "application/json");
+        if let Some(token) = hv_token {
+            eprintln!(
+                "proton-auth: post_auth sending HV token ({} chars)",
+                token.len()
+            );
+            req = req
+                .header("x-pm-human-verification-token", token)
+                .header("x-pm-human-verification-token-type", "captcha");
+        } else {
+            eprintln!("proton-auth: post_auth NO HV token");
+        }
+        let resp = req
             .json(&AuthRequest {
                 Username: username.to_string(),
                 ClientEphemeral: client_ephemeral_b64,
@@ -385,8 +427,13 @@ impl TokenManager {
         }
     }
 
-    pub fn login(&mut self, username: &str, password: &str) -> Result<LoginState> {
-        let state = self.auth.login(username, password)?;
+    pub fn login(
+        &mut self,
+        username: &str,
+        password: &str,
+        hv_token: Option<&str>,
+    ) -> Result<LoginState> {
+        let state = self.auth.login(username, password, hv_token)?;
         match &state {
             LoginState::Authenticated { tokens, .. } => {
                 self.expires_at = Some(Instant::now() + Duration::from_secs(3600));
@@ -403,10 +450,11 @@ impl TokenManager {
         access_token: &str,
         refresh_token: &str,
         uid: &str,
+        hv_token: Option<&str>,
     ) -> Result<()> {
         let tokens = self
             .auth
-            .submit_2fa(totp_code, access_token, refresh_token, uid)?;
+            .submit_2fa(totp_code, access_token, refresh_token, uid, hv_token)?;
         self.expires_at = Some(Instant::now() + Duration::from_secs(3600));
         self.tokens = Some(tokens);
         Ok(())
@@ -1044,7 +1092,7 @@ mod tests {
             .with_header("content-type", "application/json")
             .with_body(r#"{"Code":1000,"Scope":"full","Scopes":["full"]}"#)
             .create();
-        let res = client.submit_2fa("123456", "locked-at", "rt", "test-uid");
+        let res = client.submit_2fa("123456", "locked-at", "rt", "test-uid", None);
         assert!(res.is_ok(), "submit_2fa should succeed: {:?}", res);
         let tokens = res.unwrap();
         assert_eq!(tokens.access_token, "locked-at");
@@ -1063,7 +1111,7 @@ mod tests {
             .with_header("content-type", "application/json")
             .with_body(r#"{"Code":422,"Error":"TotpWrong"}"#)
             .create();
-        let res = client.submit_2fa("000000", "locked-at", "rt", "test-uid");
+        let res = client.submit_2fa("000000", "locked-at", "rt", "test-uid", None);
         assert!(res.is_err());
         let err = format!("{}", res.unwrap_err());
         assert!(err.contains("422") || err.contains("TotpWrong") || err.contains("failed"));
@@ -1105,7 +1153,7 @@ mod tests {
             .create();
         // Inject mocked client into TokenManager via private field is not accessible,
         // so we test AuthClient directly – the flow is validated above.
-        let res = client.submit_2fa("123456", "locked", "rt", "uid");
+        let res = client.submit_2fa("123456", "locked", "rt", "uid", None);
         assert!(res.is_ok());
         mock.assert();
         // Ensure TokenManager's restore path works
@@ -1182,7 +1230,7 @@ mod tests {
             .with_body(HV_BODY)
             .create();
         let err = client
-            .submit_2fa("000000", "locked-at", "rt", "test-uid")
+            .submit_2fa("000000", "locked-at", "rt", "test-uid", None)
             .expect_err("9001 must err");
         let challenge = err.captcha_challenge().expect("structured Captcha");
         assert_eq!(challenge.methods.len(), 3);

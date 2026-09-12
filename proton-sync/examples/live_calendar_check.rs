@@ -23,7 +23,7 @@ fn main() {
     });
 
     let auth = AuthClient::new();
-    let tokens = match auth.login(&username, &password) {
+    let tokens = match auth.login(&username, &password, None) {
         Ok(LoginState::Authenticated { tokens, .. }) => {
             eprintln!("login: authenticated without 2FA");
             tokens
@@ -35,7 +35,7 @@ fn main() {
             ..
         }) => {
             eprintln!("login: locked session, submitting TOTP...");
-            match auth.submit_2fa(&otp, &access_token, &refresh_token, &uid) {
+            match auth.submit_2fa(&otp, &access_token, &refresh_token, &uid, None) {
                 Ok(t) => t,
                 Err(e) => {
                     eprintln!("submit_2fa failed: {e}");

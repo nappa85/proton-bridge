@@ -1,7 +1,12 @@
+use crate::ffi_utils::cstr_to_string;
 use proton_sync::{calendar::CalendarSyncEngine, SyncConfig, SyncEngine, SyncStatus};
-use std::ffi::{CStr, CString};
+use std::ffi::CString;
 use std::os::raw::c_char;
 use std::sync::{Arc, Mutex};
+
+fn lock_or_recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 pub struct ProtonSyncEngine {
     inner: Arc<Mutex<Option<SyncEngine>>>,
@@ -11,20 +16,24 @@ pub struct ProtonSyncEngine {
 #[repr(C)]
 pub struct ProtonBridgeStatus {
     pub state: [u8; 16],
+    pub state_truncated: bool,
     pub progress: f32,
     pub total_contacts: u32,
     pub synced_contacts: u32,
     pub error: [u8; 256],
+    pub error_truncated: bool,
 }
 
 impl Default for ProtonBridgeStatus {
     fn default() -> Self {
         Self {
             state: [0; 16],
+            state_truncated: false,
             progress: 0.0,
             total_contacts: 0,
             synced_contacts: 0,
             error: [0; 256],
+            error_truncated: false,
         }
     }
 }
@@ -33,6 +42,7 @@ impl ProtonBridgeStatus {
     fn from_sync_status(s: &SyncStatus) -> Self {
         let mut status = Self::default();
         let state_bytes = s.state.as_bytes();
+        status.state_truncated = state_bytes.len() >= status.state.len();
         let copy_len = state_bytes.len().min(status.state.len() - 1);
         status.state[..copy_len].copy_from_slice(&state_bytes[..copy_len]);
         status.progress = s.progress;
@@ -40,18 +50,12 @@ impl ProtonBridgeStatus {
         status.synced_contacts = s.synced_contacts;
         if let Some(ref err) = s.error {
             let err_bytes = err.as_bytes();
+            status.error_truncated = err_bytes.len() >= status.error.len();
             let copy_len = err_bytes.len().min(status.error.len() - 1);
             status.error[..copy_len].copy_from_slice(&err_bytes[..copy_len]);
         }
         status
     }
-}
-
-unsafe fn cstr_to_string(ptr: *const c_char) -> String {
-    if ptr.is_null() {
-        return String::new();
-    }
-    CStr::from_ptr(ptr).to_string_lossy().into_owned()
 }
 
 #[no_mangle]
@@ -237,7 +241,7 @@ pub extern "C" fn proton_bridge_start_sync(engine: *mut ProtonSyncEngine) -> boo
     }
     let engine_ref = unsafe { &*engine };
 
-    if let Some(mut inner_engine) = engine_ref.inner.lock().unwrap().take() {
+    if let Some(mut inner_engine) = lock_or_recover(&engine_ref.inner).take() {
         let config = inner_engine.config().clone();
         let json_arc = Arc::clone(&engine_ref.synced_contacts_json);
         let inner_arc = Arc::clone(&engine_ref.inner);
@@ -247,9 +251,9 @@ pub extern "C" fn proton_bridge_start_sync(engine: *mut ProtonSyncEngine) -> boo
             let status = inner_engine.status();
             if status.state == "complete" {
                 let json = inner_engine.get_contacts_json();
-                *json_arc.lock().unwrap() = Some(json);
+                *lock_or_recover(&json_arc) = Some(json);
             }
-            *inner_arc.lock().unwrap() = Some(inner_engine);
+            *lock_or_recover(&inner_arc) = Some(inner_engine);
         });
 
         true
@@ -264,9 +268,9 @@ pub extern "C" fn proton_bridge_abort_sync(engine: *mut ProtonSyncEngine) {
         return;
     }
     let engine_ref = unsafe { &*engine };
-    if let Some(mut inner_engine) = engine_ref.inner.lock().unwrap().take() {
+    if let Some(mut inner_engine) = lock_or_recover(&engine_ref.inner).take() {
         inner_engine.abort();
-        *engine_ref.inner.lock().unwrap() = Some(inner_engine);
+        *lock_or_recover(&engine_ref.inner) = Some(inner_engine);
     }
 }
 
@@ -279,10 +283,7 @@ pub extern "C" fn proton_bridge_get_status(
         return;
     }
     let engine_ref = unsafe { &*engine };
-    let s = engine_ref
-        .inner
-        .lock()
-        .unwrap()
+    let s = lock_or_recover(&engine_ref.inner)
         .as_ref()
         .map(|e| e.status())
         .unwrap_or_default();
@@ -301,7 +302,7 @@ pub extern "C" fn proton_bridge_get_synced_contacts_json(
         return std::ptr::null_mut();
     }
     let engine_ref = unsafe { &*engine };
-    let json = engine_ref.synced_contacts_json.lock().unwrap().clone();
+    let json = lock_or_recover(&engine_ref.synced_contacts_json).clone();
     match json {
         Some(s) => CString::new(s).unwrap().into_raw(),
         None => std::ptr::null_mut(),
@@ -323,7 +324,7 @@ pub extern "C" fn proton_bridge_get_refresh_token(engine: *mut ProtonSyncEngine)
         return std::ptr::null_mut();
     }
     let engine_ref = unsafe { &*engine };
-    let guard = engine_ref.inner.lock().unwrap();
+    let guard = lock_or_recover(&engine_ref.inner);
     match guard.as_ref() {
         Some(e) => match e.get_refresh_token() {
             Some(s) => CString::new(s).unwrap().into_raw(),
@@ -339,7 +340,7 @@ pub extern "C" fn proton_bridge_get_uid(engine: *mut ProtonSyncEngine) -> *mut c
         return std::ptr::null_mut();
     }
     let engine_ref = unsafe { &*engine };
-    let guard = engine_ref.inner.lock().unwrap();
+    let guard = lock_or_recover(&engine_ref.inner);
     match guard.as_ref() {
         Some(e) => match e.get_uid() {
             Some(s) => CString::new(s).unwrap().into_raw(),
@@ -357,7 +358,7 @@ pub extern "C" fn proton_bridge_get_derived_passwords_json(
         return std::ptr::null_mut();
     }
     let engine_ref = unsafe { &*engine };
-    let guard = engine_ref.inner.lock().unwrap();
+    let guard = lock_or_recover(&engine_ref.inner);
     match guard.as_ref() {
         Some(e) => match e.get_derived_passwords_json() {
             Some(s) => CString::new(s).unwrap().into_raw(),
@@ -373,7 +374,7 @@ pub extern "C" fn proton_bridge_get_keys_debug(engine: *mut ProtonSyncEngine) ->
         return std::ptr::null_mut();
     }
     let engine_ref = unsafe { &*engine };
-    let guard = engine_ref.inner.lock().unwrap();
+    let guard = lock_or_recover(&engine_ref.inner);
     match guard.as_ref() {
         Some(e) => match e.get_keys_debug() {
             Some(s) => CString::new(s).unwrap().into_raw(),
@@ -394,7 +395,7 @@ pub extern "C" fn proton_bridge_get_contact_conflicts_json(
         return std::ptr::null_mut();
     }
     let engine_ref = unsafe { &*engine };
-    let guard = engine_ref.inner.lock().unwrap();
+    let guard = lock_or_recover(&engine_ref.inner);
     match guard.as_ref() {
         Some(e) => CString::new(e.get_contact_conflicts_json())
             .unwrap()
@@ -414,7 +415,7 @@ pub extern "C" fn proton_bridge_get_contact_deferred_json(
         return std::ptr::null_mut();
     }
     let engine_ref = unsafe { &*engine };
-    let guard = engine_ref.inner.lock().unwrap();
+    let guard = lock_or_recover(&engine_ref.inner);
     match guard.as_ref() {
         Some(e) => CString::new(e.get_contact_deferred_json())
             .unwrap()
@@ -431,7 +432,7 @@ pub extern "C" fn proton_bridge_get_contact_anchors_json(
         return std::ptr::null_mut();
     }
     let engine_ref = unsafe { &*engine };
-    let guard = engine_ref.inner.lock().unwrap();
+    let guard = lock_or_recover(&engine_ref.inner);
     match guard.as_ref() {
         Some(e) => {
             let s = e.get_contact_anchors_json();
@@ -457,7 +458,7 @@ pub extern "C" fn proton_bridge_get_contact_pending_json(
         return std::ptr::null_mut();
     }
     let engine_ref = unsafe { &*engine };
-    let guard = engine_ref.inner.lock().unwrap();
+    let guard = lock_or_recover(&engine_ref.inner);
     match guard.as_ref() {
         Some(e) => {
             let s = e.get_contact_pending_json();
@@ -676,7 +677,7 @@ pub extern "C" fn proton_calendar_start_sync(e: *mut ProtonCalendarEngine) -> bo
         return false;
     }
     let eref = unsafe { &*e };
-    if let Some(mut eng) = eref.inner.lock().unwrap().take() {
+    if let Some(mut eng) = lock_or_recover(&eref.inner).take() {
         let config = eng.config();
         let json_arc = Arc::clone(&eref.synced_events_json);
         let inner = Arc::clone(&eref.inner);
@@ -684,9 +685,9 @@ pub extern "C" fn proton_calendar_start_sync(e: *mut ProtonCalendarEngine) -> bo
             eng.start_sync(config);
             let status = eng.status();
             if status.state == "complete" {
-                *json_arc.lock().unwrap() = Some(eng.get_events_json());
+                *lock_or_recover(&json_arc) = Some(eng.get_events_json());
             }
-            *inner.lock().unwrap() = Some(eng);
+            *lock_or_recover(&inner) = Some(eng);
         });
         true
     } else {
@@ -721,10 +722,10 @@ pub extern "C" fn proton_calendar_get_events_json(e: *mut ProtonCalendarEngine) 
     }
     let eref = unsafe { &*e };
     // Prefer the snapshot taken at completion; fall back to the live engine.
-    if let Some(s) = eref.synced_events_json.lock().unwrap().clone() {
+    if let Some(s) = lock_or_recover(&eref.synced_events_json).clone() {
         return CString::new(s).unwrap().into_raw();
     }
-    let guard = eref.inner.lock().unwrap();
+    let guard = lock_or_recover(&eref.inner);
     match guard.as_ref() {
         Some(eng) => CString::new(eng.get_events_json()).unwrap().into_raw(),
         None => std::ptr::null_mut(),
@@ -737,7 +738,7 @@ pub extern "C" fn proton_calendar_get_keys_debug(e: *mut ProtonCalendarEngine) -
         return std::ptr::null_mut();
     }
     let eref = unsafe { &*e };
-    let guard = eref.inner.lock().unwrap();
+    let guard = lock_or_recover(&eref.inner);
     match guard.as_ref() {
         Some(eng) => match eng.get_keys_debug() {
             Some(s) => CString::new(s).unwrap().into_raw(),
@@ -753,7 +754,7 @@ pub extern "C" fn proton_calendar_get_refresh_token(e: *mut ProtonCalendarEngine
         return std::ptr::null_mut();
     }
     let eref = unsafe { &*e };
-    let guard = eref.inner.lock().unwrap();
+    let guard = lock_or_recover(&eref.inner);
     match guard.as_ref().and_then(|eng| eng.get_refresh_token()) {
         Some(s) => CString::new(s).unwrap().into_raw(),
         None => std::ptr::null_mut(),
@@ -766,7 +767,7 @@ pub extern "C" fn proton_calendar_get_uid(e: *mut ProtonCalendarEngine) -> *mut 
         return std::ptr::null_mut();
     }
     let eref = unsafe { &*e };
-    let guard = eref.inner.lock().unwrap();
+    let guard = lock_or_recover(&eref.inner);
     match guard.as_ref().and_then(|eng| eng.get_uid()) {
         Some(s) => CString::new(s).unwrap().into_raw(),
         None => std::ptr::null_mut(),
@@ -781,7 +782,7 @@ pub extern "C" fn proton_calendar_get_defaults_json(e: *mut ProtonCalendarEngine
         return std::ptr::null_mut();
     }
     let eref = unsafe { &*e };
-    let guard = eref.inner.lock().unwrap();
+    let guard = lock_or_recover(&eref.inner);
     match guard.as_ref() {
         Some(eng) => {
             let s = eng.defaults_json();
@@ -806,7 +807,7 @@ fn calendar_engine_json(
         return std::ptr::null_mut();
     }
     let eref = unsafe { &*e };
-    let guard = eref.inner.lock().unwrap();
+    let guard = lock_or_recover(&eref.inner);
     match guard.as_ref() {
         Some(eng) => CString::new(pick(eng)).unwrap().into_raw(),
         None => std::ptr::null_mut(),
@@ -835,7 +836,7 @@ pub extern "C" fn proton_calendar_get_anchors_json(e: *mut ProtonCalendarEngine)
         return std::ptr::null_mut();
     }
     let eref = unsafe { &*e };
-    let guard = eref.inner.lock().unwrap();
+    let guard = lock_or_recover(&eref.inner);
     match guard.as_ref() {
         Some(eng) => {
             let s = eng.anchors_json();
@@ -859,7 +860,7 @@ pub extern "C" fn proton_calendar_get_pending_json(e: *mut ProtonCalendarEngine)
         return std::ptr::null_mut();
     }
     let eref = unsafe { &*e };
-    let guard = eref.inner.lock().unwrap();
+    let guard = lock_or_recover(&eref.inner);
     match guard.as_ref() {
         Some(eng) => {
             let s = eng.pending_json();
@@ -897,8 +898,6 @@ mod tests {
 
     #[test]
     fn test_status_needs_2fa_round_trips_over_ffi() {
-        // The C++ shim branches on the literal "needs_2fa": it must survive
-        // the fixed-size FFI buffers intact (state has 16 bytes, it needs 9).
         let sync = SyncStatus {
             state: "needs_2fa".into(),
             error: Some("2FA verification required".into()),
@@ -906,7 +905,9 @@ mod tests {
         };
         let bridge = ProtonBridgeStatus::from_sync_status(&sync);
         assert_eq!(decode_state(&bridge), "needs_2fa");
+        assert!(!bridge.state_truncated);
         assert_eq!(decode_error(&bridge), "2FA verification required");
+        assert!(!bridge.error_truncated);
     }
 
     #[test]
@@ -919,6 +920,20 @@ mod tests {
         let bridge = ProtonBridgeStatus::from_sync_status(&sync);
         assert_eq!(decode_state(&bridge), "error");
         assert!(decode_error(&bridge).contains("bad password"));
+    }
+
+    #[test]
+    fn test_status_truncation_detected() {
+        let long_state = "a".repeat(20);
+        let long_error = "e".repeat(300);
+        let sync = SyncStatus {
+            state: long_state,
+            error: Some(long_error),
+            ..Default::default()
+        };
+        let bridge = ProtonBridgeStatus::from_sync_status(&sync);
+        assert!(bridge.state_truncated);
+        assert!(bridge.error_truncated);
     }
 
     #[test]

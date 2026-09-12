@@ -3,7 +3,7 @@
   <context>
     <name />
     <message>
-      <location filename="../ui/proton-update.qml" line="125" />
+      <location filename="../ui/proton-update.qml" line="126" />
       <source>Sign in to refresh credentials</source>
       <translation type="unfinished" />
     </message>
@@ -11,57 +11,57 @@
   <context>
     <name>proton</name>
     <message>
-      <location filename="../ui/proton.qml" line="125" />
+      <location filename="../ui/proton.qml" line="131" />
       <source>Add Proton account</source>
       <translation>Añadir cuenta de Proton</translation>
     </message>
     <message>
-      <location filename="../ui/proton.qml" line="181" />
+      <location filename="../ui/proton.qml" line="187" />
       <source>Two-factor authentication is enabled on this account. Enter the 6-digit verification code from your authenticator app.</source>
       <translation>En esta cuenta está activada la autenticación en dos pasos. Introduce el código de verificación de 6 dígitos de tu aplicación de autenticación.</translation>
     </message>
     <message>
-      <location filename="../ui/proton.qml" line="193" />
+      <location filename="../ui/proton.qml" line="199" />
       <source>Verification code</source>
       <translation>Código de verificación</translation>
     </message>
     <message>
-      <location filename="../ui/proton.qml" line="195" />
+      <location filename="../ui/proton.qml" line="201" />
       <source>Enter verification code</source>
       <translation>Introduce el código de verificación</translation>
     </message>
     <message>
-      <location filename="../ui/proton.qml" line="208" />
+      <location filename="../ui/proton.qml" line="214" />
       <source>Verify</source>
       <translation>Verificar</translation>
     </message>
     <message>
-      <location filename="../ui/proton.qml" line="234" />
+      <location filename="../ui/proton.qml" line="243" />
       <source>Sign in</source>
       <translation>Iniciar sesión</translation>
     </message>
     <message>
-      <location filename="../ui/proton.qml" line="256" />
+      <location filename="../ui/proton.qml" line="267" />
       <source>Proton blocked this sign-in attempt with a human-verification challenge (spam protection, usually triggered by the network).</source>
       <translation>Proton ha bloqueado este intento de inicio de sesión con una verificación humana (protección antispam, normalmente activada por la red).</translation>
     </message>
     <message>
-      <location filename="../ui/proton.qml" line="266" />
+      <location filename="../ui/proton.qml" line="277" />
       <source>Offered verification methods: %1</source>
       <translation>Métodos de verificación ofrecidos: %1</translation>
     </message>
     <message>
-      <location filename="../ui/proton.qml" line="282" />
+      <location filename="../ui/proton.qml" line="292" />
       <source>Open the verification page</source>
       <translation>Abrir la página de verificación</translation>
     </message>
     <message>
-      <location filename="../ui/proton.qml" line="288" />
-      <source>Solving the challenge in the browser does not continue here automatically — afterwards, try signing in again, ideally from a different network.</source>
-      <translation>Resolver el desafío en el navegador no continúa aquí automáticamente — después intenta iniciar sesión de nuevo, a ser posible desde otra red.</translation>
+      <location filename="../ui/proton.qml" line="303" />
+      <source>After solving the verification in the browser, press Try again — the login will be retried with the verification token.</source>
+      <translation type="unfinished" />
     </message>
     <message>
-      <location filename="../ui/proton.qml" line="299" />
+      <location filename="../ui/proton.qml" line="314" />
       <source>Try again</source>
       <translation>Reintentar</translation>
     </message>
@@ -82,52 +82,52 @@
   <context>
     <name>proton-update</name>
     <message>
-      <location filename="../ui/proton-update.qml" line="145" />
+      <location filename="../ui/proton-update.qml" line="146" />
       <source>Sign in</source>
       <translation>Iniciar sesión</translation>
     </message>
     <message>
-      <location filename="../ui/proton-update.qml" line="157" />
+      <location filename="../ui/proton-update.qml" line="161" />
       <source>Two-factor authentication is enabled on this account. Enter the 6-digit verification code from your authenticator app.</source>
       <translation>En esta cuenta está activada la autenticación en dos pasos. Introduce el código de verificación de 6 dígitos de tu aplicación de autenticación.</translation>
     </message>
     <message>
-      <location filename="../ui/proton-update.qml" line="169" />
+      <location filename="../ui/proton-update.qml" line="173" />
       <source>Verification code</source>
       <translation>Código de verificación</translation>
     </message>
     <message>
-      <location filename="../ui/proton-update.qml" line="171" />
+      <location filename="../ui/proton-update.qml" line="175" />
       <source>Enter verification code</source>
       <translation>Introduce el código de verificación</translation>
     </message>
     <message>
-      <location filename="../ui/proton-update.qml" line="184" />
+      <location filename="../ui/proton-update.qml" line="188" />
       <source>Verify</source>
       <translation>Verificar</translation>
     </message>
     <message>
-      <location filename="../ui/proton-update.qml" line="208" />
+      <location filename="../ui/proton-update.qml" line="213" />
       <source>Proton blocked this sign-in attempt with a human-verification challenge (spam protection, usually triggered by the network).</source>
       <translation>Proton ha bloqueado este intento de inicio de sesión con una verificación humana (protección antispam, normalmente activada por la red).</translation>
     </message>
     <message>
-      <location filename="../ui/proton-update.qml" line="218" />
+      <location filename="../ui/proton-update.qml" line="223" />
       <source>Offered verification methods: %1</source>
       <translation>Métodos de verificación ofrecidos: %1</translation>
     </message>
     <message>
-      <location filename="../ui/proton-update.qml" line="234" />
+      <location filename="../ui/proton-update.qml" line="238" />
       <source>Open the verification page</source>
       <translation>Abrir la página de verificación</translation>
     </message>
     <message>
-      <location filename="../ui/proton-update.qml" line="240" />
-      <source>Solving the challenge in the browser does not continue here automatically — afterwards, try signing in again, ideally from a different network.</source>
-      <translation>Resolver el desafío en el navegador no continúa aquí automáticamente — después intenta iniciar sesión de nuevo, a ser posible desde otra red.</translation>
+      <location filename="../ui/proton-update.qml" line="249" />
+      <source>After solving the verification in the browser, press Try again — the login will be retried with the verification token.</source>
+      <translation type="unfinished" />
     </message>
     <message>
-      <location filename="../ui/proton-update.qml" line="251" />
+      <location filename="../ui/proton-update.qml" line="260" />
       <source>Try again</source>
       <translation>Reintentar</translation>
     </message>

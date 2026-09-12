@@ -3,18 +3,6 @@
 //! [`crate::calendar::CalendarSyncEngine`] (previously this file fabricated
 //! `summary="Proton Event <UID>"` without decrypting – see FINDINGS_CALENDAR.md).
 use crate::{config::SyncConfig, status::SyncStatus};
-use serde::Serialize;
-
-#[derive(Serialize)]
-pub struct CalEventJsonCompat {
-    pub uid: String,
-    pub summary: String,
-    pub description: String,
-    pub location: String,
-    pub dtstart: String,
-    pub dtend: String,
-    pub calendar_id: String,
-}
 
 pub struct CalendarSyncEngineFull {
     inner: crate::calendar::CalendarSyncEngine,

@@ -19,7 +19,7 @@ use std::collections::{HashMap, HashSet};
 
 fn login(username: &str, password: &str, otp: &str) -> proton_api::AuthTokens {
     let auth = AuthClient::new();
-    match auth.login(username, password) {
+    match auth.login(username, password, None) {
         Ok(LoginState::Authenticated { tokens, .. }) => {
             eprintln!("login: authenticated without 2FA");
             tokens
@@ -31,7 +31,7 @@ fn login(username: &str, password: &str, otp: &str) -> proton_api::AuthTokens {
             ..
         }) => {
             eprintln!("login: locked session, submitting TOTP...");
-            auth.submit_2fa(otp, &access_token, &refresh_token, &uid)
+            auth.submit_2fa(otp, &access_token, &refresh_token, &uid, None)
                 .unwrap_or_else(|e| {
                     eprintln!("submit_2fa failed: {e}");
                     std::process::exit(1);

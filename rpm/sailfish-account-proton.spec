@@ -1,6 +1,6 @@
 Name:           sailfish-account-proton
 Summary:        Proton account provider for SailfishOS
-Version:        0.1.0
+Version:        0.1.1
 Release:        1
 License:        GPL-3.0-or-later
 URL:            https://github.com/nappa85/proton-bridge
@@ -78,5 +78,7 @@ install -m 0644 translations/*.qm \
 # %{_datadir}/icons/hicolor/*/apps/proton.png
 
 %changelog
-* %(date +"%a %b %d %Y") Marco Napetti <marco.napetti@proton.me> - 0.1.0-1
+* Sat Sep 12 2026 Marco Napetti <marco.napetti@proton.me> - 0.1.1-1
+- Fix CAPTCHA workflow
+* Sat Sep 12 2026 Marco Napetti <marco.napetti@proton.me> - 0.1.0-1
 - Initial packaging

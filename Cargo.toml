@@ -7,7 +7,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/nappa85/proton-bridge"
@@ -26,7 +26,11 @@ tokio = { version = "1", features = ["full"] }
 vcf = "0.2"
 # Use pure Rust crypto backend for cross-compile friendliness (avoid nettle/openssl C headers needed for aarch64)
 # Original default is crypto-nettle which needs nettle-dev for aarch64 cross (not present in proton-build-env)
-# crypto-rust is experimental + variable-time, requires both allow flags
+# crypto-rust is experimental + variable-time, requires both allow flags.
+# SAFETY NOTE: variable-time crypto means timing side-channels are possible.
+# Acceptable for a contacts/calendar sync client on mobile (no key-server
+# scenario), but must be revisited if ever handling live key generation or
+# interactive authentication on multi-tenant hosts.
 sequoia-openpgp = { version = "1.20", default-features = false, features = ["crypto-rust", "allow-experimental-crypto", "allow-variable-time-crypto"] }
 cbindgen = "0.28"
 

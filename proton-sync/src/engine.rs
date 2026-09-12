@@ -8,6 +8,10 @@ use proton_api::{
 use serde::Serialize;
 use std::sync::{Arc, Mutex};
 
+fn lock_or_recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[derive(Serialize)]
 struct ProcessedContact {
     id: String,
@@ -30,6 +34,8 @@ struct ProcessedContact {
     gender: String,
     photos: Vec<String>,
     keys_debug: String,
+    #[serde(skip_serializing)]
+    decrypt_failed: bool,
 }
 
 #[derive(Serialize)]
@@ -109,12 +115,12 @@ impl SyncEngine {
     }
 
     pub fn config(&self) -> SyncConfig {
-        self.config.lock().unwrap().clone()
+        lock_or_recover(&self.config).clone()
     }
 
     pub fn start_sync(&mut self, config: SyncConfig) {
-        *self.config.lock().unwrap() = config;
-        *self.abort_flag.lock().unwrap() = false;
+        *lock_or_recover(&self.config) = config;
+        *lock_or_recover(&self.abort_flag) = false;
 
         self.run_sync();
     }
@@ -129,7 +135,7 @@ impl SyncEngine {
             last_sync: None,
         });
 
-        let config = self.config.lock().unwrap().clone();
+        let config = lock_or_recover(&self.config).clone();
 
         if config.username.is_empty() {
             self.set_status(SyncStatus {
@@ -168,7 +174,7 @@ impl SyncEngine {
                     )),
                     ..Default::default()
                 });
-                *self.decrypt_errors.lock().unwrap() = 1;
+                *lock_or_recover(&self.decrypt_errors) = 1;
                 return;
             }
         };
@@ -184,7 +190,7 @@ impl SyncEngine {
                     error: Some("Failed to unlock any Proton keys – password changed or new key requires re-authentication. Update credentials in Settings → Proton.".into()),
                     ..Default::default()
                 });
-                *self.decrypt_errors.lock().unwrap() = 1;
+                *lock_or_recover(&self.decrypt_errors) = 1;
                 return;
             }
         }
@@ -206,12 +212,12 @@ impl SyncEngine {
                     &mut pending,
                 ) {
                     Ok(outcome) => {
-                        *self.contact_pending.lock().unwrap() = outcome.pending_creates.clone();
-                        *self.contact_deferred.lock().unwrap() = outcome.deferred_list.clone();
+                        *lock_or_recover(&self.contact_pending) = outcome.pending_creates.clone();
+                        *lock_or_recover(&self.contact_deferred) = outcome.deferred_list.clone();
                         outcome
                     }
                     Err(e) => {
-                        *self.contact_pending.lock().unwrap() = pending;
+                        *lock_or_recover(&self.contact_pending) = pending;
                         self.set_status(SyncStatus {
                             state: "error".into(),
                             error: Some(format!("Contacts upsync upload failed: {e}")),
@@ -220,8 +226,8 @@ impl SyncEngine {
                         return;
                     }
                 };
-                *self.contact_conflicts.lock().unwrap() = outcome.conflicts;
-                *self.contact_anchors.lock().unwrap() = outcome.anchors;
+                *lock_or_recover(&self.contact_conflicts) = outcome.conflicts;
+                *lock_or_recover(&self.contact_anchors) = outcome.anchors;
                 // File-log visibility: the shim logs `keys_debug` on every
                 // run, so the upload trace survives without the journal.
                 if !outcome.trace.is_empty() {
@@ -270,11 +276,17 @@ impl SyncEngine {
                             gender: String::new(),
                             photos: Vec::new(),
                             keys_debug: keys_debug.clone(),
+                            decrypt_failed: false,
                         };
+
+                        let mut encrypted_count: u32 = 0;
+                        let mut encrypted_fail_count: u32 = 0;
+                        let mut had_vcard_data = false;
 
                         if let Some(cards) = &c.Cards {
                             for card in cards {
                                 let vcard_data = if card.Type == 1 || card.Type == 3 {
+                                    encrypted_count += 1;
                                     match decrypt_contact_card(&card.Data, &mut unlocked_keys_mut) {
                                         Ok(plain) => {
                                             pc.keys_debug = format!(
@@ -284,11 +296,12 @@ impl SyncEngine {
                                             plain
                                         }
                                         Err(e) => {
+                                            encrypted_fail_count += 1;
+                                            decrypt_err_count += 1;
                                             pc.keys_debug = format!(
                                                 "{};decrypted_type_{}=ERR:{}",
                                                 pc.keys_debug, card.Type, e
                                             );
-                                            decrypt_err_count += 1;
                                             continue;
                                         }
                                     }
@@ -308,6 +321,7 @@ impl SyncEngine {
 
                                 match parse_vcard(&vcard_data) {
                                     Ok(vc) => {
+                                        had_vcard_data = true;
                                         if !vc.first_name.is_empty() || !vc.last_name.is_empty() {
                                             pc.first_name = vc.first_name;
                                             pc.last_name = vc.last_name;
@@ -388,6 +402,10 @@ impl SyncEngine {
                             }
                         }
 
+                        pc.decrypt_failed = encrypted_count > 0
+                            && encrypted_fail_count == encrypted_count
+                            && !had_vcard_data;
+
                         pc
                     })
                     .collect();
@@ -397,29 +415,32 @@ impl SyncEngine {
                 }
 
                 let json = serde_json::to_string(&processed).unwrap_or_else(|_| "[]".into());
-                *self.contacts_json.lock().unwrap() = Some(json);
-                *self.decrypt_errors.lock().unwrap() = decrypt_err_count;
+                *lock_or_recover(&self.contacts_json) = Some(json);
+                *lock_or_recover(&self.decrypt_errors) = decrypt_err_count;
 
-                if decrypt_err_count > 0 {
-                    let debug = self.keys_debug.clone().unwrap_or_default();
+                let skipped = processed.iter().filter(|pc| pc.decrypt_failed).count() as u32;
+                if skipped > 0 {
+                    let _debug = self.keys_debug.clone().unwrap_or_default();
                     self.set_status(SyncStatus {
-                        state: "error".into(),
+                        state: "complete".into(),
+                        progress: 1.0,
+                        total_contacts: total,
+                        synced_contacts: total - skipped,
                         error: Some(format!(
-                            "Decryption failed for {decrypt_err_count} contact(s) – mailbox password changed or new key requires re-authentication. Update credentials in Settings → Proton. Debug: {debug}"
+                            "{skipped} contact(s) skipped (decryption failed, key may have rotated)"
                         )),
-                        ..Default::default()
+                        last_sync: Some(chrono::Utc::now().to_rfc3339()),
                     });
-                    return;
+                } else {
+                    self.set_status(SyncStatus {
+                        state: "complete".into(),
+                        progress: 1.0,
+                        total_contacts: total,
+                        synced_contacts: total,
+                        error: None,
+                        last_sync: Some(chrono::Utc::now().to_rfc3339()),
+                    });
                 }
-
-                self.set_status(SyncStatus {
-                    state: "complete".into(),
-                    progress: 1.0,
-                    total_contacts: total,
-                    synced_contacts: total,
-                    error: None,
-                    last_sync: Some(chrono::Utc::now().to_rfc3339()),
-                });
             }
             Err(e) => {
                 self.set_status(SyncStatus {
@@ -685,7 +706,7 @@ impl SyncEngine {
         debug_parts.push(format!("total_unlocked={}", unlocked_keys.len()));
         self.keys_debug = Some(debug_parts.join(";"));
         if !derived_map.is_empty() {
-            *self.derived_passwords.lock().unwrap() = Some(derived_map);
+            *lock_or_recover(&self.derived_passwords) = Some(derived_map);
         }
         Ok((unlocked_keys, user_end))
     }
@@ -747,7 +768,7 @@ impl SyncEngine {
     }
 
     fn authenticate(&mut self, config: &SyncConfig) -> Result<(), proton_api::ProtonError> {
-        let mut tm = self.token_manager.lock().unwrap();
+        let mut tm = lock_or_recover(&self.token_manager);
 
         let has_refresh = tm.refresh_token().is_some() && !tm.refresh_token().unwrap().is_empty();
 
@@ -763,7 +784,7 @@ impl SyncEngine {
                 }
                 Err(_) => {
                     drop(tm);
-                    tm = self.token_manager.lock().unwrap();
+                    tm = lock_or_recover(&self.token_manager);
                 }
             }
         }
@@ -774,7 +795,7 @@ impl SyncEngine {
             ));
         }
 
-        match tm.login(&config.username, &config.password)? {
+        match tm.login(&config.username, &config.password, None)? {
             LoginState::Authenticated { .. } => {}
             LoginState::Requires2FA {
                 access_token,
@@ -783,7 +804,7 @@ impl SyncEngine {
                 ..
             } => {
                 if let Some(code) = &config.totp_code {
-                    tm.submit_2fa(code, &access_token, &refresh_token, &uid)?;
+                    tm.submit_2fa(code, &access_token, &refresh_token, &uid, None)?;
                 } else {
                     drop(tm);
                     self.set_status(SyncStatus {
@@ -1300,7 +1321,7 @@ impl SyncEngine {
     }
 
     pub fn abort(&mut self) {
-        *self.abort_flag.lock().unwrap() = true;
+        *lock_or_recover(&self.abort_flag) = true;
         self.set_status(SyncStatus {
             state: "idle".into(),
             progress: 0.0,
@@ -1309,57 +1330,51 @@ impl SyncEngine {
     }
 
     pub fn status(&self) -> SyncStatus {
-        self.status.lock().unwrap().clone()
+        lock_or_recover(&self.status).clone()
     }
 
     pub fn get_contacts_json(&self) -> String {
-        self.contacts_json
-            .lock()
-            .unwrap()
+        lock_or_recover(&self.contacts_json)
             .clone()
             .unwrap_or_else(|| "[]".into())
     }
 
     pub fn get_refresh_token(&self) -> Option<String> {
-        self.token_manager
-            .lock()
-            .unwrap()
+        lock_or_recover(&self.token_manager)
             .refresh_token()
             .map(|s| s.to_string())
     }
 
     pub fn get_uid(&self) -> Option<String> {
-        self.token_manager
-            .lock()
-            .unwrap()
+        lock_or_recover(&self.token_manager)
             .uid()
             .map(|s| s.to_string())
     }
 
     pub fn get_derived_passwords_json(&self) -> Option<String> {
-        let map = self.derived_passwords.lock().unwrap().clone()?;
+        let map = lock_or_recover(&self.derived_passwords).clone()?;
         serde_json::to_string(&map).ok()
     }
 
     pub fn get_decrypt_error_count(&self) -> u32 {
-        *self.decrypt_errors.lock().unwrap()
+        *lock_or_recover(&self.decrypt_errors)
     }
 
     /// Server-wins contact conflicts this run (`[]` when none).
     pub fn get_contact_conflicts_json(&self) -> String {
-        serde_json::to_string(&*self.contact_conflicts.lock().unwrap()).unwrap_or_default()
+        serde_json::to_string(&*lock_or_recover(&self.contact_conflicts)).unwrap_or_default()
     }
 
     /// Skipped uploads this run (`[]` when none — IDs and reason codes
     /// only, never field contents).
     pub fn get_contact_deferred_json(&self) -> String {
-        serde_json::to_string(&*self.contact_deferred.lock().unwrap()).unwrap_or_default()
+        serde_json::to_string(&*lock_or_recover(&self.contact_deferred)).unwrap_or_default()
     }
 
     /// Merged contact anchors (`{}` when nothing known — caller must not
     /// overwrite a good cache with it).
     pub fn get_contact_anchors_json(&self) -> String {
-        let map = self.contact_anchors.lock().unwrap();
+        let map = lock_or_recover(&self.contact_anchors);
         if map.is_empty() {
             return String::new();
         }
@@ -1372,7 +1387,7 @@ impl SyncEngine {
     /// nothing is unconfirmed — the shim must overwrite its cache
     /// wholesale, never merge, so stale entries vanish.
     pub fn get_contact_pending_json(&self) -> String {
-        let map = self.contact_pending.lock().unwrap();
+        let map = lock_or_recover(&self.contact_pending);
         if map.is_empty() {
             return String::new();
         }
@@ -1384,7 +1399,7 @@ impl SyncEngine {
     }
 
     fn set_status(&self, status: SyncStatus) {
-        *self.status.lock().unwrap() = status;
+        *lock_or_recover(&self.status) = status;
     }
 
     /// Maps an `authenticate` failure to the status `run_sync` reports.
@@ -1404,7 +1419,7 @@ impl SyncEngine {
     }
 
     fn should_abort(&self) -> bool {
-        *self.abort_flag.lock().unwrap()
+        *lock_or_recover(&self.abort_flag)
     }
 }
 

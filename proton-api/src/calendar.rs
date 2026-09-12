@@ -4,22 +4,17 @@
 // verified live) and proton.me/blog/protoncalendar-security-model:
 //   user key -> address key (Token) -> calendar passphrase (per-member armored)
 //   -> calendar keys -> per-event session keys (SharedKeyPacket/CalendarKeyPacket).
+use crate::client::{build_client, API_BASE, APP_VERSION};
 use crate::{crypto::UnlockedKey, models::*, ProtonError, Result};
 use base64::Engine;
-use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-/// Max window per listing request: 93 days (api.md, code 2000 beyond).
 pub const CALENDAR_MAX_WINDOW_SECS: i64 = 93 * 86400;
-/// Page size cap (400 code 2021 beyond 100).
 pub const CALENDAR_PAGE_SIZE: u32 = 100;
 
-const API_BASE: &str = "https://mail.proton.me/api";
-const APP_VERSION: &str = "web-mail@6.3.2";
-
 pub struct CalendarClient {
-    client: Client,
+    client: reqwest::blocking::Client,
     base_url: String,
     access_token: String,
     uid: String,
@@ -28,11 +23,7 @@ pub struct CalendarClient {
 impl CalendarClient {
     pub fn new(access_token: String, uid: String) -> Self {
         Self {
-            client: Client::builder()
-                .timeout(Duration::from_secs(60))
-                .user_agent("curl/8.0")
-                .build()
-                .expect("HTTP client"),
+            client: build_client(Duration::from_secs(60)),
             base_url: API_BASE.to_string(),
             access_token,
             uid,
@@ -41,11 +32,7 @@ impl CalendarClient {
 
     pub fn new_with_base_url(base_url: String, access_token: String, uid: String) -> Self {
         Self {
-            client: Client::builder()
-                .timeout(Duration::from_secs(30))
-                .user_agent("curl/8.0")
-                .build()
-                .expect("HTTP client"),
+            client: build_client(Duration::from_secs(60)),
             base_url,
             access_token,
             uid,

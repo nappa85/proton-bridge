@@ -1,14 +1,10 @@
-// proton-api/src/contacts.rs
+use crate::client::{build_client, API_BASE, APP_VERSION};
 use crate::{models::*, ProtonError, Result};
-use reqwest::blocking::Client;
 use serde::Serialize;
 use std::time::Duration;
 
-const API_BASE: &str = "https://mail.proton.me/api";
-const APP_VERSION: &str = "web-mail@6.3.2";
-
 pub struct ContactsClient {
-    client: Client,
+    client: reqwest::blocking::Client,
     base_url: String,
     access_token: String,
     uid: String,
@@ -17,11 +13,7 @@ pub struct ContactsClient {
 impl ContactsClient {
     pub fn new(access_token: String, uid: String) -> Self {
         Self {
-            client: Client::builder()
-                .timeout(Duration::from_secs(60))
-                .user_agent("curl/8.0")
-                .build()
-                .expect("HTTP client"),
+            client: build_client(Duration::from_secs(60)),
             base_url: API_BASE.to_string(),
             access_token,
             uid,
@@ -30,11 +22,7 @@ impl ContactsClient {
 
     pub fn new_with_base_url(base_url: String, access_token: String, uid: String) -> Self {
         Self {
-            client: Client::builder()
-                .timeout(Duration::from_secs(60))
-                .user_agent("curl/8.0")
-                .build()
-                .expect("HTTP client"),
+            client: build_client(Duration::from_secs(60)),
             base_url,
             access_token,
             uid,

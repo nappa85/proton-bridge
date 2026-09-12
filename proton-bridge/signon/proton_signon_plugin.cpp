@@ -165,9 +165,10 @@ void ProtonSignonPlugin::process(const SignOn::SessionData &dataIn, const QStrin
     QString refreshToken = dataIn.getProperty(QStringLiteral("RefreshToken")).toString();
     QString uid = dataIn.getProperty(QStringLiteral("Uid")).toString();
     QString totpCode = dataIn.getProperty(QStringLiteral("TwoFactorPassword")).toString().trimmed();
+    QString hvToken = dataIn.getProperty(QStringLiteral("HumanVerificationToken")).toString().trimmed();
     qDebug() << "ProtonSignonPlugin: process username=" << username << " pw_len=" << password.length()
              << " rt_present=" << !refreshToken.isEmpty() << " uid=" << uid << " totp_len=" << totpCode.length()
-             << " hasPasswordParam=" << !passwordParam.isEmpty();
+             << " hasPasswordParam=" << !passwordParam.isEmpty() << " hv_token=" << (hvToken.isEmpty() ? "no" : "yes");
 
     // 1) Second factor submission: complete the locked-session login.
     if (!totpCode.isEmpty() && !refreshToken.isEmpty() && !uid.isEmpty()) {
@@ -177,7 +178,8 @@ void ProtonSignonPlugin::process(const SignOn::SessionData &dataIn, const QStrin
                 lockedAccess.toUtf8().constData(),
                 refreshToken.toUtf8().constData(),
                 uid.toUtf8().constData(),
-                totpCode.toUtf8().constData());
+                totpCode.toUtf8().constData(),
+                hvToken.toUtf8().constData());
 
             if (authResult.status == 0) {
                 qDebug() << "ProtonSignonPlugin: 2FA verified, session upgraded";
@@ -185,11 +187,17 @@ void ProtonSignonPlugin::process(const SignOn::SessionData &dataIn, const QStrin
             } else if (authResult.status == 3) {
                 QString captchaUrl = QString::fromUtf8(authResult.captcha_url);
                 QString captchaMethods = QString::fromUtf8(authResult.captcha_methods);
+                QString captchaToken = QString::fromUtf8(authResult.captcha_token);
                 proton_auth_free_result(&authResult);
                 QVariantMap response;
                 response.insert(QStringLiteral("CaptchaRequired"), true);
                 response.insert(QStringLiteral("CaptchaUrl"), captchaUrl);
                 response.insert(QStringLiteral("CaptchaMethods"), captchaMethods);
+                response.insert(QStringLiteral("CaptchaToken"), captchaToken);
+                response.insert(QStringLiteral("AccessToken"), lockedAccess);
+                response.insert(QStringLiteral("RefreshToken"), refreshToken);
+                response.insert(QStringLiteral("Uid"), uid);
+                response.insert(QStringLiteral("TwoFARequired"), true);
                 qDebug() << "ProtonSignonPlugin: CAPTCHA required on 2FA submit";
                 emit result(SignOn::SessionData(response));
             } else {
@@ -200,6 +208,10 @@ void ProtonSignonPlugin::process(const SignOn::SessionData &dataIn, const QStrin
             }
             return;
         }
+        // TOTP code present but no locked access token: broken state.
+        emit error(SignOn::Error(SignOn::Error::MissingData,
+                                 QStringLiteral("2FA code provided but no locked-session access token")));
+        return;
     }
 
     // If a fresh password was supplied via transient "Password" param (account
@@ -243,7 +255,8 @@ void ProtonSignonPlugin::process(const SignOn::SessionData &dataIn, const QStrin
 
     ProtonAuthResult authResult = proton_auth_login(
         username.toUtf8().constData(),
-        password.toUtf8().constData());
+        password.toUtf8().constData(),
+        hvToken.toUtf8().constData());
 
     if (authResult.status == 0) {
         // No 2FA on the account: fully authenticated.
@@ -254,19 +267,20 @@ void ProtonSignonPlugin::process(const SignOn::SessionData &dataIn, const QStrin
     if (authResult.status == 3) {
         // Human-verification challenge (API 9001, e.g. datacenter IP
         // reputation): the credentials are fine, the NETWORK is gated. Do
-        // NOT store anything; hand the challenge to the UI exactly like the
-        // TwoFARequired shape (CaptchaRequired + Url + Methods) so the
-        // account page can explain + link instead of showing raw JSON.
-        // NOTE: solving the challenge in an external browser does NOT
-        // unblock this login (the proof returns via postMessage to the
-        // embedding page) — the UI copy must not promise otherwise.
+        // NOT store anything; hand the challenge to the UI with the token
+        // so the retry can send x-pm-humanverification. After the user
+        // solves the challenge in the browser, the token is marked as
+        // verified on Proton's server, and the retry with the header will
+        // succeed.
         QString captchaUrl = QString::fromUtf8(authResult.captcha_url);
         QString captchaMethods = QString::fromUtf8(authResult.captcha_methods);
+        QString captchaToken = QString::fromUtf8(authResult.captcha_token);
         proton_auth_free_result(&authResult);
         QVariantMap response;
         response.insert(QStringLiteral("CaptchaRequired"), true);
         response.insert(QStringLiteral("CaptchaUrl"), captchaUrl);
         response.insert(QStringLiteral("CaptchaMethods"), captchaMethods);
+        response.insert(QStringLiteral("CaptchaToken"), captchaToken);
         qDebug() << "ProtonSignonPlugin: CAPTCHA required, methods=" << captchaMethods;
         emit result(SignOn::SessionData(response));
         return;
@@ -287,20 +301,28 @@ void ProtonSignonPlugin::process(const SignOn::SessionData &dataIn, const QStrin
                 lockedAccess.toUtf8().constData(),
                 lockedRefresh.toUtf8().constData(),
                 lockedUid.toUtf8().constData(),
-                totpCode.toUtf8().constData());
+                totpCode.toUtf8().constData(),
+                hvToken.toUtf8().constData());
 
             if (twoFaResult.status == 0) {
                 qDebug() << "ProtonSignonPlugin: 2FA verified, session upgraded";
                 handleAuthOk(twoFaResult, username, password);
             } else if (twoFaResult.status == 3) {
-                // Challenge on the 2FA submit itself: same shape as login.
+                // Challenge on the 2FA submit itself: include locked-session
+                // tokens so the retry can go straight to 2FA, not full login.
                 QString captchaUrl = QString::fromUtf8(twoFaResult.captcha_url);
                 QString captchaMethods = QString::fromUtf8(twoFaResult.captcha_methods);
+                QString captchaToken = QString::fromUtf8(twoFaResult.captcha_token);
                 proton_auth_free_result(&twoFaResult);
                 QVariantMap response;
                 response.insert(QStringLiteral("CaptchaRequired"), true);
                 response.insert(QStringLiteral("CaptchaUrl"), captchaUrl);
                 response.insert(QStringLiteral("CaptchaMethods"), captchaMethods);
+                response.insert(QStringLiteral("CaptchaToken"), captchaToken);
+                response.insert(QStringLiteral("AccessToken"), lockedAccess);
+                response.insert(QStringLiteral("RefreshToken"), lockedRefresh);
+                response.insert(QStringLiteral("Uid"), lockedUid);
+                response.insert(QStringLiteral("TwoFARequired"), true);
                 qDebug() << "ProtonSignonPlugin: CAPTCHA required on 2FA submit";
                 emit result(SignOn::SessionData(response));
             } else {

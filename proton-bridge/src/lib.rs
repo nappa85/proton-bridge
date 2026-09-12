@@ -2,6 +2,7 @@
 
 pub mod auth;
 pub mod bridge;
+mod ffi_utils;
 
 pub use auth::{
     proton_auth_free_result, proton_auth_login, proton_auth_refresh, proton_auth_submit_2fa,

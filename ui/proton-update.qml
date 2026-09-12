@@ -38,6 +38,7 @@ AccountCredentialsAgent {
         property bool _needsCaptcha
         property string _captchaUrl
         property string _captchaMethods
+        property string _captchaToken
         property string _pendingAccessToken
         property string _pendingRefreshToken
         property string _pendingUid
@@ -144,7 +145,10 @@ AccountCredentialsAgent {
                     //% "Sign in"
                     text: qsTr("Sign in")
                     enabled: !updatePage._busy && passwordField.text.length > 0
-                    onClicked: updatePage._update(null)
+                    onClicked: {
+                        updatePage._captchaToken = ""
+                        updatePage._update(null)
+                    }
                 }
 
                 Column {
@@ -187,7 +191,8 @@ AccountCredentialsAgent {
                             "TwoFactorPassword": otpField.text,
                             "AccessToken": updatePage._pendingAccessToken,
                             "RefreshToken": updatePage._pendingRefreshToken,
-                            "Uid": updatePage._pendingUid
+                            "Uid": updatePage._pendingUid,
+                            "HumanVerificationToken": updatePage._captchaToken
                         })
                     }
                 }
@@ -223,21 +228,25 @@ AccountCredentialsAgent {
                         font.pixelSize: Theme.fontSizeSmall
                     }
 
-                    Text {
+                    Label {
                         x: Theme.horizontalPageMargin
                         width: parent.width - 2 * Theme.horizontalPageMargin
                         wrapMode: Text.Wrap
                         color: Theme.highlightColor
                         font.pixelSize: Theme.fontSizeSmall
-                        textFormat: Text.RichText
                         //% "Open the verification page"
-                        text: "<a href=\"" + updatePage._captchaUrl + "\">" + qsTr("Open the verification page") + "</a>"
-                        onLinkActivated: Qt.openUrlExternally(link)
+                        text: qsTr("Open the verification page")
+                        font.underline: true
+
+                        MouseArea {
+                            anchors.fill: parent
+                            onClicked: Qt.openUrlExternally(updatePage._captchaUrl)
+                        }
                     }
 
                     Label {
-                        //% "Solving the challenge in the browser does not continue here automatically — afterwards, try signing in again, ideally from a different network."
-                        text: qsTr("Solving the challenge in the browser does not continue here automatically — afterwards, try signing in again, ideally from a different network.")
+                        //% "After solving the verification in the browser, press Try again — the login will be retried with the verification token."
+                        text: qsTr("After solving the verification in the browser, press Try again — the login will be retried with the verification token.")
                         wrapMode: Text.Wrap
                         x: Theme.horizontalPageMargin
                         width: parent.width - 2 * Theme.horizontalPageMargin
@@ -252,7 +261,19 @@ AccountCredentialsAgent {
                         enabled: !updatePage._busy
                         onClicked: {
                             updatePage._needsCaptcha = false
-                            updatePage._update(null)
+                            var extra = {}
+                            if (updatePage._captchaToken.length > 0) {
+                                extra["HumanVerificationToken"] = updatePage._captchaToken
+                            }
+                            // If captcha was on 2FA submit, preserve the
+                            // locked-session tokens + TOTP code for retry.
+                            if (updatePage._needsTwoFA) {
+                                extra["TwoFactorPassword"] = otpField.text
+                                extra["AccessToken"] = updatePage._pendingAccessToken
+                                extra["RefreshToken"] = updatePage._pendingRefreshToken
+                                extra["Uid"] = updatePage._pendingUid
+                            }
+                            updatePage._update(extra)
                         }
                     }
                 }
@@ -278,11 +299,18 @@ AccountCredentialsAgent {
             console.log("proton-update: onSignInCredentialsUpdated hasCaptcha=" + (data["CaptchaRequired"] === true) + " has2FA=" + (data["TwoFARequired"] === true))
             if (data["CaptchaRequired"] === true) {
                 // Human-verification challenge: show message + link, keep
-                // the page for a retry. Never logs the URL (token). Clears
-                // the OTP state: the two forms exclude each other.
+                // the page for a retry. Never logs the URL (token).
                 updatePage._captchaMethods = data["CaptchaMethods"] || ""
                 updatePage._captchaUrl = data["CaptchaUrl"] || ""
-                updatePage._needsTwoFA = false
+                updatePage._captchaToken = data["CaptchaToken"] || ""
+                if (data["TwoFARequired"] === true) {
+                    updatePage._pendingAccessToken = data["AccessToken"] || updatePage._pendingAccessToken
+                    updatePage._pendingRefreshToken = data["RefreshToken"] || updatePage._pendingRefreshToken
+                    updatePage._pendingUid = data["Uid"] || updatePage._pendingUid
+                    updatePage._needsTwoFA = true
+                } else {
+                    updatePage._needsTwoFA = false
+                }
                 updatePage._needsCaptcha = true
                 updatePage._busy = false
             } else if (data["TwoFARequired"] === true) {

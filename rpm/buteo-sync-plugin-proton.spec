@@ -1,6 +1,6 @@
 Name:           buteo-sync-plugin-proton
 Summary:        Buteo sync plugin for Proton Contacts
-Version:        0.1.0
+Version:        0.1.1
 Release:        1
 License:        GPL-3.0-or-later
 URL:            https://github.com/nappa85/proton-bridge
@@ -69,5 +69,7 @@ systemctl --user reload msyncd 2>/dev/null || true
 systemctl --user reload msyncd 2>/dev/null || true
 
 %changelog
-* %(date +"%a %b %d %Y") Marco Napetti <marco.napetti@proton.me> - 0.1.0-1
+* Sat Sep 12 2026 Marco Napetti <marco.napetti@proton.me> - 0.1.1-1
+- Fix CAPTCHA workflow
+* Sat Sep 12 2026 Marco Napetti <marco.napetti@proton.me> - 0.1.0-1
 - Initial packaging
